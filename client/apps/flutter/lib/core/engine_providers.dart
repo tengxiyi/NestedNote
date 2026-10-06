@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! 引擎提供者（Riverpod）——**唯一**允许调用 Rust FFI 的位置。
 //!
 //! 《工程铁律》A2/F1：UI 层不得直接接触存储与业务规则。

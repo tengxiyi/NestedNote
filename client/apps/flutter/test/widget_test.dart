@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Flutter 侧冒烟测试。
 //
 // 说明：这是 P0 阶段的最小验证 —— 确认应用外壳能启动、品牌名正确、

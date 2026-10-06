@@ -1,5 +1,10 @@
 # 拾光笔记 / NestedNote
 
+[![CI](https://github.com/tengxiyi/NestedNote/actions/workflows/ci.yml/badge.svg)](https://github.com/tengxiyi/NestedNote/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.92-orange.svg)](https://www.rust-lang.org/)
+[![Flutter](https://img.shields.io/badge/Flutter-3.47.6-02569B.svg)](https://flutter.dev/)
+
 > **一款本地优先（Local-First）的跨平台笔记应用。**
 > 拾起每一段时光，层层收好——笔记先安家在你的设备上，再谈云端同步。
 > Windows ｜ macOS ｜ iOS ｜ Android
@@ -243,7 +248,48 @@ just audit              # 依赖漏洞审计（铁律 S11）
 
 ---
 
-## 许可与数据主权
+## 许可证
+
+本项目以 **[GNU AGPL-3.0-or-later](LICENSE)** 发布（`SPDX-License-Identifier: AGPL-3.0-or-later`）。
+
+### 这意味着什么
+
+这是一份**强 copyleft** 许可证。你可以自由使用、修改、分发，包括商业用途，但必须满足：
+
+| 要求 | 说明 |
+|---|---|
+| 保留版权与许可声明 | 分发时不得移除或修改许可证文本 |
+| 公开修改 | 你修改并分发的版本，同样必须以 AGPL 授权（不能闭源） |
+| **公开网络服务也要开源** | 第 13 条：即使你只是把修改后的版本作为**网络服务**提供（用户通过网络与它交互），也必须向使用者提供完整源代码 |
+| 记录修改 | 需要标注你改动了哪些文件与日期 |
+
+换句话说：**别人不能把你的代码改一改、闭源、然后拿去做成商业产品或 SaaS 卖钱。**
+想做这些，就必须按 AGPL 把源代码一并开放。
+
+第 13 条是选择 AGPL 而不是 GPL 的关键：它堵住了"拿开源代码做成云服务、但不分发二进制、
+于是不用开源"这条常见规避路径。
+
+### 它不禁止什么
+
+- **不禁止商业使用**：你可以用它做公司内部工具，也可以提供付费服务；
+- **不禁止自托管与二次开发**，只要遵守上面的开源义务。
+
+> 需要说明的是：任何 OSI 认可的开源许可证（含 AGPL）都无法"禁止别人使用"——
+> 能禁止的是"闭源使用"。如果哪天需要更强的商业控制（例如只允许付费客户使用），
+> 那已经不属于开源范畴，必须换成专有许可或"开源 + 商业双许可"模式。
+> 由于本项目的版权属于贡献者，届时需要所有贡献者同意（因此若将来可能双许可，
+> 现在起就应要求贡献者签署 CLA）。
+
+### 声明
+
+- 本许可证覆盖仓库内全部内容：客户端（`client/`）、服务端（`server/`）、
+  共享契约（`shared/`）、脚本与文档。
+- 项目名称「拾光笔记 / NestedNote」不在本许可证授权范围内（许可证只授权代码本身）。
+- 无任何担保：AGPL 第 15、16 条明确提供**免责声明**，作者不对使用后果负责。
+
+---
+
+## 数据主权
 
 - 用户数据存放于本地（`nested.db` + `attachments/`），**默认不上传任何内容**。
 - 云同步、AI 等涉及数据离开设备的能力**必须**显式开启（见铁律 S9）。

@@ -1,5 +1,7 @@
 name: nested
 description: "拾光笔记 / NestedNote —— 本地优先的跨平台笔记应用"
+# 与三处 Cargo.toml 的声明保持一致（铁律：同一事实只有一个来源，这里是四处同值）
+license: AGPL-3.0-or-later
 publish_to: "none"
 
 # 版本号：<应用版本>+<构建号>

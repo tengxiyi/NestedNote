@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! 应用外壳：主题与首页。
 //!
 //! 说明：P0 的首页刻意只显示"引擎自检结果"，它是 P0 的验收界面

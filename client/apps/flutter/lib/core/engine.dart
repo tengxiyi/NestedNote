@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! 引擎封装的公共类型。
 //!
 //! 本文件**不**导入 FFI，只定义纯 Dart 数据结构，

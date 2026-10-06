@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Flutter ↔ Rust 集成冒烟测试（P0-5 的验收）。
 //
 // 与 test/widget_test.dart 的区别：Widget 测试用假数据验证 UI 装配，

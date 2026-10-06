@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! 拾光笔记 / NestedNote —— Flutter 应用入口。
 //!
 //! 分层约定（《工程铁律》A1/A2/F1）：
