@@ -18,10 +18,15 @@ import 'dart:io';
 
 /// Windows 上 `getApplicationSupportDirectory()` 的等价路径。
 ///
-/// 对应 `Runner.rc` 中的 `CompanyName = "NestedNote"`、
-/// `ProductName = "NestedNote"`。
+/// 对应 `Runner.rc` 中的 `CompanyName = "app.nestednote"`、
+/// `ProductName = "nested"`，取值依据《项目章程》§1.2：
+/// 反域名作公司名、工程标识作产品名。最终路径：
 ///
-/// 这两个值刻意保持**纯 ASCII**：它们会进入文件系统路径，
+/// ```text
+/// %APPDATA%\app.nestednote\nested\nested.db
+/// ```
+///
+/// 两个值刻意保持**纯 ASCII**：它们会进入文件系统路径，
 /// 中文会给日志、备份脚本与跨平台迁移带来编码麻烦。
 Directory resolveAppDataDirForTools() {
   final String appData = Platform.environment['APPDATA'] ?? '';
@@ -30,5 +35,5 @@ Directory resolveAppDataDirForTools() {
     stderr.writeln('其它平台请用 flutter run 或测试里的临时目录。');
     exit(2);
   }
-  return Directory('$appData\\NestedNote\\NestedNote');
+  return Directory('$appData\\app.nestednote\\nested');
 }

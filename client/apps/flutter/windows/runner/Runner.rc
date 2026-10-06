@@ -92,16 +92,21 @@ BEGIN
             // 注意：CompanyName 与 ProductName 共同决定 Windows 上
             // getApplicationSupportDirectory() 的返回路径
             // （%APPDATA%\<CompanyName>\<ProductName>）。
-            // 因此这两个值必须保持**纯 ASCII**：中文会进入文件系统路径，
-            // 给日志、备份脚本与跨平台迁移带来不必要的编码问题。
-            // 界面显示的品牌名以 Rust 侧 branding 模块为准，不依赖这里。
-            VALUE "CompanyName", "NestedNote" "\0"
+            //
+            // 取值依据《项目章程》§1.2：反域名 app.nestednote 作公司名，
+            // 工程标识 nested 作产品名，从而得到
+            //   %APPDATA%\app.nestednote\nested\nested.db
+            // 两个值都保持**纯 ASCII**：中文进入文件系统路径会给日志、
+            // 备份脚本与跨平台迁移带来不必要的编码问题。
+            //
+            // 界面显示的品牌名以 Rust 侧 branding 模块为准，与此处无关。
+            VALUE "CompanyName", "app.nestednote" "\0"
             VALUE "FileDescription", "NestedNote - cross-platform notes" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "nested" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 NestedNote contributors. AGPL-3.0-or-later" "\0"
             VALUE "OriginalFilename", "nested.exe" "\0"
-            VALUE "ProductName", "NestedNote" "\0"
+            VALUE "ProductName", "nested" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

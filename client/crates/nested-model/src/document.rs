@@ -74,6 +74,40 @@ impl Document {
         }
     }
 
+    /// 内容是否与另一份文档**语义相同**（只比块，不比元信息）。
+    ///
+    /// ## 为什么必须区分"内容"与"元信息"
+    ///
+    /// `DocumentMetadata` 含有 `created_at_ms` / `updated_at_ms`，而
+    /// [`Document::from_blocks`] 每次调用都会用传入的时间戳构造元信息。
+    /// 于是"同样的正文在不同时刻构造两次"会产生**不同的序列化字节**。
+    ///
+    /// 如果用字节相等来判断"用户是否修改了内容"，就会得到错误结论：
+    /// 内容一个字没改，却被判定为"有变更"，进而递增版本、追加修订、入队同步操作。
+    /// 这正是技术债 #11 要修的问题，而字节比较会让它继续存在。
+    ///
+    /// 因此判断"内容是否变化"必须只看 [`Document::blocks`]。
+    ///
+    /// ## 关于未知字段
+    ///
+    /// 有观点认为按字节比较更安全（能发现未知字段的差异）。这里不采用，原因是
+    /// 保存路径写入的就是本程序序列化出来的内容，不存在"未知字段被丢失"的场景；
+    /// 而元信息差异是**必然发生**的，按字节比较等于让该判断永远失效。
+    #[must_use]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+    }
+
+    /// 让文档的元信息与所属笔记的时间戳保持一致。
+    ///
+    /// 文档自带的 `created_at_ms` 应当等于笔记的创建时间，
+    /// `updated_at_ms` 应当等于笔记的修改时间——否则会出现
+    /// "笔记说 10:00 改的、内容说 10:05 改的"这种自相矛盾的状态。
+    pub fn align_timestamps(&mut self, created_at_ms: i64, updated_at_ms: i64) {
+        self.metadata.created_at_ms = created_at_ms;
+        self.metadata.updated_at_ms = updated_at_ms;
+    }
+
     /// 序列化为存储字节（JSON）。
     ///
     /// # Errors

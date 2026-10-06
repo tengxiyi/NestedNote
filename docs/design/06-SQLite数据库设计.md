@@ -69,7 +69,7 @@ SQLite 在 WAL 模式下**同一时刻只允许一个写者**（多写者只会�
 
 - **覆盖**：客户端本地 SQLite（表、索引、约束、事务、迁移、分页、损坏处理）。
 - **不覆盖**：服务端 PostgreSQL（Q12，见 `12-服务端架构设计.md`）、
-  Document Model 的块结构（见 `06-Document-Model设计.md`）、
+  Document Model 的块结构（见 `07-Document-Model设计.md`）、
   FTS5 中文分词选型（见 `10-全文搜索设计.md`，须先有基准 + ADR）。
 
 ---

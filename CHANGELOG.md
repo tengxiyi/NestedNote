@@ -64,11 +64,11 @@
 - 客户端用例数由 149 增至 **204**
 
 **详细设计文档（铁律 M1，共约 3100 行）**
-- `docs/design/06-Document-Model设计.md` —— 13 种块类型逐字段、JSON 表示、
+- `docs/design/07-Document-Model设计.md` —— 13 种块类型逐字段、JSON 表示、
   行内标记的字节偏移取舍、格式版本演进规则、持久化与派生能力
-- `docs/design/05-SQLite数据库设计.md` —— PRAGMA 基线逐项、10 张表逐列、
+- `docs/design/06-SQLite数据库设计.md` —— PRAGMA 基线逐项、10 张表逐列、
   22 条索引与查询路径对应、事务边界、迁移体系、损坏容错
-- `docs/design/04-Rust-Core架构设计.md` —— 分层、12 个 crate 状态、
+- `docs/design/05-Rust-Core架构设计.md` —— 分层、12 个 crate 状态、
   `nested-core` 全部 24 个 `pub fn` 的 API 表、错误模型、FFI 契约、演进规则
 
 **附件内容寻址存储（`nested-attachment`，P1 能力提前落地）**

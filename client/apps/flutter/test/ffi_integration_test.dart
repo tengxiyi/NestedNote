@@ -166,4 +166,61 @@ void main() {
       reason: '软删除的笔记必须仍可查询（不是物理删除）',
     );
   });
+
+  test('无变更的保存不产生修订与同步操作（技术债 #11 的跨语言验证）', () async {
+    // 这条语义是编辑器自动保存的前提：若"内容没变也产生一条修订"，
+    // 自动保存就会把修订历史变成噪声，并让同步队列充满无意义操作。
+    // Rust 侧已有单元测试；这里验证它在**真实 FFI + SQLite** 上同样成立。
+    final tempDir = Directory.systemTemp.createTempSync('nested-save-test-');
+    addTearDown(() async {
+      await engineClose();
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+
+    expect((await engineStart(dataDir: tempDir.path)).ready, isTrue);
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final created = await notesCreate(title: '保存语义', atMs: now);
+    final id = created.value!.note!.id;
+
+    // 第一次保存：内容真的变了
+    final first = await notesSave(id: id, text: '内容 A', atMs: now + 1000);
+    expect(first.ok, isTrue);
+    expect(first.value!.note!.version.toInt(), 2, reason: '有变更应递增版本');
+
+    final afterFirst = await notesRevisionHistory(id: id, limit: 0);
+    expect(afterFirst.length, 2, reason: '创建 + 一次保存 = 2 条修订');
+
+    // 第二次保存：内容**完全相同**
+    final second = await notesSave(id: id, text: '内容 A', atMs: now + 2000);
+    expect(second.ok, isTrue);
+    expect(
+      second.value!.note!.version.toInt(),
+      2,
+      reason: '内容未变时版本不得前进',
+    );
+
+    final afterSecond = await notesRevisionHistory(id: id, limit: 0);
+    expect(
+      afterSecond.length,
+      2,
+      reason: '内容未变时不得追加修订记录',
+    );
+
+    // 第三次保存：内容又变了
+    final third = await notesSave(id: id, text: '内容 B', atMs: now + 3000);
+    expect(third.value!.note!.version.toInt(), 3);
+
+    final afterThird = await notesRevisionHistory(id: id, limit: 0);
+    expect(afterThird.length, 3);
+
+    // 修订父链：v3 的父是 v2，v2 的父是 v1，v1 无父
+    expect(afterThird[0].version.toInt(), 3);
+    expect(afterThird[0].parentId, afterThird[1].id, reason: 'v3 的父应指向 v2');
+    expect(afterThird[1].version.toInt(), 2);
+    expect(afterThird[1].parentId, afterThird[2].id, reason: 'v2 的父应指向 v1');
+    expect(afterThird[2].parentId, isNull, reason: '首条修订没有父');
+  });
 }

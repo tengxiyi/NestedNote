@@ -56,6 +56,11 @@ pub const ALL: &[Rule] = &[
         run: checks::no_large_files,
     },
     Rule {
+        id: "A-LAYERING",
+        title: "A-LAYERING: Flutter UI 不得直接依赖 Rust 生成绑定",
+        run: checks::flutter_layering,
+    },
+    Rule {
         id: "B-ENCODING",
         title: "B-ENCODING: PowerShell 脚本含中文时必须有 UTF-8 BOM",
         run: checks::powershell_scripts_need_bom,

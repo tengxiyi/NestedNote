@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use nested_db::NoteQuery;
-use nested_db::repositories::{notebooks, notes, tags};
+use nested_db::repositories::{notebooks, notes, revisions, tags};
 use nested_db::{Database, DbError};
 use nested_model::{Document, Id, Note, Notebook, Tag};
 
@@ -252,24 +252,79 @@ impl NestedCore {
         Ok(notes::list(&connection, query)?)
     }
 
-    /// 保存笔记（元数据 + 内容），自动递增修订号并追加修订记录（铁律 T6）。
+    /// 保存笔记（元数据 + 内容）。
+    ///
+    /// ## 修订语义（技术债 #11 已修正）
+    ///
+    /// - **内容或标题/摘要确有变化**时：递增 `version`、追加一条修订记录、
+    ///   往同步队列入队一条 `note.update`。
+    /// - **完全无变化**时：**什么都不做**，原样返回传入的笔记。
+    ///
+    /// 修正前是无条件 `touch()`：即使一个字都没改，保存也会推进版本、写一条修订
+    /// 并入队一条同步操作。这有两个实际后果：
+    ///
+    /// 1. 修订历史被噪声淹没，"哪几次才是真正的修改"无法分辨；
+    /// 2. **自动保存无法实现**——每次按键都会产生一条修订与一次同步操作。
+    ///
+    /// 因此这条语义是编辑器开启自动保存的前提。
+    ///
+    /// ## 修订父链
+    ///
+    /// 新修订的 `parent_revision_id` 指向该笔记当前最新的修订，
+    /// 从而形成可追溯的历史链（P6 的并发分叉检测依赖它）。
     ///
     /// # Errors
     ///
-    /// - 笔记本标题/摘要非法 → [`CoreError::Validation`]
+    /// - 标题/摘要非法 → [`CoreError::Validation`]
     /// - 笔记不存在 → [`CoreError::NotFound`]
     pub fn save_note(
         &self,
         mut note: Note,
-        document: Document,
+        mut document: Document,
         device_id: &str,
         at_ms: i64,
     ) -> CoreResult<Note> {
         note.set_title(note.title.clone())?;
         note.set_summary(note.summary.clone())?;
-        note.touch(at_ms);
+
         let mut connection = self.database.connection()?;
-        notes::save_with_document(&mut connection, &note, &document, device_id, None)?;
+
+        // 1) 内容是否变化：只比块，不比元信息（见 is_document_unchanged 的说明）
+        let content_changed = !notes::is_document_unchanged(&connection, &note.id, &document)?;
+
+        // 2) 元数据是否变化：与库中已有的记录比
+        let stored =
+            notes::get(&connection, &note.id)?.ok_or(CoreError::NotFound { entity: "note" })?;
+        let metadata_changed = stored.title != note.title
+            || stored.summary != note.summary
+            || stored.notebook_id != note.notebook_id
+            || stored.is_pinned != note.is_pinned
+            || stored.is_archived != note.is_archived;
+
+        if !content_changed && !metadata_changed {
+            // 无变化：不推进版本、不写修订、不入队（这正是修正后的关键行为）。
+            // 返回库中的记录而不是传入的 note，避免调用方拿到未落盘的字段。
+            tracing::debug!(note_id = %note.id, "保存时内容无变化，跳过修订与入队");
+            return Ok(stored);
+        }
+
+        // 3) 父链：指向当前最新修订。
+        //    这使修订历史成为一条可追溯的链，而不是互不相干的记录
+        //    （P6 的并发分叉检测依赖它）。
+        let parent_revision_id =
+            revisions::latest_for_note(&connection, &note.id)?.map(|revision| revision.id);
+
+        note.touch(at_ms);
+        // 文档元信息跟随笔记时间戳，避免出现
+        // "笔记说 10:00 改的、内容说 10:05 改的"这种自相矛盾的状态。
+        document.align_timestamps(note.created_at_ms, note.updated_at_ms);
+        notes::save_with_document(
+            &mut connection,
+            &note,
+            &document,
+            device_id,
+            parent_revision_id,
+        )?;
         Ok(note)
     }
 
@@ -367,6 +422,28 @@ impl NestedCore {
         Ok(nested_db::repositories::sync_operations::pending_count(
             &connection,
         )?)
+    }
+
+    /// 某篇笔记的修订历史，**按版本倒序**（最新在前）。
+    ///
+    /// `limit = 0` 时用默认值 50。
+    ///
+    /// ## 为什么 Core 要暴露它
+    ///
+    /// 修订历史是铁律 T6（每次修改可追踪）的对外体现：用户应当能回答
+    /// "这篇笔记改过几次、什么时候改的"。P3 的"版本历史"面板会直接消费它。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn revision_history(
+        &self,
+        note_id: &Id,
+        limit: u32,
+    ) -> CoreResult<Vec<nested_model::Revision>> {
+        let connection = self.database.connection()?;
+        let effective = if limit == 0 { 50 } else { limit };
+        Ok(revisions::list_for_note(&connection, note_id, effective)?)
     }
 }
 
@@ -470,21 +547,124 @@ mod tests {
     }
 
     #[test]
-    fn save_increments_version_and_leaves_pending_sync() {
+    fn save_with_changed_content_increments_version_and_enqueues() {
         let core = NestedCore::open_in_memory().expect("open");
         let note = core.create_note(None, "同步", NOW).expect("create");
-        let document = core.get_note_document(&note.id).expect("doc");
-        core.save_note(note, document, "device-a", NOW + 1)
+        assert_eq!(note.version, 1);
+
+        // 真正改了内容
+        let mut document = core.get_note_document(&note.id).expect("doc");
+        document.blocks = vec![nested_model::Block::paragraph("改过的内容")];
+        let saved = core
+            .save_note(note, document, "device-a", NOW + 1)
             .expect("save");
 
-        // **创建也必须入队**（铁律 T3 / 技术债 #12）：
-        // 此前只有"更新"入队，导致新建的笔记在 P6 同步时根本不会被推送到其他设备。
-        // 因此这里是 2 条：note.create + note.update。
+        assert_eq!(saved.version, 2, "有变更时必须递增版本（铁律 T6）");
+        // 创建 1 条 + 更新 1 条（铁律 T3 / 技术债 #12）
         assert_eq!(
             core.pending_sync_count().expect("pending"),
             2,
             "创建与更新都应入队"
         );
+    }
+
+    #[test]
+    fn saving_unchanged_content_does_nothing() {
+        // 回归测试（技术债 #11）：修正前 `save_note` 无条件 `touch()`，
+        // 于是"一个字都没改"的保存也会推进版本、写一条修订并入队。
+        // 这不只是历史记录被污染的问题——它让**自动保存无法实现**：
+        // 每次按键都会产生一条修订与一次同步操作。
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "无变更", NOW).expect("create");
+        let document = core.get_note_document(&note.id).expect("doc");
+
+        let pending_before = core.pending_sync_count().expect("pending");
+        let saved = core
+            .save_note(note, document, "device-a", NOW + 5000)
+            .expect("save");
+
+        assert_eq!(saved.version, 1, "内容未变时不得递增版本");
+        assert_eq!(
+            core.pending_sync_count().expect("pending"),
+            pending_before,
+            "内容未变时不得产生同步操作"
+        );
+        let revisions = core.revision_history(&saved.id, 10).expect("history");
+        assert_eq!(revisions.len(), 1, "内容未变时不得追加修订记录");
+    }
+
+    #[test]
+    fn saving_unchanged_content_does_not_move_updated_at() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "时间戳", NOW).expect("create");
+        let document = core.get_note_document(&note.id).expect("doc");
+        let before = note.updated_at_ms;
+
+        let saved = core
+            .save_note(note, document, "device-a", NOW + 9999)
+            .expect("save");
+        assert_eq!(
+            saved.updated_at_ms, before,
+            "无变更保存不应改变修改时间（否则列表排序会被无意义地打乱）"
+        );
+    }
+
+    #[test]
+    fn changing_only_the_title_still_counts_as_a_change() {
+        // 只改标题、内容不动，也必须产生修订与入队——
+        // 否则"改了标题"这件事永远同步不出去。
+        let core = NestedCore::open_in_memory().expect("open");
+        let mut note = core.create_note(None, "原标题", NOW).expect("create");
+        let document = core.get_note_document(&note.id).expect("doc");
+
+        note.set_title("新标题".to_owned()).expect("valid title");
+        let saved = core
+            .save_note(note, document, "device-a", NOW + 1)
+            .expect("save");
+
+        assert_eq!(saved.title, "新标题");
+        assert_eq!(saved.version, 2, "标题变更也应递增版本");
+        assert_eq!(core.pending_sync_count().expect("pending"), 2);
+    }
+
+    #[test]
+    fn revisions_form_a_parent_chain() {
+        // 技术债 #11 的另一半：此前 `parent_revision_id` 恒为 None，
+        // 修订之间互不相干，P6 的并发分叉检测缺少依据。
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "链", NOW).expect("create");
+
+        // 两次内容不同的保存
+        for (index, text) in ["第一次", "第二次"].iter().enumerate() {
+            let current = core.get_note(&note.id).expect("get");
+            let mut document = core.get_note_document(&note.id).expect("doc");
+            document.blocks = vec![nested_model::Block::paragraph(*text)];
+            // 用 u32 中转而不是直接 `as i64`：后者在 64 位平台上可能回绕，
+            // clippy 的 cast_possible_wrap 正是在拦这个（铁律 R 组要求零警告）。
+            let offset = i64::from(u32::try_from(index).expect("索引很小"));
+            core.save_note(current, document, "device-a", NOW + 10 * (offset + 1))
+                .expect("save");
+        }
+
+        let history = core.revision_history(&note.id, 10).expect("history");
+        assert_eq!(history.len(), 3, "创建 + 两次保存 = 3 条修订");
+
+        // history 按版本倒序：v3 的父应是 v2，v2 的父应是 v1，v1 无父
+        assert_eq!(history[0].version, 3);
+        assert_eq!(history[1].version, 2);
+        assert_eq!(history[2].version, 1);
+
+        assert_eq!(
+            history[0].parent_revision_id,
+            Some(history[1].id),
+            "v3 的父指针应指向 v2"
+        );
+        assert_eq!(
+            history[1].parent_revision_id,
+            Some(history[2].id),
+            "v2 的父指针应指向 v1"
+        );
+        assert_eq!(history[2].parent_revision_id, None, "首条修订没有父");
     }
 
     #[test]

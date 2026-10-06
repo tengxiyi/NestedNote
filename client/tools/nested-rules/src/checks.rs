@@ -522,6 +522,75 @@ pub fn no_large_files(root: &Path) -> Vec<Violation> {
     violations
 }
 
+/// A-LAYERING：Flutter 侧的分层约束（铁律 A1 / A2 / F1）。
+///
+/// ## 规则
+///
+/// `lib/src/rust/**` 是 `flutter_rust_bridge` 生成的绑定，也就是"Rust 内核的把手"。
+/// 只允许 **`lib/core/**`** 下的文件 import 它；其余位置（`lib/app/**` 等）一律禁止。
+///
+/// ## 为什么必须有这条检查
+///
+/// 这是本项目**最后一个没有自动检查的分层约束**。在它存在之前，任何人都可以在某个
+/// 页面里写一句 `import '../src/rust/api/notes.dart';` 然后直接操作内核——
+/// 编译通过、测试通过、评审时也极易漏过，但分层已经失效：业务规则开始渗进 UI，
+/// 而 UI 开始依赖生成代码的细节。
+///
+/// 这类失效**不会报错**，只会让后续每一次改动都更贵，因此必须由门禁拦住。
+///
+/// ## 盲区（诚实记录）
+///
+/// 本检查只看 import 的**路径字符串**，不做符号解析。因此通过 `part` / `export`
+/// 间接暴露的路径它管不到——这一点由 Review 兜底。
+#[must_use]
+pub fn flutter_layering(root: &Path) -> Vec<Violation> {
+    /// 生成代码所在目录（相对 Flutter 应用根）。
+    const GENERATED: &str = "lib/src/rust/";
+    /// 唯一允许访问生成代码的目录前缀。
+    const ALLOWED: &str = "lib/core/";
+
+    let mut violations = Vec::new();
+    let app_dir = root.join("client/apps/flutter");
+
+    for file in fsutil::collect_files(&app_dir, "dart") {
+        let relative = Violation::relative(root, &file).replace('\\', "/");
+
+        // 只看 lib/ 下的业务代码：test/ 与 tool/ 是开发期工具，
+        // 它们本来就该能直接驱动内核（集成测试的价值正在于此）。
+        let Some(index) = relative.find("/lib/") else {
+            continue;
+        };
+        let inside_lib = &relative[index + 1..]; // "lib/..."
+
+        // 生成代码自己可以自由 import；数据层是唯一允许的接触点
+        if inside_lib.starts_with(GENERATED) || inside_lib.starts_with(ALLOWED) {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+
+        for (offset, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("import ") && !trimmed.starts_with("export ") {
+                continue;
+            }
+            // 生成绑定的两种写法：相对路径与 package: 路径
+            if trimmed.contains("src/rust/") || trimmed.contains("package:nested/src/rust/") {
+                violations.push(Violation::new(
+                    "A-LAYERING",
+                    relative.clone(),
+                    offset + 1,
+                    "UI / 非数据层文件直接 import 了 Rust 生成绑定",
+                    "把这次调用移到 lib/core/ 下的提供者里，UI 只依赖提供者（铁律 A2 / F1）",
+                ));
+            }
+        }
+    }
+    violations
+}
+
 /// 检查 PowerShell 脚本是否满足"含非 ASCII 字符则必须有 UTF-8 BOM"。
 ///
 /// ## 为什么这是一条硬性检查
@@ -984,6 +1053,112 @@ mod tests {
         assert!(
             powershell_scripts_need_bom(&root).is_empty(),
             "纯 ASCII 脚本不需要 BOM，也不该被要求加上"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---------------------------------------------------------------- A-LAYERING
+
+    #[test]
+    fn ui_importing_generated_bindings_is_reported() {
+        // 这是"最后一个没有自动检查的分层约束"的回归防线：
+        // 在此之前，任何页面都能悄悄 import 生成绑定并直接操作内核，
+        // 编译与测试都不会报错，但分层已经失效。
+        let root = fixture("layering-bad");
+        write(
+            &root,
+            "client/apps/flutter/lib/app/notes_page.dart",
+            "import 'package:flutter/material.dart';\n\
+             import '../src/rust/api/notes.dart';\n",
+        );
+
+        let violations = flutter_layering(&root);
+        assert_eq!(violations.len(), 1, "实际：{violations:?}");
+        assert_eq!(violations[0].rule, "A-LAYERING");
+        assert_eq!(violations[0].line, 2, "应指向具体的 import 行");
+        assert!(violations[0].file.ends_with("lib/app/notes_page.dart"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn package_style_import_of_bindings_is_also_reported() {
+        let root = fixture("layering-package-style");
+        write(
+            &root,
+            "client/apps/flutter/lib/app/editor.dart",
+            "import 'package:nested/src/rust/api/notes.dart';\n",
+        );
+        let violations = flutter_layering(&root);
+        assert_eq!(violations.len(), 1, "package: 写法同样必须被拦住");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn core_layer_may_import_generated_bindings() {
+        // lib/core/ 是唯一允许的接触点——否则规则会把合法用法也拦掉
+        let root = fixture("layering-core-ok");
+        write(
+            &root,
+            "client/apps/flutter/lib/core/note_providers.dart",
+            "import '../src/rust/api/notes.dart';\n",
+        );
+        assert!(
+            flutter_layering(&root).is_empty(),
+            "数据层必须被允许访问生成绑定"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generated_code_may_import_itself() {
+        let root = fixture("layering-generated");
+        write(
+            &root,
+            "client/apps/flutter/lib/src/rust/api/notes.dart",
+            "import 'frb_generated.dart';\nimport 'package:nested/src/rust/frb_generated.dart';\n",
+        );
+        assert!(
+            flutter_layering(&root).is_empty(),
+            "生成代码自身不受此规则约束"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tests_and_tools_may_drive_the_engine_directly() {
+        // test/ 与 tool/ 是开发期工具，本来就该能直接驱动内核
+        // （集成测试的价值正在于验证真实 FFI 边界）。
+        let root = fixture("layering-tools-ok");
+        write(
+            &root,
+            "client/apps/flutter/test/ffi_integration_test.dart",
+            "import 'package:nested/src/rust/api/notes.dart';\n",
+        );
+        write(
+            &root,
+            "client/apps/flutter/tool/verify_app.dart",
+            "import 'package:nested/src/rust/frb_generated.dart';\n",
+        );
+        assert!(
+            flutter_layering(&root).is_empty(),
+            "测试与工具不应用业务代码的分层规则约束"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_import_lines_mentioning_bindings_are_ignored() {
+        // 注释或字符串里提到路径不算违规（只检查 import / export 语句）
+        let root = fixture("layering-comment");
+        write(
+            &root,
+            "client/apps/flutter/lib/app/page.dart",
+            "// 这里曾经 import '../src/rust/api/notes.dart'，已移到 core 层\n\
+             const String kDoc = 'lib/src/rust/ 是生成目录';\n",
+        );
+        assert!(
+            flutter_layering(&root).is_empty(),
+            "注释与字符串里的路径不应误报"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

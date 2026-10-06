@@ -220,6 +220,67 @@ pub fn get_document(connection: &Connection, note_id: &Id) -> Result<Document, D
     }
 }
 
+/// 已存文档的**原始字节**（不存在时返回 `None`）。
+///
+/// ## 为什么要读原始字节而不是解析后的 `Document`
+///
+/// 用于判断"内容是否真的变了"（[`is_document_unchanged`]）。
+/// 解析再比较会引入两个问题：
+///
+/// 1. **丢失未知字段**：`Document` 解析后重新序列化，可能丢掉本版本不认识的
+///    字段（将来新增块类型时），于是"内容没变"被误判为"变了"；
+/// 2. **依赖相等语义**：`Document` 的 `PartialEq` 一旦包含时间戳之类的元数据，
+///    比较结果就不再等于"用户改的内容"。
+///
+/// 直接比字节最严格也最便宜。
+///
+/// # Errors
+///
+/// 查询失败时返回 [`DbError::Sqlite`]。
+pub fn get_document_bytes(
+    connection: &Connection,
+    note_id: &Id,
+) -> Result<Option<Vec<u8>>, DbError> {
+    connection
+        .query_row(
+            "SELECT content FROM documents WHERE note_id = ?1",
+            params![note_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+}
+
+/// 判断给定文档与库中已存内容是否**语义相同**（只比块，不比元信息）。
+///
+/// ## 为什么不能比序列化字节
+///
+/// `DocumentMetadata` 含 `created_at_ms` / `updated_at_ms`，而
+/// `Document::from_blocks(blocks, at_ms)` 每次都会用传入的时间戳构造元信息。
+/// 因此"同样的正文在不同时刻构造两次"会得到**不同的字节**。
+///
+/// 本项目在修技术债 #11 时先写成了字节比较，结果是：用户一个字没改，
+/// 保存仍被判定为"有变更"，照样递增版本、追加修订、入队同步——问题原封不动。
+/// 改用 [`Document::has_same_content`] 后才真正成立。
+///
+/// 库中还没有文档时返回 `false`（需要写入）。
+///
+/// # Errors
+///
+/// 读取失败时返回 [`DbError::Sqlite`]；已存字节损坏时返回 [`DbError::Corrupt`]。
+pub fn is_document_unchanged(
+    connection: &Connection,
+    note_id: &Id,
+    document: &Document,
+) -> Result<bool, DbError> {
+    let Some(stored) = get_document_bytes(connection, note_id)? else {
+        return Ok(false);
+    };
+    let stored_document =
+        Document::from_bytes(&stored).map_err(|_| DbError::Corrupt { entity: "document" })?;
+    Ok(stored_document.has_same_content(document))
+}
+
 /// 原子地保存一篇笔记的全部内容变更（铁律 D1 / T6）。
 ///
 /// 一次性完成：

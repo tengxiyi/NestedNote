@@ -14,7 +14,7 @@
 | 权威实现 | `client/crates/nested-core`、`client/crates/nested-*`、`client/apps/rust` |
 | 强制条款 | [铁律](../02-工程铁律.md) T4 / T7 / T8、A1–A10、D1–D12、Q1–Q12、R1–R13、E1–E8、Z1–Z7、B1/B5 |
 | 相关 ADR | [0002 客户端与服务端两个 workspace](../adr/0002-split-client-server-workspaces.md)、[0003 迁移哈希护栏](../adr/0003-migration-hash-guard.md)、[0004 铁律检查器用 Rust](../adr/0004-rules-checker-in-rust.md) |
-| 关联设计文档 | `03-项目总体架构.md`、`05-SQLite数据库设计.md`（本文只描述"如何用"，不重复表结构） |
+| 关联设计文档 | `03-项目总体架构.md`、`06-SQLite数据库设计.md`（本文只描述"如何用"，不重复表结构） |
 
 ---
 

@@ -443,6 +443,53 @@ pub fn notes_count() -> i64 {
     }
 }
 
+/// 一条修订记录在界面上的表示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionEntry {
+    /// 修订标识。
+    pub id: String,
+    /// 对应的笔记版本号。
+    pub version: i64,
+    /// 父修订标识（首条修订为 `None`）；用于验证历史链完整。
+    pub parent_id: Option<String>,
+    /// 产生该修订的设备标识。
+    pub device_id: String,
+    /// 操作类型，如 `"note.update"`。
+    pub operation: String,
+    /// 记录时间（UTC 毫秒）。
+    pub created_at_ms: i64,
+}
+
+/// 某篇笔记的修订历史，**按版本倒序**（最新在前）。
+///
+/// ## 为什么把它暴露到界面
+///
+/// 铁律 T6 要求"每一次修改必须可追踪"。暴露它有两个直接价值：
+///
+/// 1. **可验证**：跨语言测试能断言"无变更的保存不产生修订"（技术债 #11 的
+///    关键语义），而不必只相信 Rust 侧的单元测试；
+/// 2. **P3 的版本历史面板**会直接消费它。
+#[must_use]
+pub fn notes_revision_history(id: &str, limit: u32) -> Vec<RevisionEntry> {
+    let Ok(parsed) = Id::parse(id) else {
+        return Vec::new();
+    };
+    match with_core(|core| core.revision_history(&parsed, limit)) {
+        Ok(revisions) => revisions
+            .into_iter()
+            .map(|revision| RevisionEntry {
+                id: revision.id.to_string(),
+                version: revision.version,
+                parent_id: revision.parent_revision_id.map(|parent| parent.to_string()),
+                device_id: revision.device_id,
+                operation: revision.operation,
+                created_at_ms: revision.created_at_ms,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
