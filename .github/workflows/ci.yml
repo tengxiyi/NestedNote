@@ -116,6 +116,22 @@ jobs:
         with:
           workspaces: client
 
+      # FFI 绑定生成需要 Flutter 工具链：flutter_rust_bridge_codegen 会调用
+      # `flutter --version` 来解析 Dart SDK 位置，没有它就直接失败
+      # （实测报 "Dart/Flutter toolchain not available"）。
+      #
+      # 只给 client 作业装 Flutter：server / rules / audit 作业完全不需要它。
+      # subosito/flutter-action 自带缓存，后续运行不会重复下载 1.8 GB 的 SDK。
+      #
+      # 版本固定为 3.47.6，与开发机一致（铁律 B1：构建必须可复现）。
+      # 升级时必须同时更新这里、README 的"环境要求"与本地 SDK。
+      - name: 安装 Flutter 工具链
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.6'
+          channel: stable
+          cache: true
+
       # 必须在任何 cargo 检查之前执行：FFI 桥接的生成物不入库，
       # 而 client/apps/rust/src/lib.rs 里是无条件声明 `mod frb_generated;`，
       # 没有这个文件时 cargo fmt / clippy / test 都会直接失败。
@@ -123,13 +139,12 @@ jobs:
       # 脚本做三件事：校验 codegen 版本与 pubspec 一致 → 生成绑定 →
       # 用 rustfmt 规范化生成物的格式（codegen 产出的 import 顺序不符合 rustfmt，
       # 不规范化会导致 `cargo fmt --check` 每次都在同一处假失败）。
-      #
-      # 版本必须与 pubspec 里的 flutter_rust_bridge 严格一致：不一致会导致
-      # 生成的桥接代码编译失败。脚本会自己校验，这里只需确保装到同一个版本。
       - name: 生成 FFI 绑定
         working-directory: client/apps/flutter
         shell: pwsh
         run: |
+          # 先确认 Flutter 真的可用（否则后面的 codegen 会给出更难懂的错误）
+          flutter --version
           $pinned = (Select-String -Path pubspec.yaml -Pattern 'flutter_rust_bridge:\s*\^([0-9.]+)' |
             Select-Object -First 1).Matches[0].Groups[1].Value
           Write-Host "pubspec 声明的 flutter_rust_bridge 版本：$pinned"

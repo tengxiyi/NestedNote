@@ -47,7 +47,7 @@ Flutter UI → FRB 绑定 → nested_app（Rust）→ nested-core → nested-db 
 |---|---|---|
 | Rust | 1.92.0 | 由 `client/rust-toolchain.toml` 与 `server/rust-toolchain.toml` 自动锁定并安装 |
 | MSVC 生成工具 | VS 2022/2026 Build Tools | Windows 上 Rust 与 Flutter 桌面构建所需（含 C++ 工作负载） |
-| Flutter | **3.47.6 stable**（Dart 3.13.5） | UI 需要；Rust 内核与 CLI 不需要。安装见下 |
+| Flutter | **3.47.6 stable**（Dart 3.13.5） | UI 需要；Rust 内核与 CLI 不需要。CI 固定同一版本（见 `.github/workflows/ci.yml`），升级时三处同步：本表、CI、本地 SDK |
 | `flutter_rust_bridge_codegen` | **2.13.0** | 必须与 pubspec 里的 `flutter_rust_bridge` 版本一致 |
 | Docker | 可选 | 本地 PostgreSQL + MinIO（P6 同步阶段才需要） |
 
