@@ -1,0 +1,19 @@
+[package]
+name = "nested-search"
+description = "全文搜索：SQLite FTS5 索引与查询（含中文分词策略）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nested-model.workspace = true
+nested-db.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

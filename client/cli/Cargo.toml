@@ -1,0 +1,30 @@
+[package]
+name = "nested-cli"
+description = "拾光笔记内核命令行：无 UI 的验收与运维工具（P1 阶段的主力验收手段）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nested"
+path = "src/main.rs"
+
+[dependencies]
+nested-core.workspace = true
+nested-model.workspace = true
+nested-db.workspace = true
+protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

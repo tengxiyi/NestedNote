@@ -1,0 +1,19 @@
+[package]
+name = "nested-sync"
+description = "同步引擎：设备标识、操作日志、push/pull、冲突检测（P6 起实现）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nested-model.workspace = true
+nested-db.workspace = true
+protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

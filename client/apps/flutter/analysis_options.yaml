@@ -1,0 +1,36 @@
+include: package:flutter_lints/flutter.yaml
+
+# 团队额外规则（对应《工程铁律》F 组）。
+# 说明：这里只放"能由分析器表达"的约束；分层约束（Flutter 不得碰 SQLite）
+# 由 scripts/check-rules.ps1 在仓库层面检查。
+linter:
+  rules:
+    # F2：警告即问题，禁止用 ignore 掩盖
+    always_declare_return_types: true
+    avoid_print: true            # 日志必须走 logging，禁止 print
+    prefer_const_constructors: true
+    prefer_const_declarations: true
+    prefer_final_locals: true
+    unawaited_futures: true      # 未 await 的 Future 是静默 bug 的常见来源
+    use_build_context_synchronously: true
+    # F1/F4：资源释放与副作用
+    cancel_subscriptions: true
+    close_sinks: true
+    # U3：Unicode 处理
+    avoid_utf8_decoding_with_slice_and_remove: true
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  errors:
+    # 以下问题在 CI 中视为错误（`flutter analyze` 必须 0 error / 0 warning）
+    avoid_print: error
+    unawaited_futures: error
+    unused_import: error
+    dead_code: error
+  exclude:
+    - "**/*.g.dart"          # 生成的绑定代码
+    - "**/*.freezed.dart"
+    - "build/**"

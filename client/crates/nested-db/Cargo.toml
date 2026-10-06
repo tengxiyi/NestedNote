@@ -1,0 +1,24 @@
+[package]
+name = "nested-db"
+description = "SQLite 存储层：PRAGMA / migration / Repository（唯一允许写 SQL 的 crate）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nested-model.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

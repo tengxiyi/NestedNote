@@ -1,0 +1,23 @@
+[package]
+name = "nested-rules"
+description = "铁律自动检查器：把《工程铁律》中可机械检查的条款变成 CI 门禁"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nested-rules"
+path = "src/main.rs"
+
+[lib]
+name = "nested_rules"
+path = "src/lib.rs"
+
+# 只依赖标准库：检查器本身必须"零依赖、零构建风险"，
+# 否则它会成为 CI 里最脆弱的一环（铁律 A8：依赖必须值得）。
+[dependencies]
+
+[lints]
+workspace = true

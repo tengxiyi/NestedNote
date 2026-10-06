@@ -1,0 +1,42 @@
+name: nested
+description: "拾光笔记 / NestedNote —— 本地优先的跨平台笔记应用"
+publish_to: "none"
+
+# 版本号：<应用版本>+<构建号>
+# 与 Rust 侧无关：Rust 内核版本由 client/Cargo.toml 的 workspace.package.version 决定。
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Rust 内核绑定（FFI 桥接）。由 flutter_rust_bridge 生成，见 docs/design/。
+  # 注意：P0 阶段 Rust 侧尚未生成绑定，因此本依赖在 `flutter pub get` 后才可用。
+  flutter_rust_bridge: ^2.0.0
+
+  # 状态管理（技术文档 §27：状态分层 UI → Feature → Rust Repository）
+  flutter_riverpod: ^2.5.1
+
+  # 应用数据目录（数据库与附件存放位置）
+  path_provider: ^2.1.4
+
+  # 日志（铁律 E4：Release 默认 INFO）
+  logging: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+  # 绑定代码生成工具（P0-5 打通 FFI 时启用）
+  flutter_rust_bridge_codegen: ^2.0.0
+
+flutter:
+  uses-material-design: true
+
+  # 应用显示名走本地化资源，禁止硬编码到 Widget（铁律 F8）
+  # assets:
+  #   - assets/

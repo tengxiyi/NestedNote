@@ -1,0 +1,15 @@
+[package]
+name = "nested-crypto"
+description = "加密与平台密钥存储抽象：密钥绝不入库明文（铁律 D11）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

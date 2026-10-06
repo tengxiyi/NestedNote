@@ -1,0 +1,124 @@
+# 拾光笔记 / NestedNote —— 客户端 workspace
+#
+# 客户端与服务端是两个**互相隔离**的 workspace（技术文档 §4.1）：
+#   - 客户端绝不编译 axum / sqlx / tokio-postgres
+#   - 服务端绝不编译 rusqlite / Flutter 绑定
+# 因此本目录自带 Cargo.lock，根目录**没有** Cargo.toml。
+
+[workspace]
+resolver = "3"
+members = [
+    "apps/rust",
+    "cli",
+    "tools/nested-rules",
+    "crates/nested-core",
+    "crates/nested-model",
+    "crates/nested-db",
+    "crates/nested-search",
+    "crates/nested-attachment",
+    "crates/nested-import",
+    "crates/nested-export",
+    "crates/nested-sync",
+    "crates/nested-crypto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-or-later"
+repository = "https://example.invalid/nested"
+authors = ["拾光笔记 / NestedNote contributors"]
+
+[workspace.dependencies]
+# ---- 内部 crate ----
+nested-core = { path = "crates/nested-core" }
+nested-model = { path = "crates/nested-model" }
+nested-db = { path = "crates/nested-db" }
+nested-search = { path = "crates/nested-search" }
+nested-attachment = { path = "crates/nested-attachment" }
+nested-import = { path = "crates/nested-import" }
+nested-export = { path = "crates/nested-export" }
+nested-sync = { path = "crates/nested-sync" }
+nested-crypto = { path = "crates/nested-crypto" }
+# 跨端唯一共享物：纯数据契约（无 IO 依赖）
+protocol = { path = "../shared/protocol" }
+
+# ---- 外部依赖（版本由 cargo generate-lockfile 从 crates.io 解析，铁律 B1）----
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+uuid = { version = "1.27.0", features = ["v7", "serde"] }
+time = { version = "0.3.55", features = ["formatting", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+criterion = "0.8.2"
+tempfile = "3.27.0"
+
+# ---- 工作区 lint 基线（铁律 R7：clippy 必须干净）----
+#
+# 关于 panic 类 lint 的分工（重要）：
+#   - clippy 的 unwrap_used / expect_used / panic **在测试代码里必然误报**
+#     （测试用 panic 表达失败是正确做法，且无法给 #[test] 函数加 allow ——
+#      Clippy 不允许在带 #[test] 的条目上写 #[allow]）。
+#   - 因此这里保持 warn（不 deny），真正的"产品代码禁止 panic"由
+#     scripts/check-rules.ps1 的 R1 规则强制：它只扫 src/ 且跳过 #[cfg(test)] 模块。
+#   - 两者合起来的效果正是我们想要的：产品代码严格，测试代码不受噪音干扰。
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+# 关于测试代码的 panic 类 lint（重要）：
+#   clippy 的 unwrap_used / expect_used / panic 在测试里必然误报，且 Clippy **不允许**
+#   在带 #[test] 的条目上写 #[allow]（会报 "useless attribute"），因此无法逐处压制。
+#   真正的"产品代码禁止 panic"由 scripts/check-rules.ps1 的 R1 规则强制：
+#   它只扫 src/ 且跳过 #[cfg(test)] 模块。
+#   两者合起来的效果正是我们要的：产品代码严格，测试代码零噪音。
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+unwrap_in_result = "allow"
+# 以下为 pedantic 噪音项，统一在此关闭，使 `#[allow]` 的每次出现都值得被追问（铁律 R7）
+trivially_copy_pass_by_ref = "allow"
+many_single_char_names = "allow"
+format_collect = "allow"
+match_same_arms = "allow"
+unnecessary_wraps = "allow"
+# 以下 pedantic 项在"清晰优先"的项目里属于噪音，统一在此关闭而不是到处写 allow，
+# 这样 `#[allow]` 的每一次出现都值得被 Reviewer 追问（铁律 R7）。
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+too_many_lines = "allow"
+missing_docs_in_private_items = "allow"
+similar_names = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+items_after_statements = "allow"
+option_if_let_else = "allow"
+implicit_hasher = "allow"
+needless_pass_by_value = "allow"
+struct_excessive_bools = "allow"
+unreadable_literal = "allow"
+let_underscore_must_use = "allow"
+return_self_not_must_use = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"

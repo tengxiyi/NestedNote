@@ -1,0 +1,31 @@
+[package]
+name = "nested-core"
+description = "拾光笔记内核：Domain Service，Flutter 通过 FFI 只与本 crate 对话"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nested-model.workspace = true
+nested-db.workspace = true
+nested-search.workspace = true
+nested-attachment.workspace = true
+nested-import.workspace = true
+nested-export.workspace = true
+nested-sync.workspace = true
+nested-crypto.workspace = true
+protocol.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

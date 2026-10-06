@@ -1,0 +1,6 @@
+[toolchain]
+# 铁律 B1：工具链必须锁定，禁止依赖"我这台机器能跑"
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
+targets = ["x86_64-pc-windows-msvc"]

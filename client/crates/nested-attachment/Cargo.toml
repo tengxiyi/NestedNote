@@ -1,0 +1,19 @@
+[package]
+name = "nested-attachment"
+description = "附件系统：内容寻址存储（SHA-256）、缩略图、引用计数与 GC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nested-model.workspace = true
+nested-db.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
