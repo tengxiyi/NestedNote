@@ -15,6 +15,14 @@ dependencies:
   flutter:
     sdk: flutter
 
+  # Rust 内核的本地构建与加载（Cargokit）。它把 ../rust 编译成平台库并随应用打包，
+  # 因此 `flutter run` 会自动带上 Rust 产物，无需手工复制 dll。
+  #
+  # 注意包名用下划线：Dart 包名不允许连字符，而 Rust crate 名是 `nested-app`。
+  # 两者的差异由 rust_builder/pubspec.yaml 的 `name:` 桥接（它只负责构建，不含 Dart 代码）。
+  nested_app:
+    path: rust_builder
+
   # Rust 内核绑定（FFI 桥接的 Dart 侧）。
   # 注意：命令行代码生成器 `flutter_rust_bridge_codegen` 是 **Rust 的 cargo 子命令**，
   # 不是 Dart 包，因此它不出现在这里（见 README「生成 Flutter 平台工程」）。

@@ -59,7 +59,7 @@ time = { version = "0.3.55", features = ["formatting", "macros"] }
 
 # ---- 工作区 lint 基线（铁律 R7）----
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 

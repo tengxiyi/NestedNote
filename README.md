@@ -22,14 +22,20 @@ Flutter UI  →  FFI  →  Rust Core（nested-*）  →  SQLite + FTS5  →  本
 
 | 项 | 状态 |
 |---|---|
-| 阶段 | **P0 工程基座（已完成）** → 下一步 P1 Rust Core 数据内核 |
-| 代码 | 客户端 10 个 crate + 服务端 6 个 crate + Flutter 应用源码骨架已建立 |
-| 验证 | 客户端 **147** 个测试、服务端 **22** 个测试全部通过；两端 `fmt` 与 `clippy -D warnings` 干净 |
-| 铁律门禁 | `nested-rules` 已可执行（7 条规则自动化 + 每条带单元测试） |
-| Flutter | 应用源码已就位；平台目录需 Flutter 工具链（本机未安装），见「快速开始」 |
-| 文档 | 项目章程 / 开发计划 / 工程铁律 / 总体技术方案 |
+| 阶段 | **P0 工程基座：已通过 Gate 评审**（见 [gate-p0 评审记录](docs/reports/gate-p0.md)）→ 下一步 P1 Rust Core 数据内核 |
+| 代码 | 客户端 11 个 crate + 服务端 6 个 crate + Flutter 应用（四平台工程） |
+| 验证 | 客户端 **149** 个测试、服务端 **22** 个测试、Flutter **3** 个测试全部通过；两端 `fmt` 与 `clippy -D warnings` 干净；`flutter analyze` 无问题 |
+| 铁律门禁 | `nested-rules` 7 条规则自动化，每条带单元测试；当前 0 违规 |
+| **Flutter ↔ Rust** | **已打通**：真实应用启动后由 Rust 建库、执行迁移、返回自检结果 |
+| 文档 | 项目章程 / 开发计划 / 工程铁律 / 总体技术方案 / 5 份 ADR / Gate 评审记录 |
 
-> 已实测通过的可运行闭环：`nested init` 建库并迁移 → `nested doctor` 自检 → 数据落盘重启不丢。
+实测通过的完整闭环：
+
+```text
+Flutter UI → FRB 绑定 → nested_app（Rust）→ nested-core → nested-db → SQLite
+                                                                      ↓
+  界面显示「拾光笔记 0.1.0」+ 三项自检全绿  ←  ready=true，schema v1，integrity ok
+```
 
 ---
 
@@ -40,9 +46,20 @@ Flutter UI  →  FFI  →  Rust Core（nested-*）  →  SQLite + FTS5  →  本
 | 组件 | 版本 | 说明 |
 |---|---|---|
 | Rust | 1.92.0 | 由 `client/rust-toolchain.toml` 与 `server/rust-toolchain.toml` 自动锁定并安装 |
-| MSVC 生成工具 | VS 2022/2026 Build Tools | Windows 上 Rust 链接所需（含 C++ 工作负载） |
-| Flutter | stable（Dart ≥ 3.6） | **仅客户端 UI 需要**；Rust 内核与 CLI 不需要 |
+| MSVC 生成工具 | VS 2022/2026 Build Tools | Windows 上 Rust 与 Flutter 桌面构建所需（含 C++ 工作负载） |
+| Flutter | **3.47.6 stable**（Dart 3.13.5） | UI 需要；Rust 内核与 CLI 不需要。安装见下 |
+| `flutter_rust_bridge_codegen` | **2.13.0** | 必须与 pubspec 里的 `flutter_rust_bridge` 版本一致 |
 | Docker | 可选 | 本地 PostgreSQL + MinIO（P6 同步阶段才需要） |
+
+一次性安装：
+
+```powershell
+# Flutter SDK（下载 + SHA-256 校验 + 解压 + 配置 PATH，约 1.8 GB）
+powershell -NoProfile -File scripts/install-flutter.ps1
+
+# FFI 绑定生成器（必须与 Dart 侧 flutter_rust_bridge 同版本）
+cargo install flutter_rust_bridge_codegen --version 2.13.0 --locked
+```
 
 ### 验证内核（无需 Flutter）
 
@@ -52,30 +69,46 @@ just check                     # 未安装 just 时见下方分步命令
 
 # 2) 分步执行
 cd client; cargo test --workspace; cargo clippy --workspace --all-targets -- -D warnings
-cd server; cargo test --workspace; cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p nested-rules -- --root ..        # 铁律检查（在 client 目录下执行）
+cd ../server; cargo test --workspace; cargo clippy --workspace --all-targets -- -D warnings
+cd ../client; cargo run -p nested-rules -- --root ..     # 铁律检查
 
-# 3) 实测数据闭环
-cd client
-cargo run -p nested-cli -- version                       # 品牌与版本
-cargo run -p nested-cli -- doctor --data-dir C:\tmp\nested   # 建库 + 迁移 + 自检
-cargo run -p nested-cli -- doctor --data-dir C:\tmp\nested   # 再跑一次：数据仍在
+# 3) CLI 实测数据闭环
+cargo run -p nested-cli -- version                            # 品牌与版本
+cargo run -p nested-cli -- doctor --data-dir C:\tmp\nested    # 建库 + 迁移 + 自检
+cargo run -p nested-cli -- doctor --data-dir C:\tmp\nested    # 再跑一次：数据仍在
 
 # 4) 服务端（不需要数据库也能启动，/readyz 会如实报未就绪）
-cd server; cargo run -p server               # 监听 127.0.0.1:8080
-curl http://127.0.0.1:8080/healthz           # {"status":"ok"}
-curl -i http://127.0.0.1:8080/readyz         # 503（未配置 DATABASE_URL）
+cd ../server; cargo run -p server              # 监听 127.0.0.1:8080
+curl http://127.0.0.1:8080/healthz             # {"status":"ok"}
+curl -i http://127.0.0.1:8080/readyz           # 503（未配置 DATABASE_URL）
 ```
 
-### 生成 Flutter 平台工程（首次配置时执行一次）
+### 运行 Flutter 应用（Windows 桌面）
 
 ```powershell
-pwsh scripts/bootstrap-flutter.ps1          # 检查工具链并生成 windows/macos/ios/android
-pwsh scripts/build-rust-for-flutter.ps1     # 构建 Rust 静态库并放到平台工程可链接的位置
-cd client/apps/flutter; flutter run -d windows
+cd client/apps/flutter
+
+# Rust 动态库：Cargokit 插件会在 flutter build/run 时自动编译并打包，
+# 但 `flutter test` 需要显式构建到 FRB 默认查找的位置（见下）
+cd ../..; cargo build -p nested_app --release; cd apps/flutter
+
+# 静态检查与测试（含真实 FFI 集成测试）
+flutter analyze
+$env:FRB_DART_LOAD_EXTERNAL_LIBRARY_NATIVE_LIB_DIR = "$PWD/../../target/release"
+flutter test
+
+# 运行 GUI 应用
+flutter run -d windows
 ```
 
-> 平台目录（`windows/ macos/ ios/ android/`）由 `flutter create` 生成，生成后随仓库提交。
+> **首次配置**（仅需一次）：`powershell -NoProfile -File scripts/bootstrap-flutter.ps1`
+> 生成 `windows/ macos/ ios/ android/` 平台工程。注意它会覆盖 `lib/` 下的自定义文件，
+> 因此该脚本用于**首次生成**；日常不要重复执行。
+>
+> **修改 Rust API 后**必须重新生成绑定：
+> `cd client/apps/flutter; flutter_rust_bridge_codegen generate`
+> 生成物（`apps/rust/src/frb_generated.rs`、`lib/src/rust/**`）不入库，已列入 `.gitignore`。
+
 
 ---
 

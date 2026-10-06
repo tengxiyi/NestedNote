@@ -31,9 +31,22 @@ const SQL_INTERPOLATION_ALLOWED: &[&str] = &["COLUMNS", "columns"];
 /// 单个文件的体积上限（5 MiB，铁律 V6）。
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// 判断某个相对路径是否指向**生成代码**。
+///
+/// 生成代码不是人写的，既不该按手写标准要求，改也改不动（下次生成就覆盖）。
+/// 目前唯一的生成物是 flutter_rust_bridge 的 `frb_generated.rs`。
+#[must_use]
+fn is_generated(relative_path: &str) -> bool {
+    let file_name = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    file_name.contains("generated")
+}
+
 /// R1：产品代码不得出现 `unwrap()` / `expect()` / `panic!` / `todo!` / `unimplemented!`。
 ///
-/// 覆盖范围：`src/` 下的 `.rs` 文件，**排除** `#[cfg(test)]` 模块。
+/// 覆盖范围：`src/` 下的 `.rs` 文件，**排除**：
+/// - `#[cfg(test)]` 模块（测试里 panic 是正确做法）；
+/// - 生成代码（文件名含 `generated`，如 FRB 产出的 `frb_generated.rs`）。
+///
 /// 不覆盖：`tests/` 与 `benches/` 目录（测试里 panic 是正确做法）。
 #[must_use]
 pub fn panic_free_production_code(root: &Path) -> Vec<Violation> {
@@ -46,7 +59,7 @@ pub fn panic_free_production_code(root: &Path) -> Vec<Violation> {
         }
         for file in fsutil::collect_files(&dir, "rs") {
             let relative = Violation::relative(root, &file);
-            if !relative.contains("/src/") {
+            if !relative.contains("/src/") || is_generated(&relative) {
                 continue;
             }
 

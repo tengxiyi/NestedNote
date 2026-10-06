@@ -21,6 +21,12 @@ client/apps/flutter/android/local.properties
 client/apps/flutter/android/key.properties
 *.g.dart.bak
 
+# ---- flutter_rust_bridge 生成物（不入库）----
+# 它们完全由 client/apps/flutter/flutter_rust_bridge.yaml 与 client/apps/rust/src/api/ 决定，
+# 提交只会制造无意义的 diff 与合并冲突。重建：flutter_rust_bridge_codegen generate
+client/apps/rust/src/frb_generated.rs
+client/apps/flutter/lib/src/rust/
+
 # ---- 本地数据与运行时产物（绝不能进仓库，铁律 V5）----
 *.db
 *.db-wal

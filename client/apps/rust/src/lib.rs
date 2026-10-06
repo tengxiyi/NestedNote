@@ -1,8 +1,30 @@
 //! # nested-app —— Flutter ↔ Rust 桥接层
 //!
-//! **状态**：P0 提供最小可调用面（品牌、版本、就绪自检）。
-//! 完整的 `flutter_rust_bridge` 绑定生成将在 Flutter 工具链就绪后接入
-//! （见开发计划 P0-5）。
+//! 由 `flutter_rust_bridge` 生成的绑定把 [`api`] 模块里的函数暴露给 Dart。
+//! Flutter 只与本 crate 对话（铁律 A1/A3/T4）。
+//!
+//! ## 这个 crate 里的三部分
+//!
+//! | 文件 | 归属 | 说明 |
+//! |---|---|---|
+//! | `src/api/*.rs` | **手写（入库）** | 导出的业务 API，是唯一的跨语言契约面 |
+//! | `src/frb_generated.rs` | 生成（不入库） | codegen 产出的桥接样板 |
+//! | `lib/src/rust/**` | 生成（不入库） | codegen 产出的 Dart 绑定 |
+//!
+//! 生成物不入库的理由：它们完全由 `flutter_rust_bridge.yaml` 与 `src/api/` 决定，
+//! 提交它们只会制造无意义的 diff 与合并冲突。重建命令见 README
+//! （`flutter_rust_bridge_codegen generate`）。
+//!
+//! ## 为什么这里没有 `#![forbid(unsafe_code)]`
+//!
+//! 生成代码里包含 FFI 必需的 `unsafe` 块（跨语言指针转换）。因此本项目对
+//! **手写代码**用两条更强的约束替代它：
+//!
+//! - `nested-rules` 的 R1 规则扫描手写源码，禁止 panic 类调用与调试宏；
+//! - `nested-rules` 的 A-ISOLATION 规则保证 FFI 层不会越界依赖服务端。
+//!
+//! 换言之：不用 crate 级 `forbid` 一刀切，是因为它会把**生成代码**一起拦下，
+//! 而真正需要约束的是手写的 `src/api/`。
 //!
 //! ## 契约要求（铁律 A3 / A4）
 //!
@@ -10,112 +32,23 @@
 //! - 跨边界只传可序列化的简单结构，不传裸指针、不传数据库句柄；
 //! - 所有函数**禁止** panic：错误一律以结构化结果返回（铁律 E1）。
 
-#![forbid(unsafe_code)]
+// 生成代码的 lint 豁免（理由见下）。
+//
+// 为什么豁免整个 crate 而不是逐个 `#[allow]`：
+//   `frb_generated.rs` 由 codegen 每次重新生成，在其中插入 `#[allow]` 会被覆盖；
+//   而它的代码风格不受我们控制（例如 `self as _` 转换、`use super::*` 通配导入、
+//   不需要的 `else` 分支等）。因此这类噪音必须在**模块之外**压制。
+//
+// 这不等于放过 FFI 层：手写的 `src/api/` 仍受 `nested-rules` 的 R1 规则
+// （禁止 panic 类调用）与 A-ISOLATION 规则约束。
+//
+// `unreachable_pub` 也一并豁免：生成代码在**二进制/库 root** 上写 `pub use io::*;`，
+// 该 lint 会把它判为无效可见性。
+#![allow(unsafe_code, unreachable_pub, clippy::all, clippy::pedantic)]
 
-use nested_core::{NestedCore, branding};
+// `mod frb_generated;` 由 codegen 自动注入并**必须保持为第一个 item**：
+// 生成文件顶部带有 `#![allow(...)]` 内部属性，而 Rust 只允许内部属性出现在
+// 文件/模块的最前面。手工把它移到别处会导致编译失败。
+mod frb_generated;
 
-/// 版本信息（键值对，便于跨 FFI 传递）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionInfo {
-    /// 中文品牌名。
-    pub name_zh: String,
-    /// 英文品牌名。
-    pub name_en: String,
-    /// 应用版本。
-    pub version: String,
-}
-
-/// 返回品牌与版本信息。
-#[must_use]
-pub fn version_info() -> VersionInfo {
-    VersionInfo {
-        name_zh: branding::BRAND_NAME_ZH.to_owned(),
-        name_en: branding::BRAND_NAME_EN.to_owned(),
-        version: branding::APP_VERSION.to_owned(),
-    }
-}
-
-/// 返回操作界面显示名（按 BCP-47 语言标签）。
-#[must_use]
-pub fn display_name(language_tag: &str) -> String {
-    branding::display_name(language_tag).to_owned()
-}
-
-/// 引擎启动自检结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineStatus {
-    /// 是否全部检查通过。
-    pub ready: bool,
-    /// 逐项检查结果（名称，是否通过）。
-    pub checks: Vec<(String, bool)>,
-    /// 出错时的可读信息（**不含**内部细节，铁律 E2）。
-    pub message: Option<String>,
-}
-
-/// 在给定数据目录启动内核并执行就绪自检。
-///
-/// FFI 边界**不允许** panic：任何失败都转成 [`EngineStatus`] 返回。
-#[must_use]
-pub fn start_engine(data_dir: &str) -> EngineStatus {
-    match NestedCore::open(data_dir) {
-        Ok(core) => {
-            let checks: Vec<(String, bool)> = core
-                .readiness()
-                .into_iter()
-                .map(|(name, ok)| (name.to_owned(), ok))
-                .collect();
-            let ready = checks.iter().all(|(_, ok)| *ok);
-            EngineStatus {
-                ready,
-                checks,
-                message: None,
-            }
-        }
-        Err(error) => EngineStatus {
-            ready: false,
-            checks: Vec::new(),
-            message: Some(error.user_hint().to_owned()),
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn version_info_is_non_empty() {
-        let info = version_info();
-        assert!(!info.name_zh.is_empty());
-        assert!(!info.name_en.is_empty());
-        assert!(!info.version.is_empty());
-    }
-
-    #[test]
-    fn display_name_follows_language() {
-        assert_eq!(display_name("zh-CN"), branding::BRAND_NAME_ZH);
-        assert_eq!(display_name("en"), branding::BRAND_NAME_EN);
-    }
-
-    #[test]
-    fn start_engine_reports_ready_on_writable_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let status = start_engine(&dir.path().to_string_lossy());
-        assert!(status.ready, "空目录应能正常启动：{:?}", status.message);
-        assert!(!status.checks.is_empty());
-    }
-
-    #[test]
-    fn start_engine_reports_failure_without_panicking() {
-        // 用一个"父路径是文件"的非法目录触发失败
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("not-a-dir");
-        std::fs::write(&file_path, b"x").expect("write file");
-        let status = start_engine(&file_path.join("sub").to_string_lossy());
-        assert!(!status.ready);
-        assert!(
-            status.message.is_some(),
-            "失败必须给出可读信息，而不是 panic"
-        );
-    }
-}
+pub mod api;

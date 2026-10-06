@@ -66,7 +66,7 @@ tempfile = "3.27.0"
 #     scripts/check-rules.ps1 的 R1 规则强制：它只扫 src/ 且跳过 #[cfg(test)] 模块。
 #   - 两者合起来的效果正是我们想要的：产品代码严格，测试代码不受噪音干扰。
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 

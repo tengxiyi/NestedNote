@@ -32,10 +32,19 @@ analyzer:
     unused_import: error
     dead_code: error
   exclude:
-    - "**/*.g.dart"          # 生成的绑定代码
+    # ---- 生成代码（由 codegen 产出，不入库）----
+    - "lib/src/rust/**"      # flutter_rust_bridge 生成的 Dart 绑定
+    - "**/*.g.dart"
     - "**/*.freezed.dart"
-    - "build/**"
+    # ---- 平台工程（由 flutter create 产出，我们只改极少数文件）----
     - android/**
     - ios/**
     - windows/**
     - macos/**
+    # ---- 第三方构建工具（vendored，不由我们维护）----
+    # rust_builder 是 Cargokit 的构建插件：它负责把 ../rust 编译并打包进应用，
+    # 不含任何 Dart 业务代码。其 cargokit/ 子目录是上游 vendored 代码，
+    # 在两个发布版本之间可能自相矛盾（实测有 74 个分析器报错）。
+    # 我们对它的正确性不负责，也不应在它上面消耗"0 warning"门禁。
+    - "rust_builder/**"
+    - "build/**"

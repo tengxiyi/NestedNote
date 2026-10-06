@@ -1,0 +1,47 @@
+# 本包只负责"把 ../rust 编译并打包进应用"，不含任何 Dart 业务代码。
+#
+# 命名统一为 `nested_app`（下划线），三处必须一致，**不要**改回连字符：
+#   1. Dart 包名（本文件 `name:`）—— Dart 包名不允许连字符；
+#   2. Rust crate 名（../rust/Cargo.toml 的 `package.name`）；
+#   3. Cargokit 的目标/输出库名（windows/CMakeLists.txt 的 apply_cargokit 参数）。
+#
+# 踩过的坑：Cargokit 会按目标名去找 `nested_app.dll`，而 cargo 会把 crate 名里的
+# 连字符规范成下划线。若目标名写成 `nested-app`，则 CMake 期望 `nested-app.dll`、
+# 实际产物是 `nested_app.dll`，表现为"编译成功但打包时报找不到文件"。
+name: nested_app
+description: "Utility to build Rust code"
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  plugin_platform_interface: ^2.0.2
+
+dev_dependencies:
+  ffi: ^2.0.2
+  # 说明：模板里还带了 `ffigen: ^20.1.1`，本项目已移除。
+  # ffigen 只在 Cargokit 的"编译期生成 C 头文件绑定"流程里用到，而我们用的是
+  # flutter_rust_bridge 自己生成的绑定（见 apps/rust/src/api），那条路径不会被走到。
+  # 移除的依据是铁律 A8：依赖必须值得——不能留一个永远不会被执行的依赖及其供应链风险。
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      linux:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true

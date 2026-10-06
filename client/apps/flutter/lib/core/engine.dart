@@ -24,6 +24,7 @@ class EngineStatus {
     required this.protocolVersion,
     required this.ready,
     required this.checks,
+    this.databasePath,
     this.message,
   });
 
@@ -41,6 +42,9 @@ class EngineStatus {
 
   /// 逐项自检结果。
   final List<EngineCheck> checks;
+
+  /// 数据库文件的绝对路径（自检成功时由 Rust 侧返回）。
+  final String? databasePath;
 
   /// 失败时的可读信息（**不含**内部细节）。
   final String? message;
