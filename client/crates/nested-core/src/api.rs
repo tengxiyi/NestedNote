@@ -4,6 +4,7 @@
 //! 只暴露**业务语义**操作，不暴露 SQL、表结构、行 ID 之类的实现细节。
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use nested_db::NoteQuery;
 use nested_db::repositories::{notebooks, notes, tags};
@@ -19,10 +20,27 @@ use crate::error::{CoreError, CoreResult};
 /// 使 CLI 与测试无需先走设备注册流程。
 pub const UNKNOWN_DEVICE_ID: &str = "unknown-device";
 
+/// `settings` 表中存放本设备标识的键名。
+///
+/// 取值必须与 `nested_sync::DEVICE_ID_SETTING_KEY` 一致。这里重复定义一个常量，
+/// 是为了避免 `nested-core` 为了一个字符串而依赖同步引擎（分层更干净）。
+pub const DEVICE_ID_SETTING_KEY: &str = "device.id";
+
 /// 内核句柄。
 #[derive(Debug)]
 pub struct NestedCore {
     database: Database,
+    /// 本设备标识的缓存。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 每次写入都要往同步队列里记"是哪台设备产生的变更"（铁律 T3）。
+    /// 设备标识在首次启动时生成并持久化到 `settings`（键为 [`DEVICE_ID_SETTING_KEY`]），
+    /// 此后不再变化；缓存在这里避免每次写入都多读一次设置表。
+    ///
+    /// 若表中尚无设备标识（CLI 直接建库、测试环境），使用 [`UNKNOWN_DEVICE_ID`] 兜底
+    /// 并**不擅自落库**——生成设备标识属于应用启动流程的职责，不该是内核的副作用。
+    device_id_cache: Mutex<Option<String>>,
 }
 
 impl NestedCore {
@@ -40,7 +58,10 @@ impl NestedCore {
             .map_err(|error| CoreError::Config(format!("无法创建数据目录：{error}")))?;
         let path = data_dir.join(crate::branding::DATABASE_FILE);
         let database = Database::open(&path)?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            device_id_cache: Mutex::new(None),
+        })
     }
 
     /// 在内存中打开内核（测试与 CLI 快速验证用）。
@@ -51,7 +72,29 @@ impl NestedCore {
     pub fn open_in_memory() -> CoreResult<Self> {
         Ok(Self {
             database: Database::open_in_memory()?,
+            device_id_cache: Mutex::new(None),
         })
+    }
+
+    /// 本设备标识（用于同步队列记录变更来源，铁律 T3）。
+    ///
+    /// 解析顺序：内存缓存 → `settings` 表 → [`UNKNOWN_DEVICE_ID`]。
+    ///
+    /// # Errors
+    ///
+    /// 读取设置表失败时返回 [`CoreError::Database`]。
+    pub fn device_id(&self) -> CoreResult<String> {
+        if let Ok(cache) = self.device_id_cache.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+        let stored = self.database.setting(DEVICE_ID_SETTING_KEY)?;
+        let resolved = stored.unwrap_or_else(|| UNKNOWN_DEVICE_ID.to_owned());
+        if let Ok(mut cache) = self.device_id_cache.lock() {
+            *cache = Some(resolved.clone());
+        }
+        Ok(resolved)
     }
 
     /// 底层数据库句柄（仅供 CLI 与诊断使用；**UI 层禁止**直接使用，铁律 A2）。
@@ -110,8 +153,9 @@ impl NestedCore {
         at_ms: i64,
     ) -> CoreResult<Notebook> {
         let notebook = Notebook::new(name, parent_id, at_ms)?;
-        let connection = self.database.connection()?;
-        notebooks::insert(&connection, &notebook)?;
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notebooks::insert(&mut connection, &notebook, &device_id)?;
         Ok(notebook)
     }
 
@@ -173,8 +217,8 @@ impl NestedCore {
         at_ms: i64,
     ) -> CoreResult<Note> {
         let note = Note::new(notebook_id, title, at_ms)?;
-        let connection = self.database.connection()?;
-        notes::create_with_document(&connection, &note, &document, device_id)?;
+        let mut connection = self.database.connection()?;
+        notes::create_with_document(&mut connection, &note, &document, device_id)?;
         Ok(note)
     }
 
@@ -224,8 +268,8 @@ impl NestedCore {
         note.set_title(note.title.clone())?;
         note.set_summary(note.summary.clone())?;
         note.touch(at_ms);
-        let connection = self.database.connection()?;
-        notes::save_with_document(&connection, &note, &document, device_id, None)?;
+        let mut connection = self.database.connection()?;
+        notes::save_with_document(&mut connection, &note, &document, device_id, None)?;
         Ok(note)
     }
 
@@ -235,8 +279,9 @@ impl NestedCore {
     ///
     /// 笔记不存在或已在回收站 → [`CoreError::NotFound`]。
     pub fn delete_note(&self, id: &Id, at_ms: i64) -> CoreResult<()> {
-        let connection = self.database.connection()?;
-        notes::soft_delete(&connection, id, at_ms)?;
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notes::soft_delete(&mut connection, id, &device_id, at_ms)?;
         Ok(())
     }
 
@@ -246,8 +291,9 @@ impl NestedCore {
     ///
     /// 笔记不在回收站中 → [`CoreError::NotFound`]。
     pub fn restore_note(&self, id: &Id, at_ms: i64) -> CoreResult<()> {
-        let connection = self.database.connection()?;
-        notes::restore(&connection, id, at_ms)?;
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notes::restore(&mut connection, id, &device_id, at_ms)?;
         Ok(())
     }
 
@@ -260,8 +306,9 @@ impl NestedCore {
     /// 重名 → [`CoreError::Conflict`]；名称为空 → [`CoreError::Validation`]。
     pub fn create_tag(&self, name: impl Into<String>, at_ms: i64) -> CoreResult<Tag> {
         let tag = Tag::new(name, at_ms)?;
-        let connection = self.database.connection()?;
-        match tags::insert(&connection, &tag) {
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        match tags::insert(&mut connection, &tag, &device_id) {
             Ok(()) => Ok(tag),
             Err(DbError::Conflict { .. }) => Err(CoreError::Conflict("标签名称已存在".to_owned())),
             Err(other) => Err(CoreError::Database(other)),
@@ -429,7 +476,65 @@ mod tests {
         let document = core.get_note_document(&note.id).expect("doc");
         core.save_note(note, document, "device-a", NOW + 1)
             .expect("save");
+
+        // **创建也必须入队**（铁律 T3 / 技术债 #12）：
+        // 此前只有"更新"入队，导致新建的笔记在 P6 同步时根本不会被推送到其他设备。
+        // 因此这里是 2 条：note.create + note.update。
+        assert_eq!(
+            core.pending_sync_count().expect("pending"),
+            2,
+            "创建与更新都应入队"
+        );
+    }
+
+    #[test]
+    fn creating_a_notebook_enqueues_a_sync_operation() {
+        // 回归测试（技术债 #12 的连带发现）：笔记本变更此前完全不入队，
+        // 且 0001 的 `sync_operations.note_id` 外键会直接拒绝笔记本 id
+        // （787 FOREIGN KEY constraint failed）。迁移 0002 修掉了外键，
+        // 本测试锁住"笔记本创建也会入队"。
+        let core = NestedCore::open_in_memory().expect("open");
+        core.create_notebook("工作", None, NOW).expect("notebook");
         assert_eq!(core.pending_sync_count().expect("pending"), 1);
+    }
+
+    #[test]
+    fn deleting_and_restoring_a_note_enqueue_sync_operations() {
+        // 墓碑必须同步（铁律 D9）：否则别的设备会把已删除的笔记"复活"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "墓碑", NOW).expect("create");
+        assert_eq!(core.pending_sync_count().expect("pending"), 1, "创建入队");
+
+        core.delete_note(&note.id, NOW + 1).expect("delete");
+        assert_eq!(core.pending_sync_count().expect("pending"), 2, "删除入队");
+
+        core.restore_note(&note.id, NOW + 2).expect("restore");
+        assert_eq!(core.pending_sync_count().expect("pending"), 3, "恢复入队");
+    }
+
+    #[test]
+    fn device_id_falls_back_to_unknown_and_is_cached() {
+        let core = NestedCore::open_in_memory().expect("open");
+        // 未注册设备时用兜底值，且不擅自写库
+        assert_eq!(core.device_id().expect("device"), UNKNOWN_DEVICE_ID);
+        assert!(
+            core.database()
+                .setting(DEVICE_ID_SETTING_KEY)
+                .expect("setting")
+                .is_none(),
+            "内核不应擅自生成并持久化设备标识"
+        );
+        // 第二次调用走缓存，仍返回同一值
+        assert_eq!(core.device_id().expect("device"), UNKNOWN_DEVICE_ID);
+    }
+
+    #[test]
+    fn device_id_is_read_from_settings_when_present() {
+        let core = NestedCore::open_in_memory().expect("open");
+        core.database()
+            .set_setting(DEVICE_ID_SETTING_KEY, "device-from-settings", NOW)
+            .expect("set");
+        assert_eq!(core.device_id().expect("device"), "device-from-settings");
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub struct SyncOperation {
 }
 
 /// 统一列顺序。
-const COLUMNS: &str = "id, note_id, device_id, operation, payload, created_at_ms, pushed_at_ms";
+const COLUMNS: &str = "id, entity_id, device_id, operation, payload, created_at_ms, pushed_at_ms";
 
 /// 从一行映射出 [`SyncOperation`]（错误类型为 `rusqlite::Error`，见 `rowmap` 模块说明）。
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOperation> {
@@ -49,17 +49,31 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOperation> {
 
 /// 入队一条操作。
 ///
+/// `entity_id` 是变更对象的标识：对笔记是 `note_id`，对笔记本/标签是它们自己的 `id`。
+///
+/// ## 列名演进（迁移 0002）
+///
+/// 0001 把这一列命名为 `note_id` 并加了 `REFERENCES notes (id)` 外键。
+/// 但同步队列并不只承载笔记——铁律 T3 要求**任何**本地写操作都入队，
+/// 其中包括笔记本与标签的变更。把笔记本 id 写进带外键的 `note_id` 会立刻触发
+/// `787 FOREIGN KEY constraint failed`（实测）。
+///
+/// 迁移 0002 因此把列改名为 `entity_id` 并**去掉外键**：实体分散在多张表里，
+/// SQLite 无法表达"多态外键"，引用完整性改由写入路径保证。
+/// 结构体字段仍叫 `note_id`（既有公共 API 的一部分），
+/// 语义上应按"本次操作针对的实体"理解。
+///
 /// # Errors
 ///
 /// 写入失败时返回 [`DbError`]。
 pub fn enqueue(
     connection: &Connection,
-    note_id: &Id,
+    entity_id: &Id,
     device_id: &str,
     operation: &str,
     at_ms: i64,
 ) -> Result<(), DbError> {
-    enqueue_with_payload(connection, note_id, device_id, operation, None, at_ms)
+    enqueue_with_payload(connection, entity_id, device_id, operation, None, at_ms)
 }
 
 /// 入队一条带负载的操作。
@@ -69,19 +83,19 @@ pub fn enqueue(
 /// 写入失败时返回 [`DbError`]。
 pub fn enqueue_with_payload(
     connection: &Connection,
-    note_id: &Id,
+    entity_id: &Id,
     device_id: &str,
     operation: &str,
     payload: Option<&[u8]>,
     at_ms: i64,
 ) -> Result<(), DbError> {
     connection.execute(
-        "INSERT INTO sync_operations (id, note_id, device_id, operation, payload,
+        "INSERT INTO sync_operations (id, entity_id, device_id, operation, payload,
                                       created_at_ms, pushed_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
         params![
             Id::new().as_bytes(),
-            note_id.as_bytes(),
+            entity_id.as_bytes(),
             device_id,
             operation,
             payload,

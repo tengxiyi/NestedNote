@@ -65,18 +65,20 @@ pub fn insert(connection: &Connection, note: &Note) -> Result<(), DbError> {
     Ok(())
 }
 
-/// 原子地创建一篇笔记：笔记元数据 + 文档内容 + 修订记录（铁律 D1）。
+/// 原子地创建一篇笔记：笔记元数据 + 文档内容 + 修订记录 + 同步入队（铁律 D1 / T3 / T6）。
 ///
 /// # Errors
 ///
 /// 任一步失败则整体回滚，返回 [`DbError`]。
 pub fn create_with_document(
-    connection: &Connection,
+    connection: &mut Connection,
     note: &Note,
     document: &Document,
     device_id: &str,
 ) -> Result<(), DbError> {
-    let transaction = connection.unchecked_transaction()?;
+    // 统一用 IMMEDIATE 写事务：一开始就取写锁，冲突在起点由 busy_timeout 排队，
+    // 而不是"先读后写"到中途才升级锁并随机失败（技术债 #10）。
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
     insert(&transaction, note)?;
     upsert_document(&transaction, &note.id, document)?;
     crate::repositories::attachments::sync_note_links(
@@ -95,6 +97,15 @@ pub fn create_with_document(
             "note.create",
             note.created_at_ms,
         ),
+    )?;
+    // 与 save_with_document 对称：创建也要入队（技术债 #12）。
+    // 此前只有"更新"入队，导致新建的笔记在 P6 同步时根本不会被推送到其他设备。
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        &note.id,
+        device_id,
+        "note.create",
+        note.created_at_ms,
     )?;
     transaction.commit()?;
     Ok(())
@@ -221,13 +232,14 @@ pub fn get_document(connection: &Connection, note_id: &Id) -> Result<Document, D
 ///
 /// 任一步失败则整体回滚。
 pub fn save_with_document(
-    connection: &Connection,
+    connection: &mut Connection,
     note: &Note,
     document: &Document,
     device_id: &str,
     parent_revision_id: Option<Id>,
 ) -> Result<(), DbError> {
-    let transaction = connection.unchecked_transaction()?;
+    // 与 create_with_document 保持同一种事务行为（技术债 #10）
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
 
     let changed = transaction.execute(
         "UPDATE notes SET title = ?2, summary = ?3, notebook_id = ?4,
@@ -282,11 +294,26 @@ pub fn save_with_document(
 
 /// 软删除（移入回收站）。
 ///
+/// 把一篇笔记移入回收站（软删除），并在**同一事务**里入队（铁律 T3 / T7 / D9）。
+///
+/// ## 为什么需要 `device_id`
+///
+/// 删除必须同步：其他设备要能知道这篇笔记被删了，否则它会在对方那里"复活"
+/// （铁律 D9 的墓碑）。因此入队与软删除必须在同一事务里完成，
+/// 否则会出现"本地删了但没入队"的悬挂状态。
+///
 /// # Errors
 ///
 /// 目标不存在时返回 [`DbError::NotFound`]。
-pub fn soft_delete(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), DbError> {
-    let changed = connection.execute(
+pub fn soft_delete(
+    connection: &mut Connection,
+    id: &Id,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    let changed = transaction.execute(
         "UPDATE notes SET deleted_at_ms = ?2, updated_at_ms = ?2
          WHERE id = ?1 AND deleted_at_ms IS NULL",
         params![id.as_bytes(), at_ms],
@@ -294,16 +321,31 @@ pub fn soft_delete(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), D
     if changed == 0 {
         return Err(DbError::NotFound { entity: "note" });
     }
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        id,
+        device_id,
+        "note.delete",
+        at_ms,
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
-/// 从回收站恢复。
+/// 从回收站恢复，并在**同一事务**里入队（理由同 [`soft_delete`]）。
 ///
 /// # Errors
 ///
 /// 目标不在回收站中时返回 [`DbError::NotFound`]。
-pub fn restore(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), DbError> {
-    let changed = connection.execute(
+pub fn restore(
+    connection: &mut Connection,
+    id: &Id,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    let changed = transaction.execute(
         "UPDATE notes SET deleted_at_ms = NULL, updated_at_ms = ?2
          WHERE id = ?1 AND deleted_at_ms IS NOT NULL",
         params![id.as_bytes(), at_ms],
@@ -311,10 +353,21 @@ pub fn restore(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), DbErr
     if changed == 0 {
         return Err(DbError::NotFound { entity: "note" });
     }
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        id,
+        device_id,
+        "note.restore",
+        at_ms,
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
 /// 记录一次访问（用于"最近查看"）。
+///
+/// **刻意不入队**：`accessed_at_ms` 是本机使用习惯的副产品，
+/// 同步它只会制造无意义的写入流量（每台设备的"最近查看"本来就该不同）。
 ///
 /// # Errors
 ///
@@ -344,8 +397,9 @@ mod tests {
         let db = Database::open_in_memory().expect("open");
         let notebook = Notebook::new("工作", None, NOW).expect("valid");
         {
-            let guard = db.connection().expect("conn");
-            crate::repositories::notebooks::insert(&guard, &notebook).expect("insert notebook");
+            let mut guard = db.connection().expect("conn");
+            crate::repositories::notebooks::insert(&mut guard, &notebook, DEVICE)
+                .expect("insert notebook");
         }
         (db, notebook.id)
     }
@@ -357,11 +411,11 @@ mod tests {
     #[test]
     fn create_with_document_writes_all_tables_atomically() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let note = sample_note(Some(notebook_id), "第一篇");
         let document = Document::from_blocks(vec![Block::paragraph("你好，世界")], NOW);
 
-        create_with_document(&guard, &note, &document, DEVICE).expect("create");
+        create_with_document(&mut guard, &note, &document, DEVICE).expect("create");
 
         assert_eq!(get(&guard, &note.id).expect("get").expect("exists"), note);
         assert_eq!(get_document(&guard, &note.id).expect("doc"), document);
@@ -378,7 +432,7 @@ mod tests {
     #[test]
     fn create_is_rolled_back_when_document_is_invalid() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let note = sample_note(Some(notebook_id), "会被回滚");
         // 构造一个版本号过新的文档：序列化成功，但反序列化会失败
         let mut document = Document::empty(NOW);
@@ -386,8 +440,10 @@ mod tests {
 
         // 写入本身能成功（存的是字节），因此这里改用约束冲突验证回滚：
         // 先建一次，再用同一 note.id 再建一次应触发主键冲突并整体回滚。
-        create_with_document(&guard, &note, &Document::empty(NOW), DEVICE).expect("first create");
-        let err = create_with_document(&guard, &note, &document, DEVICE).expect_err("duplicate");
+        create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE)
+            .expect("first create");
+        let err =
+            create_with_document(&mut guard, &note, &document, DEVICE).expect_err("duplicate");
         assert!(matches!(err, DbError::Sqlite(_)));
         let count: i64 = guard
             .query_row(
@@ -402,16 +458,16 @@ mod tests {
     #[test]
     fn save_increments_version_and_appends_revision() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let mut note = sample_note(Some(notebook_id), "标题");
         let mut document = Document::from_blocks(vec![Block::paragraph("v1")], NOW);
-        create_with_document(&guard, &note, &document, DEVICE).expect("create");
+        create_with_document(&mut guard, &note, &document, DEVICE).expect("create");
 
         note.set_title("标题改了").expect("valid title");
         note.touch(NOW + 1000);
         document.blocks.push(Block::paragraph("v2"));
         document.touch(NOW + 1000);
-        save_with_document(&guard, &note, &document, DEVICE, None).expect("save");
+        save_with_document(&mut guard, &note, &document, DEVICE, None).expect("save");
 
         let loaded = get(&guard, &note.id).expect("get").expect("exists");
         assert_eq!(loaded.version, 2);
@@ -431,11 +487,11 @@ mod tests {
     #[test]
     fn save_enqueues_sync_operation() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let note = sample_note(Some(notebook_id), "待同步");
         let document = Document::empty(NOW);
-        create_with_document(&guard, &note, &document, DEVICE).expect("create");
-        save_with_document(&guard, &note, &document, DEVICE, None).expect("save");
+        create_with_document(&mut guard, &note, &document, DEVICE).expect("create");
+        save_with_document(&mut guard, &note, &document, DEVICE, None).expect("save");
 
         let pending: i64 = guard
             .query_row(
@@ -444,15 +500,34 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count");
-        assert_eq!(pending, 1, "本地写入必须同时入同步队列（铁律 T3）");
+        // 3 条：fixture 建的笔记本(notebook.create) + 笔记创建(note.create) + 保存(note.update)。
+        // 技术债 #12 之前只有"保存"入队——笔记本变更与笔记创建都会丢失同步。
+        assert_eq!(pending, 3, "本地写入必须同时入同步队列（铁律 T3）");
+
+        // 操作类型必须能区分，否则对端无法按语义应用变更。
+        // 创建时刻相同，因此按 operation 排序取集合，避免依赖 id 的偶然顺序。
+        let mut operations: Vec<String> = {
+            let mut statement = guard
+                .prepare("SELECT operation FROM sync_operations")
+                .expect("prepare");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            rows.collect::<Result<Vec<_>, _>>().expect("collect")
+        };
+        operations.sort();
+        assert_eq!(
+            operations,
+            vec!["note.create", "note.update", "notebook.create"]
+        );
     }
 
     #[test]
     fn save_missing_note_is_not_found() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let note = sample_note(None, "不存在");
-        let err = save_with_document(&guard, &note, &Document::empty(NOW), DEVICE, None)
+        let err = save_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE, None)
             .expect_err("must fail");
         assert!(matches!(err, DbError::NotFound { entity: "note" }));
     }
@@ -460,16 +535,16 @@ mod tests {
     #[test]
     fn list_respects_paging_and_excludes_deleted_by_default() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         for index in 0..5 {
             let mut note =
                 Note::new(Some(notebook_id), format!("笔记{index}"), NOW + index).expect("valid");
             note.updated_at_ms = NOW + index;
-            create_with_document(&guard, &note, &Document::empty(NOW), DEVICE).expect("create");
+            create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE).expect("create");
         }
         let deleted = sample_note(Some(notebook_id), "已删除");
-        create_with_document(&guard, &deleted, &Document::empty(NOW), DEVICE).expect("create");
-        soft_delete(&guard, &deleted.id, NOW + 100).expect("delete");
+        create_with_document(&mut guard, &deleted, &Document::empty(NOW), DEVICE).expect("create");
+        soft_delete(&mut guard, &deleted.id, DEVICE, NOW + 100).expect("delete");
 
         let page = list(
             &guard,
@@ -512,9 +587,9 @@ mod tests {
     #[test]
     fn corrupted_document_bytes_are_reported() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let note = sample_note(Some(notebook_id), "损坏");
-        create_with_document(&guard, &note, &Document::empty(NOW), DEVICE).expect("create");
+        create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE).expect("create");
         guard
             .execute(
                 "UPDATE documents SET content = ?2 WHERE note_id = ?1",
@@ -528,12 +603,12 @@ mod tests {
     #[test]
     fn archived_filter_works() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let mut archived = sample_note(Some(notebook_id), "归档的");
         archived.is_archived = true;
-        create_with_document(&guard, &archived, &Document::empty(NOW), DEVICE).expect("create");
+        create_with_document(&mut guard, &archived, &Document::empty(NOW), DEVICE).expect("create");
         let plain = sample_note(Some(notebook_id), "普通的");
-        create_with_document(&guard, &plain, &Document::empty(NOW), DEVICE).expect("create");
+        create_with_document(&mut guard, &plain, &Document::empty(NOW), DEVICE).expect("create");
 
         let only_archived = list(
             &guard,
@@ -550,9 +625,9 @@ mod tests {
     #[test]
     fn mark_accessed_records_time() {
         let (db, notebook_id) = fixture();
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let note = sample_note(Some(notebook_id), "访问");
-        create_with_document(&guard, &note, &Document::empty(NOW), DEVICE).expect("create");
+        create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE).expect("create");
         mark_accessed(&guard, &note.id, NOW + 42).expect("access");
         assert_eq!(
             get(&guard, &note.id)

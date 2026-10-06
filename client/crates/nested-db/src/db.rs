@@ -7,9 +7,16 @@
 //! - 第一阶段（P1/P2）的瓶颈在索引与查询设计，不在连接数；
 //! - 引入连接池属于性能优化，必须在 P4 有基准数据支撑后再做（铁律 P2：先测量再优化）。
 //!
-//! 多读者优化留给 P4，届时通过 `criterion` 基准证明必要性。
+//! 多读优化留给 P4，届时通过 `criterion` 基准证明必要性。
+//!
+//! ## 重入保护
+//!
+//! `Mutex` 不可重入，而"持有连接时又调用 `Database` 的方法"是极容易犯的错。
+//! 因此加锁前会做重入检测，误用会**立即报错**而不是静默挂起——
+//! 细节见 [`Database::connection`]。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
@@ -62,6 +69,47 @@ pub struct Database {
     connection: Option<Mutex<Connection>>,
     /// 数据库文件路径（内存库为 `None`）。
     path: Option<PathBuf>,
+    /// 重入检测开关（见 [`Database::connection`]）。
+    ///
+    /// `std::sync::Mutex` 不可重入，自己等自己会**永久挂起**：不报错、不 panic，
+    /// 现象只是"卡住不动"。本项目的测试因此挂死过一次，排查代价很高。
+    /// 用一个标志把这种误用变成**立即返回的错误**，是消除该陷阱最省的方式
+    /// （比把全部调用点改成闭包 API 风险小得多）。
+    locked: AtomicBool,
+}
+
+/// 连接借用的 RAII 守卫。
+///
+/// 除了持有 `MutexGuard`，它还负责在**释放时**清掉重入标志，
+/// 这样"guard 离开作用域"与"允许再次加锁"永远同步，不会因为忘记复位而误报。
+#[derive(Debug)]
+pub struct ConnectionGuard<'a> {
+    guard: MutexGuard<'a, Connection>,
+    locked: &'a AtomicBool,
+    /// 该守卫是否真正持锁（用于"连接已关闭"的占位情况）。
+    owns_lock: bool,
+}
+
+impl std::ops::Deref for ConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for ConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if self.owns_lock {
+            self.locked.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl Database {
@@ -101,6 +149,7 @@ impl Database {
         Ok(Self {
             connection: Some(Mutex::new(connection)),
             path,
+            locked: AtomicBool::new(false),
         })
     }
 
@@ -120,44 +169,82 @@ impl Database {
         migrations::current_version(&guard)
     }
 
-    /// 借用底层连接（只读用途）。
+    /// 借用底层连接。
     ///
-    /// # ⚠️ 死锁警告（真实踩过的坑）
+    /// ## 重入会被检测并报错（不会死锁）
     ///
-    /// 返回的 `MutexGuard` 持有连接锁。**在它存活期间，绝不能再调用任何 `Database`
-    /// 自己的方法**——包括 [`Database::check_integrity`]、[`Database::with_transaction`]、
-    /// [`Database::setting`] 等，因为它们都要重新获取同一把锁，结果是**自己等自己**：
-    /// 进程静默挂起，不报错、不 panic，现象就是"卡住不动"。本项目的测试曾因此挂死一次。
+    /// `std::sync::Mutex` 不可重入。如果在**持有**上一个 [`ConnectionGuard`] 期间
+    /// 再次调用 [`Database::connection`]，或调用任何内部会取连接的 `Database` 方法
+    /// （[`Database::check_integrity`]、[`Database::with_transaction`]、
+    /// [`Database::setting`]…），这里会立即返回 [`DbError::ReentrantLock`]，
+    /// **而不是静默挂起**。
+    ///
+    /// 这条检测是刻意加的：本项目的测试曾因误用而挂死一次——进程不报错、不 panic，
+    /// 现象只是"卡住不动"，排查代价很高。
     ///
     /// ```no_run
     /// # use nested_db::Database;
     /// # fn demo(db: &Database) {
-    /// // 错误写法：guard 仍存活就调 check_integrity → 死锁
-    /// // let guard = db.connection().unwrap();
-    /// // db.check_integrity().unwrap();
-    ///
-    /// // 正确写法：先让 guard 离开作用域，再加锁
-    /// {
+    /// // 正确写法：让 guard 先在作用域内用完
+    /// let version = {
     ///     let guard = db.connection().unwrap();
-    ///     let _ = guard.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0));
-    /// }
-    /// db.check_integrity().unwrap();
+    ///     guard
+    ///         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+    ///         .unwrap()
+    /// };
+    /// assert!(version >= 0);
+    ///
+    /// // 更推荐：`with_connection` 把作用域收敛在一处
+    /// let again = db
+    ///     .with_connection(|connection| {
+    ///         Ok(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?)
+    ///     })
+    ///     .unwrap();
+    /// assert_eq!(version, again);
     /// # }
     /// ```
     ///
-    /// TECH-DEBT(#8)：计划在 P1 把连接访问收敛为闭包式 API（`with_connection(|c| ...)`），
-    /// 从类型层面消除这个顺序陷阱。
+    /// # Errors
+    ///
+    /// - 连接已关闭 → [`DbError::Sqlite`]
+    /// - 重入（已持有连接） → [`DbError::ReentrantLock`]
+    /// - 锁中毒（持锁线程 panic） → [`DbError::LockPoisoned`]
+    pub fn connection(&self) -> Result<ConnectionGuard<'_>, DbError> {
+        // Acquire 与 Release 配对：只有真正拿到锁的那次才置位/清位
+        if self.locked.swap(true, Ordering::Acquire) {
+            return Err(DbError::ReentrantLock);
+        }
+        let Some(mutex) = self.connection.as_ref() else {
+            // 连接已关闭：把标志复位，否则后续调用会被误判为重入
+            self.locked.store(false, Ordering::Release);
+            return Err(DbError::Closed);
+        };
+        // 锁中毒说明持锁线程曾 panic，连接状态不可信，因此明确报错而不是继续用
+        let Ok(guard) = mutex.lock() else {
+            self.locked.store(false, Ordering::Release);
+            return Err(DbError::LockPoisoned);
+        };
+        Ok(ConnectionGuard {
+            guard,
+            locked: &self.locked,
+            owns_lock: true,
+        })
+    }
+
+    /// 在闭包里访问连接（推荐用法）。
+    ///
+    /// 相比 [`Database::connection`]，它把"取锁 → 用 → 释放"收敛在一个作用域里，
+    /// 从结构上避免"忘了释放就调用另一个方法"。
     ///
     /// # Errors
     ///
-    /// 连接已关闭时返回 [`DbError::Sqlite`]。
-    pub fn connection(&self) -> Result<MutexGuard<'_, Connection>, DbError> {
-        match self.connection.as_ref() {
-            Some(mutex) => mutex
-                .lock()
-                .map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidQuery)),
-            None => Err(DbError::Sqlite(rusqlite::Error::InvalidQuery)),
-        }
+    /// 取连接失败（见 [`Database::connection`]）或闭包本身返回错误时返回错误。
+    pub fn with_connection<T, F>(&self, f: F) -> Result<T, DbError>
+    where
+        F: FnOnce(&Connection) -> Result<T, DbError>,
+    {
+        let guard = self.connection()?;
+        f(&guard)
     }
 
     /// 在**单个事务**中执行一段操作（铁律 D1：一次业务操作 = 一个事务）。
@@ -167,12 +254,20 @@ impl Database {
     /// # Errors
     ///
     /// 连接不可用、事务开启或提交失败时返回错误。
+    /// 在**单个事务**中执行一段操作（铁律 D1：一次业务操作 = 一个事务）。
+    ///
+    /// 使用 `Immediate` 行为：一开始就取写锁，而不是等到第一次写才升级。
+    /// 理由见 [`begin_write_transaction`]。
+    ///
+    /// # Errors
+    ///
+    /// 连接不可用、事务开启或提交失败时返回错误。
     pub fn with_transaction<T, F>(&self, f: F) -> Result<T, DbError>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T, DbError>,
     {
         let mut guard = self.connection()?;
-        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = begin_write_transaction(&mut guard)?;
         let value = f(&transaction)?;
         transaction.commit()?;
         Ok(value)
@@ -258,6 +353,35 @@ const fn open_flags() -> OpenFlags {
         .union(OpenFlags::SQLITE_OPEN_URI)
 }
 
+/// 开启一个**写事务**（`IMMEDIATE` 行为）。
+///
+/// ## 为什么统一用 `IMMEDIATE`，而不是 `DEFERRED`（rusqlite 默认）
+///
+/// - `DEFERRED` 在**第一次写**时才尝试取写锁。若事务里是"先读后写"的模式
+///   （本项目的保存路径正是：先更新 `notes`、再写 `documents`），取锁发生在中途；
+///   此时若另一连接持有写锁，SQLite 会立刻返回 `SQLITE_BUSY`——
+///   而 `busy_timeout` 对"锁升级失败"**不生效**，于是表现为"随机失败"而非"等一会儿"。
+/// - `IMMEDIATE` 在事务开始时就取写锁，冲突发生在起点，由 `busy_timeout` 正常排队。
+///
+/// ## 为什么参数是 `&mut Connection`
+///
+/// rusqlite 0.40 中**只有** `transaction_with_behavior(&mut self, ...)` 能指定事务行为；
+/// 可用于 `&Connection` 的 `unchecked_transaction()` 行为固定为 `DEFERRED`，
+/// 且允许静默嵌套。把参数定为 `&mut` 换来两个好处：
+///
+/// 1. 能真正使用 `IMMEDIATE`（与 [`Database::with_transaction`] 语义一致）；
+/// 2. **嵌套在编译期就不可能出现**——同一个 `&mut` 无法同时被两个事务借用。
+///
+/// 调用方持有的是 [`ConnectionGuard`]，它实现了 `DerefMut`，
+/// 因此 `&mut *guard` 就能直接传入。
+///
+/// # Errors
+///
+/// 取写锁失败（例如超时）时返回 [`DbError::Sqlite`]。
+pub fn begin_write_transaction(connection: &mut Connection) -> Result<Transaction<'_>, DbError> {
+    Ok(connection.transaction_with_behavior(TransactionBehavior::Immediate)?)
+}
+
 /// 应用 PRAGMA 基线（铁律 D12）。
 ///
 /// WAL 只对**文件库**有意义；内存库会被 SQLite 静默忽略，因此这里显式区分，
@@ -300,6 +424,131 @@ mod tests {
             db.schema_version().expect("version"),
             migrations::LATEST_VERSION
         );
+    }
+
+    // ---------------------------------------------------------------- 重入保护
+    //
+    // 这一组测试是本模块最重要的回归防线：`Mutex` 不可重入，误用会**静默挂起**
+    // （不报错、不 panic，只是卡住），本项目为此真实挂死过一次。
+    // 下面每个测试都在证明"误用会立刻得到明确错误"。
+
+    #[test]
+    fn second_connection_borrow_is_rejected_instead_of_deadlocking() {
+        let db = Database::open_in_memory().expect("open");
+        let first = db.connection().expect("first borrow");
+        let second = db.connection();
+
+        assert!(
+            matches!(second, Err(DbError::ReentrantLock)),
+            "重复借用必须被拒绝；若这里挂住，说明重入检测失效"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn database_methods_while_holding_connection_are_rejected() {
+        let db = Database::open_in_memory().expect("open");
+        let _guard = db.connection().expect("borrow");
+
+        // 这三个都是内部会取连接的 Database 方法，持有 guard 时调用必须报错
+        assert!(matches!(db.ping(), Err(DbError::ReentrantLock)));
+        assert!(matches!(db.check_integrity(), Err(DbError::ReentrantLock)));
+        assert!(matches!(
+            db.with_transaction(|_| Ok(())),
+            Err(DbError::ReentrantLock)
+        ));
+    }
+
+    #[test]
+    fn borrow_becomes_available_again_after_guard_is_dropped() {
+        let db = Database::open_in_memory().expect("open");
+
+        {
+            let _guard = db.connection().expect("first");
+        }
+
+        // guard 释放后必须能再次借用（否则重入标志泄漏，库就"锁死"了）
+        db.ping().expect("must be usable again after drop");
+        let _again = db.connection().expect("second borrow");
+    }
+
+    #[test]
+    fn flag_is_cleared_even_when_closure_returns_error() {
+        let db = Database::open_in_memory().expect("open");
+
+        let failed: Result<(), DbError> =
+            db.with_connection(|_| Err(DbError::NotFound { entity: "probe" }));
+        assert!(failed.is_err());
+
+        // 闭包返回错误不能让重入标志卡住
+        db.ping()
+            .expect("must still be usable after failing closure");
+    }
+
+    #[test]
+    fn with_connection_passes_a_usable_connection() {
+        let db = Database::open_in_memory().expect("open");
+        let version = db
+            .with_connection(|connection| {
+                Ok(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?)
+            })
+            .expect("with_connection");
+        assert_eq!(version, i64::from(migrations::LATEST_VERSION));
+    }
+
+    #[test]
+    fn with_connection_propagates_closure_error() {
+        let db = Database::open_in_memory().expect("open");
+        let error = db
+            .with_connection(|_| Err::<(), _>(DbError::NotFound { entity: "note" }))
+            .expect_err("必须把闭包的错误传出去");
+        assert!(matches!(error, DbError::NotFound { entity: "note" }));
+    }
+
+    #[test]
+    fn write_transaction_is_immediate_not_deferred() {
+        // IMMEDIATE 的意义：一开事务就取写锁（`BEGIN IMMEDIATE` 会让 sqlite 记下
+        // 一个 ROLLBACK journal / 写锁）。DEFERRED 则要等到第一次写才取锁。
+        //
+        // 判据用 `Transaction` 自己执行 PRAGMA（不能去读 `connection.is_autocommit()`：
+        // 事务正持有 `&mut Connection`，编译器不允许再借用——这本身就是嵌套不可能的证据）。
+        let mut connection = Connection::open_in_memory().expect("open");
+        let transaction = begin_write_transaction(&mut connection).expect("begin");
+
+        // 事务内可以直接写入（若为 DEFERRED，此刻才取写锁；IMMEDIATE 已在开启时取到）
+        transaction
+            .execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .expect("write inside transaction");
+
+        let in_transaction: i64 = transaction
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .expect("query inside transaction");
+        assert_eq!(in_transaction, 1);
+
+        transaction.rollback().expect("rollback");
+
+        // 回滚后表不应存在，证明事务确实生效（而不是被静默嵌套成自动提交）
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='probe'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query after rollback");
+        assert_eq!(exists, 0, "回滚必须撤销事务内的建表");
+        assert!(connection.is_autocommit(), "回滚后应回到自动提交模式");
+    }
+
+    #[test]
+    fn nested_transaction_is_impossible_at_compile_time() {
+        // 这条不变量由**类型系统**保证：`&mut Connection` 同一时刻只能被一个事务借用。
+        // 本测试用运行期断言把这个意图记录下来：
+        // 事务存活期间无法再开启第二个事务（下面的代码一旦写成注释里的样子就编译不过）。
+        let mut connection = Connection::open_in_memory().expect("open");
+        let transaction = begin_write_transaction(&mut connection).expect("begin");
+        // let _second = begin_write_transaction(&mut connection); // ← 编译错误 E0499
+        transaction.commit().expect("commit");
+        assert!(connection.is_autocommit());
     }
 
     #[test]

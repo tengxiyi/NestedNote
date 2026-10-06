@@ -27,11 +27,22 @@ pub struct Migration {
 }
 
 /// 内置迁移清单。新增迁移时**只能追加**。
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_init",
-    sql: include_str!("../../../migrations/0001_init.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_init",
+        sql: include_str!("../../../migrations/0001_init.sql"),
+    },
+    // 0002：修正 sync_operations 的外键设计。
+    // 起因（技术债 #12 的连带发现）：同步队列要承载笔记本/标签的变更，
+    // 而 0001 把 `note_id` 定义为 `REFERENCES notes (id)`，
+    // 写入非笔记实体时会触发 787 FOREIGN KEY constraint failed。
+    Migration {
+        version: 2,
+        name: "0002_sync_operations_entity",
+        sql: include_str!("../../../migrations/0002_sync_operations_entity.sql"),
+    },
+];
 
 /// 当前程序支持的最高数据库版本。
 pub const LATEST_VERSION: u32 = match MIGRATIONS.last() {
@@ -295,13 +306,19 @@ mod tests {
             let before = current_version(&guard).expect("version");
             assert_eq!(before, LATEST_VERSION);
 
-            // 模拟"下一版迁移写错了"：版本 2 必然失败
-            let list = manifest(&[
-                (1, "0001_init", MIGRATIONS[0].sql),
-                (2, "0002_broken", BROKEN_SQL),
-            ]);
-            let error = apply_manifest(&mut guard, &list, 2).expect_err("必须失败");
-            assert!(matches!(error, DbError::Migrate { version: 2, .. }));
+            // 模拟"下一版迁移写错了"：在**全部已发布迁移之后**追加一条必然失败的迁移。
+            // 注意不能简单用版本 2 当"坏迁移"——真实清单里版本 2 已经存在，
+            // 那样会被 `from == latest_version` 判为"无需升级"而根本不执行。
+            let mut list: Vec<Migration> = MIGRATIONS.to_vec();
+            list.push(Migration {
+                version: LATEST_VERSION + 1,
+                name: "9999_broken",
+                sql: BROKEN_SQL,
+            });
+            let next = LATEST_VERSION + 1;
+
+            let error = apply_manifest(&mut guard, &list, next).expect_err("必须失败");
+            assert!(matches!(error, DbError::Migrate { version, .. } if version == next));
             assert_eq!(
                 current_version(&guard).expect("version"),
                 LATEST_VERSION,

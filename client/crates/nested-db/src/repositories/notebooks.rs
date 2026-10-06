@@ -23,12 +23,38 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<Notebook> {
     })
 }
 
-/// 插入一个笔记本。
+/// 插入一个笔记本，并在**同一事务**里入队（铁律 T3 / D1）。
+///
+/// 笔记本也会在多设备间同步，因此它的创建同样必须入队——
+/// 否则新设备永远看不到这个笔记本（技术债 #12：此前只有笔记更新入队）。
 ///
 /// # Errors
 ///
 /// 主键冲突或写入失败时返回 [`DbError`]。
-pub fn insert(connection: &Connection, notebook: &Notebook) -> Result<(), DbError> {
+pub fn insert(
+    connection: &mut Connection,
+    notebook: &Notebook,
+    device_id: &str,
+) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+    insert_in_transaction(&transaction, notebook)?;
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        &notebook.id,
+        device_id,
+        "notebook.create",
+        notebook.created_at_ms,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 在给定事务内插入笔记本（供其它事务复用，不自行开关事务）。
+///
+/// # Errors
+///
+/// 写入失败时返回 [`DbError`]。
+pub fn insert_in_transaction(connection: &Connection, notebook: &Notebook) -> Result<(), DbError> {
     connection.execute(
         "INSERT INTO notebooks (id, name, parent_id, created_at_ms, updated_at_ms, deleted_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -90,13 +116,20 @@ pub fn list_children(
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
 }
 
-/// 重命名。
+/// 重命名（同一事务入队）。
 ///
 /// # Errors
 ///
 /// 目标不存在时返回 [`DbError::NotFound`]。
-pub fn rename(connection: &Connection, id: &Id, name: &str, at_ms: i64) -> Result<(), DbError> {
-    let changed = connection.execute(
+pub fn rename(
+    connection: &mut Connection,
+    id: &Id,
+    name: &str,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+    let changed = transaction.execute(
         "UPDATE notebooks SET name = ?2, updated_at_ms = ?3
          WHERE id = ?1 AND deleted_at_ms IS NULL",
         params![id.as_bytes(), name, at_ms],
@@ -104,10 +137,18 @@ pub fn rename(connection: &Connection, id: &Id, name: &str, at_ms: i64) -> Resul
     if changed == 0 {
         return Err(DbError::NotFound { entity: "notebook" });
     }
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        id,
+        device_id,
+        "notebook.update",
+        at_ms,
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
-/// 软删除（移入回收站）。
+/// 软删除（移入回收站，同一事务入队）。
 ///
 /// **注意**：不会级联删除子笔记本与笔记——级联策略由 `nested-core` 的业务规则决定，
 /// 仓储层只负责一次写入（铁律 A7）。
@@ -115,8 +156,14 @@ pub fn rename(connection: &Connection, id: &Id, name: &str, at_ms: i64) -> Resul
 /// # Errors
 ///
 /// 目标不存在时返回 [`DbError::NotFound`]。
-pub fn soft_delete(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), DbError> {
-    let changed = connection.execute(
+pub fn soft_delete(
+    connection: &mut Connection,
+    id: &Id,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+    let changed = transaction.execute(
         "UPDATE notebooks SET deleted_at_ms = ?2, updated_at_ms = ?2
          WHERE id = ?1 AND deleted_at_ms IS NULL",
         params![id.as_bytes(), at_ms],
@@ -124,16 +171,30 @@ pub fn soft_delete(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), D
     if changed == 0 {
         return Err(DbError::NotFound { entity: "notebook" });
     }
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        id,
+        device_id,
+        "notebook.delete",
+        at_ms,
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
-/// 从回收站恢复。
+/// 从回收站恢复（同一事务入队）。
 ///
 /// # Errors
 ///
 /// 目标不存在时返回 [`DbError::NotFound`]。
-pub fn restore(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), DbError> {
-    let changed = connection.execute(
+pub fn restore(
+    connection: &mut Connection,
+    id: &Id,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+    let changed = transaction.execute(
         "UPDATE notebooks SET deleted_at_ms = NULL, updated_at_ms = ?2
          WHERE id = ?1 AND deleted_at_ms IS NOT NULL",
         params![id.as_bytes(), at_ms],
@@ -141,6 +202,14 @@ pub fn restore(connection: &Connection, id: &Id, at_ms: i64) -> Result<(), DbErr
     if changed == 0 {
         return Err(DbError::NotFound { entity: "notebook" });
     }
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        id,
+        device_id,
+        "notebook.restore",
+        at_ms,
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -164,6 +233,7 @@ mod tests {
     use crate::Database;
 
     const NOW: i64 = 1_700_000_000_000;
+    const DEVICE: &str = "device-test";
 
     fn notebook(name: &str) -> Notebook {
         Notebook::new(name, None, NOW).expect("valid notebook")
@@ -172,9 +242,9 @@ mod tests {
     #[test]
     fn insert_then_get_roundtrips() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let original = notebook("工作");
-        insert(&guard, &original).expect("insert");
+        insert(&mut guard, &original, DEVICE).expect("insert");
         let loaded = get(&guard, &original.id).expect("get").expect("exists");
         assert_eq!(loaded, original);
     }
@@ -189,12 +259,12 @@ mod tests {
     #[test]
     fn list_all_excludes_soft_deleted_and_sorts_by_name() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
-        insert(&guard, &notebook("beta")).expect("insert");
-        insert(&guard, &notebook("Alpha")).expect("insert");
+        let mut guard = db.connection().expect("conn");
+        insert(&mut guard, &notebook("beta"), DEVICE).expect("insert");
+        insert(&mut guard, &notebook("Alpha"), DEVICE).expect("insert");
         let gone = notebook("删掉的");
-        insert(&guard, &gone).expect("insert");
-        soft_delete(&guard, &gone.id, NOW + 1).expect("soft delete");
+        insert(&mut guard, &gone, DEVICE).expect("insert");
+        soft_delete(&mut guard, &gone.id, DEVICE, NOW + 1).expect("soft delete");
 
         let names: Vec<String> = list_all(&guard)
             .expect("list")
@@ -208,11 +278,11 @@ mod tests {
     #[test]
     fn nested_notebooks_are_listed_by_parent() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let root = notebook("root");
-        insert(&guard, &root).expect("insert root");
+        insert(&mut guard, &root, DEVICE).expect("insert root");
         let child = Notebook::new("child", Some(root.id), NOW).expect("valid");
-        insert(&guard, &child).expect("insert child");
+        insert(&mut guard, &child, DEVICE).expect("insert child");
 
         let roots = list_children(&guard, None).expect("roots");
         assert_eq!(roots.len(), 1);
@@ -226,10 +296,10 @@ mod tests {
     #[test]
     fn rename_updates_timestamp() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let item = notebook("旧名");
-        insert(&guard, &item).expect("insert");
-        rename(&guard, &item.id, "新名", NOW + 500).expect("rename");
+        insert(&mut guard, &item, DEVICE).expect("insert");
+        rename(&mut guard, &item.id, "新名", DEVICE, NOW + 500).expect("rename");
         let loaded = get(&guard, &item.id).expect("get").expect("exists");
         assert_eq!(loaded.name, "新名");
         assert_eq!(loaded.updated_at_ms, NOW + 500);
@@ -238,19 +308,19 @@ mod tests {
     #[test]
     fn rename_missing_is_not_found() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
-        let err = rename(&guard, &Id::new(), "x", NOW).expect_err("must fail");
+        let mut guard = db.connection().expect("conn");
+        let err = rename(&mut guard, &Id::new(), "x", DEVICE, NOW).expect_err("must fail");
         assert!(matches!(err, DbError::NotFound { entity: "notebook" }));
     }
 
     #[test]
     fn soft_delete_then_restore_is_reversible() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let item = notebook("回收站往返");
-        insert(&guard, &item).expect("insert");
+        insert(&mut guard, &item, DEVICE).expect("insert");
 
-        soft_delete(&guard, &item.id, NOW + 1).expect("delete");
+        soft_delete(&mut guard, &item.id, DEVICE, NOW + 1).expect("delete");
         assert!(
             get(&guard, &item.id)
                 .expect("get")
@@ -258,7 +328,7 @@ mod tests {
                 .is_deleted()
         );
 
-        restore(&guard, &item.id, NOW + 2).expect("restore");
+        restore(&mut guard, &item.id, DEVICE, NOW + 2).expect("restore");
         assert!(
             !get(&guard, &item.id)
                 .expect("get")
@@ -270,20 +340,20 @@ mod tests {
     #[test]
     fn double_soft_delete_is_reported() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let item = notebook("重复删除");
-        insert(&guard, &item).expect("insert");
-        soft_delete(&guard, &item.id, NOW + 1).expect("first");
-        assert!(soft_delete(&guard, &item.id, NOW + 2).is_err());
+        insert(&mut guard, &item, DEVICE).expect("insert");
+        soft_delete(&mut guard, &item.id, DEVICE, NOW + 1).expect("first");
+        assert!(soft_delete(&mut guard, &item.id, DEVICE, NOW + 2).is_err());
     }
 
     #[test]
     fn row_is_never_physically_removed_by_soft_delete() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let item = notebook("墓碑");
-        insert(&guard, &item).expect("insert");
-        soft_delete(&guard, &item.id, NOW + 1).expect("delete");
+        insert(&mut guard, &item, DEVICE).expect("insert");
+        soft_delete(&mut guard, &item.id, DEVICE, NOW + 1).expect("delete");
         let total: i64 = guard
             .query_row("SELECT COUNT(*) FROM notebooks", [], |row| row.get(0))
             .expect("count");

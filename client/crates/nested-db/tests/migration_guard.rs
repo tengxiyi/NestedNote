@@ -27,10 +27,16 @@ use nested_db::migrations::MIGRATIONS;
 /// 已发布迁移的哈希清单：`文件名 -> 小写十六进制 SHA-256`。
 ///
 /// 新增迁移时**追加**一行；修改既有行等于承认"改动了已发布迁移"，需走 ADR。
-const MIGRATION_HASHES: &[(&str, &str)] = &[(
-    "0001_init.sql",
-    "4566e916ca98e4d437020b13a79999abaf6fa7639a09146f57b8159125d93341",
-)];
+const MIGRATION_HASHES: &[(&str, &str)] = &[
+    (
+        "0001_init.sql",
+        "4566e916ca98e4d437020b13a79999abaf6fa7639a09146f57b8159125d93341",
+    ),
+    (
+        "0002_sync_operations_entity.sql",
+        "cfe8e20ae8c66e319e96e677c98d6b92d617da920e944e42676dbffb40619151",
+    ),
+];
 
 /// 定位迁移目录：`client/migrations`。
 fn migrations_dir() -> PathBuf {

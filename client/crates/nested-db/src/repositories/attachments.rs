@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn document_attachments_are_linked_through_note_write() {
         let db = Database::open_in_memory().expect("open");
-        let guard = db.connection().expect("conn");
+        let mut guard = db.connection().expect("conn");
         let item = attachment('d', "shot.png");
         let id = upsert(&guard, &item).expect("upsert");
 
@@ -335,7 +335,7 @@ mod tests {
             .expect("get")
             .expect("exists");
         crate::repositories::notes::save_with_document(
-            &guard,
+            &mut guard,
             &note_row,
             &document,
             "device-test",

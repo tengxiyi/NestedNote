@@ -7,7 +7,54 @@
 
 ## [Unreleased]
 
-### 新增（P1 开工准备：覆盖率基线 + 设计文档）
+### 修复（三项高危技术债 #8 / #10 / #12）
+
+**#8 连接锁死锁陷阱 —— 现在会报错而不是静默挂起**
+- `Database` 增加 `AtomicBool` 重入检测：持有连接时再次获取立即返回
+  `DbError::ReentrantLock`，不再"卡住不动"（此前测试真实挂死过一次）
+- 新增 `Database::with_connection(|c| ...)` 闭包式 API 作为推荐用法；
+  `connection()` 保留（测试与 CLI 仍需要），另返回带 RAII 复位的 `ConnectionGuard`
+- 区分了新的错误语义：`ReentrantLock`（开发期错误）、`LockPoisoned`（持锁线程 panic）、
+  `Closed`（句柄已关闭），此前这些都被折叠成 `InvalidQuery`
+- 6 个回归测试，逐条证明"误用报错而非挂起"
+
+**#10 事务行为统一为 IMMEDIATE，嵌套在编译期不可能**
+- 新增 `db::begin_write_transaction()`，所有写入口统一 `IMMEDIATE`：
+  一开始就取写锁，冲突由 `busy_timeout` 排队，而不是"先读后写"到中途升级锁并随机失败
+- 仓储写入口签名由 `&Connection` 改为 `&mut Connection`。
+  这不只是风格问题：**`&mut` 使嵌套事务在类型层面不可能**，
+  同时消除了 `unchecked_transaction()` 允许的静默嵌套
+- 附两个不变量测试（`IMMEDIATE` 确实取到写锁、回滚确实撤销事务内建表）
+
+**#12 同步入队缺口（最严重的一项）**
+- 此前**只有** `save_with_document` 入队；现在改为全部本地写在同一事务内入队：
+  笔记创建 / 软删 / 恢复、笔记本创建 / 重命名 / 软删 / 恢复、
+  标签创建 / 删除、笔记标签设置
+- 操作类型可区分：`note.create` / `note.update` / `note.delete` / `note.restore` /
+  `note.tag` / `notebook.create` / `notebook.update` / `notebook.delete` /
+  `notebook.restore` / `tag.create` / `tag.delete`
+- `mark_accessed` **刻意不入队**并写明理由："最近查看"是本机习惯的副产品，
+  同步它只会制造无意义流量
+- 新增 `NestedCore::device_id()`：从 `settings` 解析并缓存设备标识，
+  未注册时用 `UNKNOWN_DEVICE_ID` 兜底且**不擅自落库**（生成设备标识属于启动流程职责）
+
+### 迁移 0002：修正 `sync_operations` 的外键设计（#12 的连带发现）
+- **真实缺陷**：`0001` 里 `sync_operations.note_id` 是 `REFERENCES notes (id)`，
+  但这张表在语义上是"通用实体变更队列"（铁律 T3 要求任何本地写都入队）。
+  把笔记本/标签 id 写进这一列会直接触发 `787 FOREIGN KEY constraint failed`。
+  该缺陷一直存在，只因"此前只有笔记更新入队"而从未暴露
+- 迁移 0002 把列改名为多态 `entity_id` 并去掉外键（SQLite 无法表达多态外键），
+  引用完整性改由写入路径保证；存量数据用 `LEFT JOIN notes` 清洗悬空引用后原样保留
+- 按铁律 Q2 新增迁移而非修改已发布的 0001；哈希护栏与 `LATEST_VERSION` 同步更新
+- **升级路径已实测**：构造 v1 库（含 1 笔记本 + 1 笔记 + 1 条旧队列记录）后用新代码打开，
+  日志 `from=1 to=2 count=1`；升级后 `user_version=2`、数据完整保留、
+  `foreign_key_check` 无违规、`integrity_check` = ok
+
+### 变更
+- 客户端测试用例数 204 → **218**
+- 覆盖率：nested-db 94.8%（1921/2026 行）、nested-core 95.1%，6 项门禁全部达标
+
+## [P1 准备] —— 覆盖率基线 + 详细设计文档
 
 **测试覆盖率（铁律 Z1）**
 - 新增 `scripts/coverage-gate.ps1` 并接入 CI：只对**已实现**的 crate 卡 80%，
@@ -54,8 +101,12 @@
 - 新增 `sha2` 0.10.9（RustCrypto）：附件内容寻址所需，与项目其它加密选型一致
 
 ### 数据与文档一致性
-- 技术债登记表由 7 条扩至 **20 条**：设计文档审出的实现问题全部登记，
-  含 3 项高危（#8 连接锁死锁陷阱、#10 事务行为不统一、#12 同步入队缺口）
+- 技术债登记表由 7 条扩至 **22 条**：设计文档审出的实现问题全部登记，
+  其中 #8 / #10 / #12 三项高危已在同一轮内偿还（见上），
+  #21 是修复 #12 时连带发现的真实架构缺陷（`sync_operations` 外键）
+- 剩余待还：#11（`save_note` 无条件 touch 且父链恒空）、#13（软删标签无法复用同名）、
+  #14（`Conflict` 语义混淆）、#16（首屏跑全库 integrity_check）、
+  #17/#22（附件插入主路径与附件同步）、#18（分页上限未覆盖全部列表）
 
 ## [P0] —— 工程基座（已通过 [Gate 评审](docs/reports/gate-p0.md))
 

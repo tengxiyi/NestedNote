@@ -24,10 +24,20 @@
 //! let note = Note::new(None, "第一篇笔记", nested_model::now_ms())?;
 //! let document = Document::from_blocks(vec![Block::paragraph("你好，世界")], nested_model::now_ms());
 //!
-//! let connection = db.connection()?;
-//! nested_db::repositories::notes::create_with_document(&connection, &note, &document, "device-1")?;
+//! // 写入口需要 &mut Connection：它在内部开启 IMMEDIATE 写事务，
+//! // 而 `&mut` 同时让"嵌套事务"在编译期就不可能发生。
+//! let mut connection = db.connection()?;
+//! nested_db::repositories::notes::create_with_document(&mut connection, &note, &document, "device-1")?;
 //! let loaded = nested_db::repositories::notes::get(&connection, &note.id)?;
 //! assert!(loaded.is_some());
+//!
+//! // 只读访问推荐用 with_connection：作用域收敛在一处，
+//! // 不会出现"还持有连接又去调 Database 其它方法"的重入错误。
+//! drop(connection);
+//! let count = db.with_connection(|connection| {
+//!     nested_db::repositories::notes::count(connection, false)
+//! })?;
+//! assert_eq!(count, 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
