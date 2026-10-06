@@ -1,0 +1,208 @@
+# 拾光笔记 / NestedNote —— 持续集成
+#
+# 设计依据（《工程铁律》Z7）：PR 必须通过格式化、lint、测试、迁移测试与铁律检查。
+#
+# 关键结构决策：**客户端与服务端是两个独立 workspace**，因此用两个独立作业分别检查，
+# 并用 paths-filter 做变更检测 —— 只改客户端的 PR 不会去编译 SQLx/Tokio，
+# 只改服务端的 PR 也不会去编译 SQLite/Flutter 绑定。
+# 隔离约束本身由 `rules` 作业校验（客户端不得依赖服务端 crate，反之亦然）。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 默认最小权限（铁律 S4：最小权限原则同样适用于 CI）
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- 变更检测
+  changes:
+    name: 变更检测
+    runs-on: ubuntu-latest
+    outputs:
+      client: ${{ steps.filter.outputs.client }}
+      server: ${{ steps.filter.outputs.server }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            client:
+              - 'client/**'
+              - 'shared/**'
+              - 'scripts/check-rules.ps1'
+              - '.github/workflows/ci.yml'
+            server:
+              - 'server/**'
+              - 'shared/**'
+              - 'scripts/check-rules.ps1'
+              - '.github/workflows/ci.yml'
+
+  # ---------------------------------------------------------------- 铁律检查
+  # 权威实现是 Rust 工具 client/tools/nested-rules（零依赖、有单元测试、与编码无关）。
+  rules:
+    name: 铁律检查
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+
+      - name: 检查器自身的单元测试
+        run: cargo test -p nested-rules
+
+      - name: 执行铁律检查
+        run: cargo run --quiet -p nested-rules -- --root ..
+
+  # ---------------------------------------------------------------- 行尾规范
+  # 迁移文件受哈希清单保护（client/crates/nested-db/tests/migration_guard.rs），
+  # CRLF 漂移会让 CI 误报"迁移被篡改"，因此单独设一道门禁。
+  line-endings:
+    name: 行尾规范（LF）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 迁移文件必须是 LF
+        run: |
+          if grep -rIl $'\r' client/migrations server/migrations shared 2>/dev/null; then
+            echo "以下文件含 CR，必须为 LF（会破坏迁移哈希保护）"
+            exit 1
+          fi
+          echo "OK: 迁移与共享源码均为 LF"
+
+  # ---------------------------------------------------------------- 客户端
+  client:
+    name: 客户端（Rust Core）
+    needs: changes
+    if: needs.changes.outputs.client == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+
+      - name: 格式检查（铁律 R8）
+        run: cargo fmt --all -- --check
+
+      - name: Clippy（铁律 R7，警告即失败）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（铁律 Z7）
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------- 服务端
+  server:
+    name: 服务端（Sync Server）
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: 格式检查（铁律 R8）
+        run: cargo fmt --all -- --check
+
+      - name: Clippy（铁律 R7）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（P0 阶段全部为内存测试，不需要真实数据库）
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------- 安全审计
+  audit:
+    name: 依赖安全审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: 审计客户端依赖（铁律 S11）
+        working-directory: client
+        run: cargo audit
+
+      - name: 审计服务端依赖（铁律 S11）
+        working-directory: server
+        run: cargo audit
+
+  # ---------------------------------------------------------------- 汇总门禁
+  ci-ok:
+    name: CI 结果
+    if: always()
+    needs: [changes, rules, line-endings, client, server, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 汇总
+        run: |
+          echo "changes=${{ needs.changes.result }}"
+          echo "rules=${{ needs.rules.result }}"
+          echo "line-endings=${{ needs.line-endings.result }}"
+          echo "client=${{ needs.client.result }}"
+          echo "server=${{ needs.server.result }}"
+          echo "audit=${{ needs.audit.result }}"
+          # 被跳过的作业（因为没有相关改动）视为通过；失败与取消必须阻断
+          for result in \
+            "${{ needs.changes.result }}" \
+            "${{ needs.rules.result }}" \
+            "${{ needs.line-endings.result }}" \
+            "${{ needs.client.result }}" \
+            "${{ needs.server.result }}" \
+            "${{ needs.audit.result }}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "CI 未通过：$result"
+              exit 1
+            fi
+          done
+          echo "CI 通过"
