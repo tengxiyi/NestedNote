@@ -116,6 +116,26 @@ jobs:
         with:
           workspaces: client
 
+      # 必须在任何 cargo 检查之前执行：FFI 桥接的生成物不入库，
+      # 而 client/apps/rust/src/lib.rs 里是无条件声明 `mod frb_generated;`，
+      # 没有这个文件时 cargo fmt / clippy / test 都会直接失败。
+      #
+      # 脚本做三件事：校验 codegen 版本与 pubspec 一致 → 生成绑定 →
+      # 用 rustfmt 规范化生成物的格式（codegen 产出的 import 顺序不符合 rustfmt，
+      # 不规范化会导致 `cargo fmt --check` 每次都在同一处假失败）。
+      #
+      # 版本必须与 pubspec 里的 flutter_rust_bridge 严格一致：不一致会导致
+      # 生成的桥接代码编译失败。脚本会自己校验，这里只需确保装到同一个版本。
+      - name: 生成 FFI 绑定
+        working-directory: client/apps/flutter
+        shell: pwsh
+        run: |
+          $pinned = (Select-String -Path pubspec.yaml -Pattern 'flutter_rust_bridge:\s*\^([0-9.]+)' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          Write-Host "pubspec 声明的 flutter_rust_bridge 版本：$pinned"
+          cargo install flutter_rust_bridge_codegen --version $pinned --locked
+          & "$env:GITHUB_WORKSPACE/scripts/generate-ffi-bindings.ps1"
+
       - name: 格式检查（铁律 R8）
         run: cargo fmt --all -- --check
 

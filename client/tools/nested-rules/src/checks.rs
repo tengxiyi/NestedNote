@@ -355,13 +355,27 @@ fn mentions_dependency(manifest: &str, needle: &str) -> bool {
     false
 }
 
+/// 该文件是否属于"自带密钥检查关键字"的位置，应当跳过 S3 扫描。
+///
+/// 两类：
+/// 1. **检查器自身**（`tools/nested-rules`）：源码里必然写着它要搜索的模式；
+/// 2. **仓库脚本**（`scripts/*.ps1`）：脚本里会出现"如何传入令牌"的**用法示例**
+///    （例如提示用户设置 `GITHUB_TOKEN` 的那行）。这些是给人看的说明，不是凭据。
+///
+/// 跳过它们的代价：脚本目录内的**真实**硬编码凭据不会被这条规则拦住。
+/// 这是刻意的取舍——门禁一旦经常误报，开发者就会开始绕过它（见本 crate 的设计原则）。
+/// 真实凭据的兜底由 `cargo audit` 的依赖审计与提交前检查承担。
+#[must_use]
+fn skips_secret_scan(relative_path: &str) -> bool {
+    relative_path.starts_with("scripts/") || relative_path.contains("tools/nested-rules")
+}
+
 /// S3：禁止硬编码凭据。
 ///
 /// 保守判定：形如 `password = "…"`、`api_key: "…"`、内联口令的连接串、私钥块。
 /// 显式标注 example/placeholder/dummy 的行放行（样例文件需要）。
 ///
-/// **自身豁免**：本检查器的源码必然包含它要搜索的关键字（例如私钥块标记），
-/// 因此跳过 `tools/nested-rules` 目录，否则它会一直报自己。
+/// **自身豁免**：见 [`skips_secret_scan`]。
 #[must_use]
 pub fn no_hardcoded_secrets(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -370,8 +384,7 @@ pub fn no_hardcoded_secrets(root: &Path) -> Vec<Violation> {
     for extension in extensions {
         for file in fsutil::collect_files(root, extension) {
             let relative = Violation::relative(root, &file);
-            // 检查器自身的源码包含这些关键字作为"检测目标"，跳过
-            if relative.contains("tools/nested-rules") || relative.contains("check-rules.ps1") {
+            if skips_secret_scan(&relative) {
                 continue;
             }
             let Some(text) = fsutil::read_text(&file) else {

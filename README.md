@@ -63,6 +63,18 @@ cargo install flutter_rust_bridge_codegen --version 2.13.0 --locked
 
 ### 验证内核（无需 Flutter）
 
+> ⚠️ **刚 clone 仓库后，第一次跑 `cargo` 命令之前必须先执行**：
+>
+> ```powershell
+> powershell -NoProfile -File scripts/generate-ffi-bindings.ps1
+> ```
+>
+> 原因：FFI 桥接的生成物（`client/apps/rust/src/frb_generated.rs`）**不入库**，
+> 而 `nested_app` 里是无条件声明 `mod frb_generated;`。缺少它时任何 `cargo fmt` /
+> `clippy` / `test` 都会以 `failed to resolve mod 'frb_generated'` 失败。
+> 这是刻意设计：宁可给出明确的"请先生成"错误，也不要悄悄跳过 FFI 层。
+> 该脚本同时会把生成物的格式规范化，避免 `cargo fmt --check` 反复报同一个假失败。
+
 ```powershell
 # 1) 全量门禁：格式 + lint + 测试 + 铁律检查
 just check                     # 未安装 just 时见下方分步命令
@@ -106,8 +118,24 @@ flutter run -d windows
 > 因此该脚本用于**首次生成**；日常不要重复执行。
 >
 > **修改 Rust API 后**必须重新生成绑定：
-> `cd client/apps/flutter; flutter_rust_bridge_codegen generate`
+> `powershell -NoProfile -File scripts/generate-ffi-bindings.ps1`
+> 它会校验 codegen 版本与 pubspec 一致、生成绑定，并规范化生成物的格式。
 > 生成物（`apps/rust/src/frb_generated.rs`、`lib/src/rust/**`）不入库，已列入 `.gitignore`。
+
+### 查看 CI 结果
+
+仓库是私有的，Actions 需要认证。两种方式：
+
+```powershell
+# 方式一（推荐）：脚本读取 CI 结果并翻译成可读报告，失败时自动带出日志尾部
+powershell -NoProfile -File scripts/check-ci.ps1
+
+# 方式二：浏览器打开
+#   https://github.com/tengxiyi/NestedNote/actions
+```
+
+> 脚本复用 git 凭据管理器里已有的 GitHub 令牌（不会打印令牌内容）。
+> 若令牌不可用，可用 `-Token "<个人访问令牌>"` 显式传入。
 
 
 ---

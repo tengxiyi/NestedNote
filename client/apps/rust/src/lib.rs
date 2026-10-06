@@ -1,4 +1,4 @@
-//! # nested-app —— Flutter ↔ Rust 桥接层
+//! # nested_app —— Flutter ↔ Rust 桥接层
 //!
 //! 由 `flutter_rust_bridge` 生成的绑定把 [`api`] 模块里的函数暴露给 Dart。
 //! Flutter 只与本 crate 对话（铁律 A1/A3/T4）。
@@ -12,8 +12,29 @@
 //! | `lib/src/rust/**` | 生成（不入库） | codegen 产出的 Dart 绑定 |
 //!
 //! 生成物不入库的理由：它们完全由 `flutter_rust_bridge.yaml` 与 `src/api/` 决定，
-//! 提交它们只会制造无意义的 diff 与合并冲突。重建命令见 README
-//! （`flutter_rust_bridge_codegen generate`）。
+//! 提交它们只会制造无意义的 diff 与合并冲突。重建命令：
+//!
+//! ```text
+//! cd client/apps/flutter
+//! flutter_rust_bridge_codegen generate
+//! ```
+//!
+//! ## 前提：编译前必须先生成绑定
+//!
+//! 生成物不入库 ⇒ **刚 clone 的仓库里没有 `src/frb_generated.rs`**。
+//! 由于下面是无条件声明 `mod frb_generated;`，任何 cargo 命令（fmt / clippy / test）
+//! 在没有跑过 codegen 的机器上都会以
+//! `failed to resolve mod 'frb_generated'` **直接失败**。
+//!
+//! 这是**刻意保留**的行为，而不是缺陷：
+//!
+//! - CI 在质量门禁之前先执行 codegen（见 `.github/workflows/ci.yml` 的
+//!   `生成 FFI 绑定` 步骤），因此 CI 上永远是带着真实绑定做检查；
+//! - 本地若忘记生成，得到的是一个**明确的**错误信息与修复命令，
+//!   而不是"悄悄用了旧绑定"或"悄悄跳过了 FFI 层"。
+//!
+//! 只有一种情况例外：只改 `src/api/` 之外、与 FFI 无关的 crate 时可以直接构建，
+//! 因为那时根本不依赖本 crate。
 //!
 //! ## 为什么这里没有 `#![forbid(unsafe_code)]`
 //!
