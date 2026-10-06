@@ -15,3 +15,4 @@
 //! - 所有函数**禁止** panic：错误一律转成结构化结果返回。
 
 pub mod branding;
+pub mod notes;

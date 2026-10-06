@@ -3,7 +3,7 @@
 //! 这三个函数构成开发计划 P0-5 的验收内容：**从 Dart 调通 Rust 并取回真实数据**。
 //! 它们同时也证明了完整链路可用（Dart → FRB → Rust → SQLite 建库/迁移/校验）。
 
-use nested_core::{NestedCore, branding};
+use nested_core::branding;
 
 /// 版本与品牌信息。
 ///
@@ -68,38 +68,30 @@ pub struct EngineCheck {
 ///
 /// 这是 P0 阶段最有价值的验收函数：它会在真实目录里建库、执行迁移、
 /// 校验完整性，并把结果如实报告给界面。
+///
+/// ## 与 [`crate::api::notes::engine_start`] 的关系
+///
+/// 本函数现在**委托**给 `notes::engine_start`，后者会把内核装进进程级单例，
+/// 从而让界面后续能直接调用笔记操作。
+///
+/// 之所以做这个委托：两个函数各自持有一个 `NestedCore` 就会对同一个数据库
+/// 文件打开**两条连接**——写入时容易撞 `SQLITE_BUSY`，也让"引擎是否已启动"
+/// 这一状态出现两个互不相知的副本。统一到一处后，"启动"与"使用"看到的是同一个内核。
 #[must_use]
 pub fn start_engine(data_dir: &str) -> EngineStatus {
-    match NestedCore::open(data_dir) {
-        Ok(core) => {
-            let checks: Vec<EngineCheck> = core
-                .readiness()
-                .into_iter()
-                .map(|(name, passed)| EngineCheck {
-                    name: name.to_owned(),
-                    passed,
-                })
-                .collect();
-            let ready = checks.iter().all(|check| check.passed);
-            EngineStatus {
-                ready,
-                checks,
-                database_path: core.database_path().map(|path| path.display().to_string()),
-                message: None,
-            }
-        }
-        Err(error) => EngineStatus {
-            ready: false,
-            checks: Vec::new(),
-            database_path: None,
-            message: Some(error.user_hint().to_owned()),
-        },
-    }
+    crate::api::notes::engine_start(data_dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 这些测试会**启动全局引擎**，因此必须与 `notes` 的测试串行执行。
+    /// 否则一个测试的 `start_engine` 会把另一个测试正在用的引擎换掉，
+    /// 表现为"数据丢失"这类极具误导性的失败（详见 `notes::engine_lock_for_tests`）。
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::api::notes::test_support::engine_lock()
+    }
 
     #[test]
     fn version_info_is_non_empty_and_exposes_protocol() {
@@ -119,6 +111,7 @@ mod tests {
 
     #[test]
     fn start_engine_reports_ready_and_creates_database() {
+        let _guard = lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let status = start_engine(&dir.path().to_string_lossy());
 
@@ -139,6 +132,7 @@ mod tests {
 
     #[test]
     fn start_engine_is_idempotent_on_existing_directory() {
+        let _guard = lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let first = start_engine(&dir.path().to_string_lossy());
         assert!(first.ready);
@@ -149,6 +143,7 @@ mod tests {
 
     #[test]
     fn start_engine_reports_failure_without_panicking() {
+        let _guard = lock();
         // 用一个"父路径是文件"的非法目录触发失败
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("not-a-dir");
@@ -164,9 +159,28 @@ mod tests {
 
     #[test]
     fn start_engine_rejects_unwritable_path_without_panicking() {
+        let _guard = lock();
         // Windows 保留字符路径：必然不可创建
         let status = start_engine(r"Z:\definitely\missing\drive\nested");
         assert!(!status.ready);
         assert!(status.message.is_some());
+    }
+
+    #[test]
+    fn start_engine_shares_one_engine_with_note_operations() {
+        // 关键不变量：启动引擎后，笔记 API 必须能**立刻**在同一个内核上工作。
+        // 若两者各持一个 NestedCore（曾经如此），就会对同一数据库文件打开两条连接，
+        // 而且"启动成功但写不进去"这种故障极难定位。
+        let _guard = lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(start_engine(&dir.path().to_string_lossy()).ready);
+
+        let created = crate::api::notes::notes_create("共享引擎", 1_700_000_000_000);
+        assert!(
+            created.ok,
+            "笔记应能在启动后的引擎上创建：{:?}",
+            created.hint
+        );
+        assert_eq!(crate::api::notes::notes_count(), 1);
     }
 }

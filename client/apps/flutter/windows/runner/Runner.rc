@@ -89,13 +89,19 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "app.nestednote" "\0"
-            VALUE "FileDescription", "nested" "\0"
+            // 注意：CompanyName 与 ProductName 共同决定 Windows 上
+            // getApplicationSupportDirectory() 的返回路径
+            // （%APPDATA%\<CompanyName>\<ProductName>）。
+            // 因此这两个值必须保持**纯 ASCII**：中文会进入文件系统路径，
+            // 给日志、备份脚本与跨平台迁移带来不必要的编码问题。
+            // 界面显示的品牌名以 Rust 侧 branding 模块为准，不依赖这里。
+            VALUE "CompanyName", "NestedNote" "\0"
+            VALUE "FileDescription", "NestedNote - cross-platform notes" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "nested" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 app.nestednote. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 NestedNote contributors. AGPL-3.0-or-later" "\0"
             VALUE "OriginalFilename", "nested.exe" "\0"
-            VALUE "ProductName", "nested" "\0"
+            VALUE "ProductName", "NestedNote" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

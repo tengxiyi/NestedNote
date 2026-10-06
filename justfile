@@ -125,6 +125,28 @@ cli-doctor dir="":
 cli-init dir="":
     cd {{client_dir}} && cargo run -p nested-cli -- init {{ if dir == "" { "" } else { "--data-dir " + dir } }}
 
+# ---------------------------------------------------------------- 桌面应用
+
+# 打包 Windows 桌面应用
+# 产物：client/apps/flutter/build/windows/x64/runner/Release/nested.exe
+# 说明：Cargokit 会在构建过程中自动编译 Rust 内核并打进产物目录，无需先手动 cargo build。
+app-build:
+    cd {{client_dir}}/apps/flutter && flutter build windows --release
+    @echo "完成：{{client_dir}}\apps\flutter\build\windows\x64\runner\Release\nested.exe"
+
+# 直接运行桌面应用（开发模式，支持热重载）
+app-run:
+    cd {{client_dir}}/apps/flutter && flutter run -d windows
+
+# Flutter 侧静态分析与测试（含真实 FFI 集成测试，需先构建 release 动态库）
+check-flutter:
+    @echo "== flutter analyze =="
+    cd {{client_dir}}/apps/flutter && flutter analyze
+    @echo "== 构建 Rust 动态库 =="
+    cd {{client_dir}} && cargo build --release -p nested_app
+    @echo "== flutter test =="
+    cd {{client_dir}}/apps/flutter && flutter test
+
 # ---------------------------------------------------------------- 格式化
 
 fmt:

@@ -27,7 +27,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
   Win32Window::Size size(1280, 720);
-  if (!window.Create(L"nested", origin, size)) {
+  if (!window.Create(L"\u62fe\u5149\u7b14\u8bb0\u0020\u004e\u0065\u0073\u0074\u0065\u0064\u004e\u006f\u0074\u0065", origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);

@@ -30,17 +30,35 @@ final FutureProvider<EngineStatus> engineProvider =
       return loadEngineStatus();
     });
 
+/// FFI 运行时是否已初始化。
+///
+/// `RustLib.init()` **不允许**重复调用：第二次会抛
+/// `StateError: Should not initialize flutter_rust_bridge twice`。
+/// 而本函数会在每次 `engineProvider` 被 invalidate 时重新执行（刷新自检、
+/// 重试启动），因此必须自己保证幂等——否则"点一下刷新就崩"。
+bool _rustInitialized = false;
+
+/// 初始化 FFI 运行时（幂等）。
+Future<void> ensureRustInitialized() async {
+  if (_rustInitialized) {
+    return;
+  }
+  await RustLib.init();
+  _rustInitialized = true;
+}
+
 /// 启动引擎并返回自检结果。
 ///
 /// 这是与 Rust 内核的唯一接触点。步骤：
 /// 1. 初始化 FRB 运行时（幂等，重复调用安全）；
 /// 2. 解析数据目录（`path_provider`，需要 Flutter binding）；
-/// 3. 调用 `startEngine` —— Rust 侧会在该目录建库、执行迁移、校验完整性。
+/// 3. 调用 `startEngine` —— Rust 侧会在该目录建库、执行迁移、校验完整性，
+///    并把内核装进进程级单例，供后续笔记操作使用。
 ///
 /// 测试场景请改用 [startEngineInDirectory]：它不依赖平台通道，
 /// 可以传入临时目录，从而在 `flutter test` 里真实跑通 FFI。
 Future<EngineStatus> loadEngineStatus() async {
-  await RustLib.init();
+  await ensureRustInitialized();
   return startEngineInDirectory(await resolveDataDir());
 }
 
@@ -95,25 +113,42 @@ Future<EngineStatus> startEngineInDirectory(String dataDir) async {
   return status;
 }
 
-/// 把一次自检的结果写入临时目录，便于排查"界面只显示一句提示"的现场问题。
-Future<void> _writeDiagnostics(String dataDir, EngineStatus status) async {
+/// 把 UI 侧的诊断信息追加写入临时目录。
+///
+/// ## 为什么需要这个
+///
+/// "应用到底看到了什么"必须能被外部核实。界面观察依赖人眼、自动化截屏又可能
+/// 受远程桌面/虚拟化环境限制（本项目实测过：截屏返回的画面始终是同一帧，
+/// 无法用来判断界面渲染结果）。因此把关键状态落到一个文件里，
+/// 让验证脚本可以断言——这比"截图看起来对"可靠得多。
+///
+/// P1 引入结构化日志（铁律 E5）后，这段应替换为正式的日志通道。
+Future<void> writeUiDiagnostics(List<String> lines) async {
   try {
-    final lines = <String>[
-      'dataDir=$dataDir',
-      'ready=${status.ready}',
-      'displayName=${status.displayName}',
-      'version=${status.version}',
-      'protocolVersion=${status.protocolVersion}',
-      'databasePath=${status.databasePath}',
-      'message=${status.message}',
-      for (final check in status.checks) 'check ${check.name}=${check.passed}',
-    ];
-    await File(
-      '${Directory.systemTemp.path}/engine-status.txt',
-    ).writeAsString('${lines.join('\n')}\n');
+    final stamp = DateTime.now().toIso8601String();
+    final file = File('${Directory.systemTemp.path}/nested-ui-diagnostics.txt');
+    await file.writeAsString(
+      '[$stamp]\n${lines.join('\n')}\n\n',
+      mode: FileMode.append,
+    );
   } catch (_) {
     // 诊断写入失败绝不能影响正常流程
   }
+}
+
+/// 把一次自检的结果写入临时目录，便于排查"界面只显示一句提示"的现场问题。
+Future<void> _writeDiagnostics(String dataDir, EngineStatus status) async {
+  await writeUiDiagnostics(<String>[
+    'kind=engine-status',
+    'dataDir=$dataDir',
+    'ready=${status.ready}',
+    'displayName=${status.displayName}',
+    'version=${status.version}',
+    'protocolVersion=${status.protocolVersion}',
+    'databasePath=${status.databasePath}',
+    'message=${status.message}',
+    for (final check in status.checks) 'check ${check.name}=${check.passed}',
+  ]);
 }
 
 /// 解析数据目录。
