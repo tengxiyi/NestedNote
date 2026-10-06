@@ -1,0 +1,41 @@
+# =============================================================================
+# 拾光笔记 / NestedNote —— 行尾与二进制文件规范
+#
+# 为什么需要这个文件：
+#   迁移文件受"哈希清单"保护（见 client/crates/nested-db/tests/migration_guard.rs）。
+#   若 Windows 检出时把 LF 变成 CRLF，同一份迁移在不同机器上哈希不同，
+#   CI 会误报"迁移被篡改"。因此这里强制统一。
+# =============================================================================
+
+# 默认：自动判断，检出时统一为 LF
+* text=auto eol=lf
+
+# 迁移与 SQL：必须 LF，且禁止任何转换（哈希敏感）
+*.sql text eol=lf -text
+client/migrations/*.sql text eol=lf
+
+# 源码与配置
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+
+# Windows 脚本用 CRLF
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.db    binary
+*.keystore binary

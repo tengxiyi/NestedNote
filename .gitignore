@@ -1,0 +1,67 @@
+# ---- Rust ----
+# 注意（铁律 B1）：Cargo.lock 必须提交入库，因此此处**不**忽略它。
+# 用 `target/`（不带前导斜杠）匹配任意层级的构建目录：
+# client/target、server/target、shared/protocol/target 都要忽略。
+target/
+**/*.rs.bk
+
+# ---- Flutter / Dart ----
+client/apps/flutter/.dart_tool/
+client/apps/flutter/.flutter-plugins
+client/apps/flutter/.flutter-plugins-dependencies
+client/apps/flutter/build/
+client/apps/flutter/ephemeral/
+client/apps/flutter/windows/flutter/ephemeral/
+client/apps/flutter/macos/Flutter/ephemeral/
+client/apps/flutter/ios/Flutter/ephemeral/
+client/apps/flutter/ios/Pods/
+client/apps/flutter/macos/Pods/
+client/apps/flutter/android/.gradle/
+client/apps/flutter/android/local.properties
+client/apps/flutter/android/key.properties
+*.g.dart.bak
+
+# ---- 本地数据与运行时产物（绝不能进仓库，铁律 V5）----
+*.db
+*.db-wal
+*.db-shm
+/data/
+/attachments/
+/backups/
+/logs/
+*.log
+
+# ---- 机密（铁律 S1 / B8）----
+.env
+.env.local
+.env.*.local
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+!client/apps/flutter/android/app/debug.keystore
+
+# ---- 构建与工具产物 ----
+/dist/
+/artifacts/
+/tmp/
+coverage/
+*.profraw
+*.profdata
+.criterion/
+.idea/
+.vs/
+.vscode/*
+!.vscode/extensions.json
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- 本地临时探针（依赖版本探测用，永不入库）----
+.probe/
