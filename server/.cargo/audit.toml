@@ -1,0 +1,45 @@
+# cargo-audit 配置（铁律 S11：依赖漏洞必须在 7 天内处理**或记录豁免**）
+#
+# 用法：在 server/ 或 client/ 目录下执行 `cargo audit --file <path>`，或把本文件放到
+# 对应 workspace 根目录（`<workspace>/.cargo/audit.toml`），cargo-audit 会自动读取。
+#
+# =============================================================================
+# 豁免记录
+# =============================================================================
+#
+# RUSTSEC-2023-0071 —— Marvin Attack：`rsa` crate 的时序侧信道
+#
+# 为什么豁免（而不是修复）：
+#
+#   1. **上游没有补丁**。advisory 里 `patched = []` 是作者刻意的：
+#      截至 2026-09-12，`rsa` 0.9.10（最新稳定版）与 0.10.0-rc.18 都仍受影响。
+#      也就是说"升级到修复版本"这条路当前不存在。
+#
+#   2. **我们不会编译到它**。该 crate 只被 `sqlx-mysql` 引用，而本项目**只用
+#      PostgreSQL**（`sqlx` 特性里只有 `postgres`，没有 `mysql`）。
+#      证据：
+#        cargo tree -i rsa                 → nothing to print
+#        cargo tree --target all -i rsa     → nothing to print
+#      它出现在 Cargo.lock 里，是因为 Cargo 会为**可选依赖**解析并锁定版本，
+#      而 `cargo audit` 扫描的是 lock 文件、**不感知 feature 与目标平台**，
+#      因此这是一个"锁文件层面存在、编译产物层面不存在"的误报。
+#
+#   3. **我们的代码不直接用 RSA**。服务端 TLS 走 `tls-rustls`（见 server/Cargo.toml），
+#      rustls 不使用 `rsa` crate 做握手。即便将来启用 RSA 证书，走的也是 rustls 的
+#      实现而非本 crate。
+#
+# 风险接受结论：**在编译产物中不存在该代码，故无可利用面。**
+#
+# 复核触发条件（任一满足即必须重新评估，见 docs/tech-debt.md）：
+#   - 服务端引入 MySQL/MariaDB 后端（会真正编译 sqlx-mysql）；
+#   - sqlx 发布去掉 mysql 可选依赖的版本；
+#   - `rsa` 发布修复版本（届时应直接升级而非继续豁免）；
+#   - 我们开始直接使用 `rsa` crate。
+#
+# 注意：豁免必须与"证明它没被编译"的检查配套，否则豁免会退化成"眼不见为净"。
+# 该检查已加入 CI（.github/workflows/ci.yml 的 audit 作业）。
+
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071",
+]

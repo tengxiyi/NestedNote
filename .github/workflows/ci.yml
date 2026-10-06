@@ -177,6 +177,21 @@ jobs:
         working-directory: server
         run: cargo audit
 
+      # 服务端对 RUSTSEC-2023-0071（rsa 时序侧信道）有豁免，理由见
+      # server/.cargo/audit.toml：该 crate 只被 sqlx-mysql 引用，而我们只用 PostgreSQL。
+      # 豁免必须与"证明它没被编译"的检查配套，否则豁免会退化成"眼不见为净"。
+      - name: 验证豁免前提：rsa 不在实际依赖树中（铁律 S11）
+        working-directory: server
+        run: |
+          set -euo pipefail
+          if cargo tree -i rsa 2>&1 | grep -q 'nothing to print'; then
+            echo "OK: rsa 不在依赖树中，RUSTSEC-2023-0071 豁免前提成立"
+          else
+            echo "FAIL: rsa 出现在依赖树中 —— 豁免前提已失效，必须重新评估而非继续豁免"
+            cargo tree -i rsa
+            exit 1
+          fi
+
   # ---------------------------------------------------------------- 汇总门禁
   ci-ok:
     name: CI 结果
