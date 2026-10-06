@@ -70,9 +70,15 @@ class EngineStatusPage extends ConsumerWidget {
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: switch (engine) {
-              AsyncData(:final EngineStatus status) =>
-                _StatusView(status: status, theme: theme),
-              AsyncError(:final Object error) => _ErrorView(message: '$error', theme: theme),
+              // 注意：AsyncValue 的 data 载荷字段名是 `value`，不是 `status`。
+              AsyncData(:final EngineStatus value) => _StatusView(
+                status: value,
+                theme: theme,
+              ),
+              AsyncError(:final Object error) => _ErrorView(
+                message: '$error',
+                theme: theme,
+              ),
               _ => const Center(child: CircularProgressIndicator()),
             },
           ),
@@ -109,15 +115,19 @@ class _StatusView extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Text('启动自检（$okCount/${status.checks.length} 通过）',
-                    style: theme.textTheme.titleMedium),
+                Text(
+                  '启动自检（$okCount/${status.checks.length} 通过）',
+                  style: theme.textTheme.titleMedium,
+                ),
                 const SizedBox(height: 12),
                 for (final EngineCheck check in status.checks)
                   ListTile(
                     dense: true,
                     leading: Icon(
                       check.passed ? Icons.check_circle : Icons.error,
-                      color: check.passed ? Colors.green : theme.colorScheme.error,
+                      color: check.passed
+                          ? Colors.green
+                          : theme.colorScheme.error,
                     ),
                     title: Text(check.name),
                   ),
@@ -151,7 +161,11 @@ class _ErrorView extends StatelessWidget {
         const SizedBox(height: 16),
         Text('引擎启动失败', style: theme.textTheme.titleLarge),
         const SizedBox(height: 8),
-        Text(message, textAlign: TextAlign.center, style: theme.textTheme.bodyMedium),
+        Text(
+          message,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium,
+        ),
       ],
     );
   }

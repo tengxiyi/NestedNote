@@ -1,4 +1,4 @@
-# 构建 Rust 内核并放到 Flutter 平台工程可链接的位置。
+﻿# 构建 Rust 内核并放到 Flutter 平台工程可链接的位置。
 #
 # 为什么需要它：
 #   flutter_rust_bridge 生成的绑定需要一个本地动态/静态库。

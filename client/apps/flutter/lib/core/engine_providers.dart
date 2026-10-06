@@ -20,9 +20,10 @@ import 'package:path_provider/path_provider.dart';
 import 'engine.dart';
 
 /// 引擎状态提供者。
-final FutureProvider<EngineStatus> engineProvider = FutureProvider<EngineStatus>((Ref ref) async {
-  return loadEngineStatus();
-});
+final FutureProvider<EngineStatus> engineProvider =
+    FutureProvider<EngineStatus>((Ref ref) async {
+      return loadEngineStatus();
+    });
 
 /// 加载引擎状态。
 ///

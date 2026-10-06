@@ -1,4 +1,4 @@
-# 把迁移与源码文件统一为 LF 行尾（幂等）。
+﻿# 把迁移与源码文件统一为 LF 行尾（幂等）。
 #
 # 依据：.gitattributes 规定迁移文件必须是 LF。
 # 迁移文件的哈希被 client/crates/nested-db/tests/migration_guard.rs 校验，

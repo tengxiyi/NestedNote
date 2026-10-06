@@ -1,14 +1,16 @@
-# 一次性引导脚本：生成 Flutter 平台工程目录
+﻿# 一次性引导脚本：生成 Flutter 平台工程目录
 #
 # 为什么需要它：
 #   Flutter 的平台目录（windows/ macos/ ios/ android/）体量大且由工具生成，
 #   不适合手工维护。本脚本在**首次**配置环境时运行一次，之后这些目录随仓库提交。
 #
 # 用法（在仓库根目录）：
-#   pwsh scripts/bootstrap-flutter.ps1
-#   pwsh scripts/bootstrap-flutter.ps1 -Check   只检查环境，不生成
+#   powershell -NoProfile -File scripts/bootstrap-flutter.ps1
+#   powershell -NoProfile -File scripts/bootstrap-flutter.ps1 -Check   只检查环境，不生成
 #
-# 输出使用 ASCII，避免 Windows PowerShell 5.1 的编码问题。
+# 注意：本脚本的用户可见输出一律使用 ASCII。
+# Windows PowerShell 5.1 会把无 BOM 的 UTF-8 脚本按 ANSI 解码，
+# 中文会变成乱码并**破坏脚本语法**（这是本项目踩过的坑，见 ADR 0004）。
 
 [CmdletBinding()]
 param(
@@ -30,19 +32,17 @@ Write-Host "== 1/4 checking Flutter toolchain =="
 if (-not (Test-Command 'flutter')) {
     Write-Host "FAIL: flutter is not installed or not on PATH."
     Write-Host ""
-    Write-Host "Install Flutter (stable channel), then re-run this script:"
-    Write-Host "  https://docs.flutter.dev/get-started/install/windows"
+    Write-Host "Install the Flutter SDK, then re-run this script:"
+    Write-Host "  powershell -NoProfile -File scripts/install-flutter.ps1"
     Write-Host ""
-    Write-Host "After install, run:"
-    Write-Host "  flutter --version"
-    Write-Host "  flutter doctor -v"
+    Write-Host "Install docs: https://docs.flutter.dev/get-started/install/windows"
     exit 1
 }
 
 $flutterVersion = (& flutter --version 2>&1 | Select-Object -First 1)
 Write-Host "flutter: $flutterVersion"
 
-Write-Host "== 2/4 checking desktop/mobile targets =="
+Write-Host "== 2/4 checking desktop targets =="
 if (-not $Check) {
     & flutter config --enable-windows-desktop | Out-Null
     & flutter config --enable-macos-desktop | Out-Null
@@ -54,21 +54,26 @@ if ($Check) {
 }
 
 Write-Host "== 3/4 generating platform projects =="
-if (-not (Test-Path $flutterApp)) {
+if (-not (Test-Path -LiteralPath $flutterApp)) {
     Write-Host "FAIL: $flutterApp not found."
     exit 1
 }
 
 # 说明：
-#   - 用 `flutter create` 补齐平台目录；已存在的文件不会被覆盖
+#   - 用 `flutter create` 补齐平台目录；已存在的 lib/ 文件会被它覆盖，
+#     因此调用方需要先备份自定义 Dart 文件（安装流程见 README）
 #   - --project-name 必须是合法的 Dart 包名（小写下划线），品牌名放显示名
-& flutter create `
-    --org $Organization `
-    --project-name nested `
-    --platforms windows,macos,ios,android `
-    --description "拾光笔记 / NestedNote - local-first cross-platform notes" `
+#   - 用参数数组而不是反引号续行：反引号在跨 shell 调用时极易被吃掉
+$createArgs = @(
+    'create',
+    '--org', $Organization,
+    '--project-name', 'nested',
+    '--platforms', 'windows,macos,ios,android',
+    '--description', 'Shiguang Notes / NestedNote - local-first cross-platform notes',
     $flutterApp
+)
 
+& flutter @createArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "FAIL: flutter create returned $LASTEXITCODE"
     exit 1
@@ -79,7 +84,7 @@ Push-Location $flutterApp
 try {
     & flutter pub get
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "WARN: flutter pub get failed (flutter_rust_bridge may not be published/available yet)."
+        Write-Host "WARN: flutter pub get failed; run it manually to see details."
     }
 }
 finally {
@@ -88,4 +93,5 @@ finally {
 
 Write-Host ""
 Write-Host "done. platform directories are ready under client/apps/flutter/"
-Write-Host "next: pwsh scripts/build-rust-for-flutter.ps1 -Platform windows"
+Write-Host "next: restore your custom lib/ files if flutter create overwrote them,"
+Write-Host "      then run: flutter analyze"

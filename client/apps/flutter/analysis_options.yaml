@@ -16,8 +16,9 @@ linter:
     # F1/F4：资源释放与副作用
     cancel_subscriptions: true
     close_sinks: true
-    # U3：Unicode 处理
-    avoid_utf8_decoding_with_slice_and_remove: true
+    # U3（Unicode 处理）没有对应的内置 lint 规则：
+    # 字素簇级别的处理（光标移动、字数统计）无法靠静态检查保证，
+    # 只能靠测试覆盖，因此这里不列规则，改由 Widget 测试兜底。
 
 analyzer:
   language:
@@ -34,3 +35,7 @@ analyzer:
     - "**/*.g.dart"          # 生成的绑定代码
     - "**/*.freezed.dart"
     - "build/**"
+    - android/**
+    - ios/**
+    - windows/**
+    - macos/**
