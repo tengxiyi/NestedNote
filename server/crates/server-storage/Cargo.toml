@@ -1,0 +1,23 @@
+[package]
+name = "server-storage"
+description = "服务端存储：PostgreSQL（SQLx）与 S3 兼容对象存储抽象"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+server-core.workspace = true
+protocol.workspace = true
+sqlx.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

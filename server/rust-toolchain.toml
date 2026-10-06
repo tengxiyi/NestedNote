@@ -1,0 +1,6 @@
+[toolchain]
+# 铁律 B1：服务端工具链独立锁定，可与客户端不同步升级
+# 目标平台：开发在本机（windows-msvc），生产部署走 Docker（debian GNU 基础镜像）
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

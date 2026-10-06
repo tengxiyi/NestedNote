@@ -1,0 +1,20 @@
+[package]
+name = "server-core"
+description = "服务端基础设施：配置、结构化错误、日志与可观测性"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+protocol.workspace = true
+axum.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

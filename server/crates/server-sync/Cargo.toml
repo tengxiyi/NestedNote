@@ -1,0 +1,21 @@
+[package]
+name = "server-sync"
+description = "同步服务端逻辑：push/pull、修订序、冲突检测（P6 起实现）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+server-core.workspace = true
+server-storage.workspace = true
+protocol.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "server-api"
+description = "HTTP 层：Axum 路由、中间件、请求/响应 DTO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+server-core.workspace = true
+server-auth.workspace = true
+server-sync.workspace = true
+server-storage.workspace = true
+protocol.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

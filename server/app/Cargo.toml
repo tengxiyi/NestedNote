@@ -1,0 +1,27 @@
+[package]
+name = "server"
+description = "拾光笔记同步服务：可执行入口（配置加载、日志初始化、优雅停机）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nested-server"
+path = "src/main.rs"
+
+[dependencies]
+server-core.workspace = true
+server-api.workspace = true
+server-storage.workspace = true
+protocol.workspace = true
+axum.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

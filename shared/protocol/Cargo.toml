@@ -1,0 +1,42 @@
+# shared/protocol —— 跨端唯一共享的纯数据契约
+#
+# ⚠️ 本 crate **不属于** client/ 或 server/ 任何一个 workspace，这是刻意的：
+#    - 若归入某一侧，另一侧引用它就会把对方的 workspace 边界打破（隔离失效）；
+#    - 因此它必须**完全独立**：不能使用 `workspace = true` 继承，依赖版本在此显式声明。
+#
+# 依赖版本必须与 client/Cargo.toml 和 server/Cargo.toml 中的声明保持一致。
+# 修改依赖后请同步三处（scripts/check-rules.ps1 会检查两端是否混入越界依赖）。
+
+[workspace]
+# 显式声明空 workspace：防止它被误认为某个父目录 workspace 的成员
+
+[package]
+name = "protocol"
+description = "跨端唯一共享的纯数据契约（API / 同步协议 DTO）。禁止引入任何 IO、数据库、网络依赖。"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-or-later"
+
+# 纯数据契约：这里**故意**只有 serde 与 thiserror。
+# 新增任何依赖都必须先证明它不引入 IO/数据库/网络（技术文档 §4.2 硬约束 2）。
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+serde_json = "1.0.151"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"

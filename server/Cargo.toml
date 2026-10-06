@@ -1,0 +1,105 @@
+# 拾光笔记 / NestedNote —— 服务端 workspace
+#
+# 与 client/ 完全隔离（技术文档 §4.1）：
+#   - 此处**禁止**出现 rusqlite、Flutter 相关依赖
+#   - 唯一的跨端共享物是 ../shared/protocol（纯数据契约）
+# 本目录自带 Cargo.lock。
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/server-core",
+    "crates/server-api",
+    "crates/server-auth",
+    "crates/server-sync",
+    "crates/server-storage",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-or-later"
+repository = "https://example.invalid/nested"
+authors = ["拾光笔记 / NestedNote contributors"]
+
+[workspace.dependencies]
+# ---- 内部 crate ----
+server-core = { path = "crates/server-core" }
+server-api = { path = "crates/server-api" }
+server-auth = { path = "crates/server-auth" }
+server-sync = { path = "crates/server-sync" }
+server-storage = { path = "crates/server-storage" }
+protocol = { path = "../shared/protocol" }
+
+# ---- 外部依赖（版本由 cargo generate-lockfile 解析，铁律 B1）----
+axum = "0.8.9"
+tokio = { version = "1.53.2", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["trace", "limit", "timeout"] }
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "migrate",
+    "uuid",
+    "time",
+    "macros",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+async-trait = "0.1.89"
+thiserror = "2.0.21"
+anyhow = "1.0.100"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.27.0", features = ["v7", "serde"] }
+time = { version = "0.3.55", features = ["formatting", "macros"] }
+
+# ---- 工作区 lint 基线（铁律 R7）----
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+# 测试代码的 panic 类 lint 与噪音项：理由同 client/Cargo.toml
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+unwrap_in_result = "allow"
+trivially_copy_pass_by_ref = "allow"
+many_single_char_names = "allow"
+format_collect = "allow"
+match_same_arms = "allow"
+unnecessary_wraps = "allow"
+# 与客户端保持同一套"噪音豁免"清单，理由见 client/Cargo.toml
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+too_many_lines = "allow"
+missing_docs_in_private_items = "allow"
+similar_names = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+items_after_statements = "allow"
+option_if_let_else = "allow"
+implicit_hasher = "allow"
+needless_pass_by_value = "allow"
+struct_excessive_bools = "allow"
+unreadable_literal = "allow"
+let_underscore_must_use = "allow"
+return_self_not_must_use = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
