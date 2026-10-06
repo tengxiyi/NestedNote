@@ -55,4 +55,9 @@ pub const ALL: &[Rule] = &[
         title: "V6: 禁止大文件入库",
         run: checks::no_large_files,
     },
+    Rule {
+        id: "B-ENCODING",
+        title: "B-ENCODING: PowerShell 脚本含中文时必须有 UTF-8 BOM",
+        run: checks::powershell_scripts_need_bom,
+    },
 ];

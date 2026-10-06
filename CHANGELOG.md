@@ -7,7 +7,57 @@
 
 ## [Unreleased]
 
-### 新增（P0 工程基座 —— 已通过 [Gate 评审](docs/reports/gate-p0.md)）
+### 新增（P1 开工准备：覆盖率基线 + 设计文档）
+
+**测试覆盖率（铁律 Z1）**
+- 新增 `scripts/coverage-gate.ps1` 并接入 CI：只对**已实现**的 crate 卡 80%，
+  占位 crate 单独列出并写明"实现后必须并入清单"的原因，避免一刀切产生自欺指标
+- 实测：nested-model 95.9%、nested-db 94.4%、nested-core 93.9%、
+  nested-attachment 94.9%、nested-sync 100%、nested-rules 88.7%
+- 客户端用例数由 149 增至 **204**
+
+**详细设计文档（铁律 M1，共约 3100 行）**
+- `docs/design/06-Document-Model设计.md` —— 13 种块类型逐字段、JSON 表示、
+  行内标记的字节偏移取舍、格式版本演进规则、持久化与派生能力
+- `docs/design/05-SQLite数据库设计.md` —— PRAGMA 基线逐项、10 张表逐列、
+  22 条索引与查询路径对应、事务边界、迁移体系、损坏容错
+- `docs/design/04-Rust-Core架构设计.md` —— 分层、12 个 crate 状态、
+  `nested-core` 全部 24 个 `pub fn` 的 API 表、错误模型、FFI 契约、演进规则
+
+**附件内容寻址存储（`nested-attachment`，P1 能力提前落地）**
+- `ContentStore`：流式 SHA-256、写入去重、原子落盘（临时文件 → fsync → rename）、
+  写后回读校验、`verify`/`delete`/`contains`
+- 非法哈希返回结构化错误而不是 panic；临时文件与目标同目录以保证 rename 的原子性
+- 21 个测试，含"路径布局必须与 `Attachment::storage_key` 一致"的交叉验证
+
+**铁律检查器新增规则：B-ENCODING**
+- 检查 `scripts/*.ps1` 是否"含非 ASCII 字符但没有 UTF-8 BOM"。
+  Windows PowerShell 5.1 在无 BOM 时按 ANSI 解码，会**直接破坏脚本语法**——
+  这个坑在本项目真实发生过三次，因此改由门禁强制
+
+### 修复（设计文档撰写中审出的缺陷）
+- `Document::searchable_text()` 把列表项文本收集两遍，导致 FTS5 索引内容重复、
+  影响词频与相关度排序；已加回归测试 `searchable_text_collects_list_item_text_exactly_once`
+- `nested-db` 迁移框架改为可注入清单（`apply()` + `apply_manifest()`），
+  从而能真正测试失败路径：新增 5 个测试覆盖"迁移失败必须整体回滚""版本不得前进"
+  "清单不自洽必须拒绝启动"
+- 测试死锁：`failing_migration_keeps_previous_version_when_upgrading` 曾因持有连接锁
+  再调 `check_integrity` 而挂死（已在 `Database::connection()` 的文档中写明这个陷阱）
+
+### 变更
+- `justfile` 补齐并修正：新增 `check-client` / `check-server` / `check-all` /
+  `coverage` / `bindings` / `ci`；此前头部注释宣传了 `check-client`、`check-server`
+  但并未定义（文档与实现不一致）
+- 覆盖率门禁策略写入 `docs/reports/gate-p0.md` §4.1 与脚本头部注释
+
+### 依赖
+- 新增 `sha2` 0.10.9（RustCrypto）：附件内容寻址所需，与项目其它加密选型一致
+
+### 数据与文档一致性
+- 技术债登记表由 7 条扩至 **20 条**：设计文档审出的实现问题全部登记，
+  含 3 项高危（#8 连接锁死锁陷阱、#10 事务行为不统一、#12 同步入队缺口）
+
+## [P0] —— 工程基座（已通过 [Gate 评审](docs/reports/gate-p0.md))
 
 **Flutter ↔ Rust 打通（P0-5）**
 - 真实应用启动后由 Rust 建库、执行迁移、返回自检结果：

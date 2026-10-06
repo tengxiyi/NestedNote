@@ -49,39 +49,59 @@ pub fn current_version(connection: &Connection) -> Result<u32, DbError> {
     u32::try_from(raw).map_err(|_| DbError::VersionOutOfRange { raw })
 }
 
-/// 按序执行未应用的迁移。
+/// 按序执行**内置**清单中未应用的迁移。见 [`apply_manifest`]。
+///
+/// # Errors
+///
+/// 见 [`apply_manifest`]。
+pub fn apply(connection: &mut Connection) -> Result<u32, DbError> {
+    apply_manifest(connection, MIGRATIONS, LATEST_VERSION)
+}
+
+/// 按序执行给定清单中未应用的迁移。
 ///
 /// 整个升级过程在**单个事务**内完成：要么全部生效，要么原样回滚，
 /// 不会出现"迁移到一半"的数据库。
 ///
+/// ## 为什么清单是参数而不是直接用 [`MIGRATIONS`]
+///
+/// 迁移的失败路径（SQL 出错时的回滚、清单不自洽时的拒绝启动）恰恰是**最需要测试**
+/// 的部分——"迁移失败留下半截状态"是最难排查的一类事故。把清单作为参数注入，
+/// 测试就能构造一条必然失败的迁移来验证回滚，而不必真的去破坏内置迁移。
+/// 生产路径通过 [`apply`] 固定使用内置清单。
+///
 /// # Errors
 ///
 /// - 数据库版本高于本程序支持 → [`DbError::SchemaTooNew`]（禁止降级使用）
-/// - 迁移清单版本号不连续 → [`DbError::MigrationManifest`]
+/// - 清单版本号不连续或 SQL 为空 → [`DbError::MigrationManifest`]
 /// - SQL 执行失败 → [`DbError::Migrate`]（事务回滚，库保持升级前状态）
-pub fn apply(connection: &mut Connection) -> Result<u32, DbError> {
-    validate_manifest()?;
+pub fn apply_manifest(
+    connection: &mut Connection,
+    migrations: &[Migration],
+    latest_version: u32,
+) -> Result<u32, DbError> {
+    validate_manifest(migrations)?;
 
     let from = current_version(connection)?;
-    if from > LATEST_VERSION {
+    if from > latest_version {
         return Err(DbError::SchemaTooNew {
             found: from,
-            supported: LATEST_VERSION,
+            supported: latest_version,
         });
     }
-    if from == LATEST_VERSION {
+    if from == latest_version {
         tracing::debug!(version = from, "数据库结构已是最新");
         return Ok(from);
     }
 
-    let pending: Vec<&Migration> = MIGRATIONS
+    let pending: Vec<&Migration> = migrations
         .iter()
         .filter(|migration| migration.version > from)
         .collect();
 
     tracing::info!(
         from,
-        to = LATEST_VERSION,
+        to = latest_version,
         count = pending.len(),
         "开始执行数据库迁移"
     );
@@ -106,12 +126,12 @@ pub fn apply(connection: &mut Connection) -> Result<u32, DbError> {
     }
     transaction.commit()?;
 
-    Ok(LATEST_VERSION)
+    Ok(latest_version)
 }
 
-/// 校验清单自身的一致性（版本连续、名称唯一、SQL 非空）。
-fn validate_manifest() -> Result<(), DbError> {
-    for (index, migration) in MIGRATIONS.iter().enumerate() {
+/// 校验清单自身的一致性（版本从 1 连续递增、SQL 非空）。
+fn validate_manifest(migrations: &[Migration]) -> Result<(), DbError> {
+    for (index, migration) in migrations.iter().enumerate() {
         let expected = u32::try_from(index).unwrap_or(u32::MAX) + 1;
         if migration.version != expected {
             return Err(DbError::MigrationManifest {
@@ -130,19 +150,181 @@ fn validate_manifest() -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Database;
+
+    /// 一条只创建单表的合法迁移，用于构造测试清单。
+    const OK_SQL: &str = "CREATE TABLE probe (id INTEGER PRIMARY KEY);";
+    /// 一条必然失败的迁移（语法错误）。
+    const BROKEN_SQL: &str = "CREATE TABLE";
+
+    /// 打开一个**未经迁移**的裸连接（`user_version = 0`）。
+    ///
+    /// 不能用 `Database::open_in_memory()`：它内部会直接应用内置清单，
+    /// 打开后版本就已经是最新，无法用来测试"从旧版本升级"的路径。
+    fn bare_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("open in memory");
+        connection
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .expect("busy_timeout");
+        connection
+    }
+
+    fn manifest(entries: &[(u32, &'static str, &'static str)]) -> Vec<Migration> {
+        entries
+            .iter()
+            .map(|(version, name, sql)| Migration {
+                version: *version,
+                name,
+                sql,
+            })
+            .collect()
+    }
 
     #[test]
-    fn manifest_is_consistent() {
-        validate_manifest().expect("清单必须自洽");
+    fn builtin_manifest_is_consistent() {
+        validate_manifest(MIGRATIONS).expect("内置清单必须自洽");
         assert_eq!(LATEST_VERSION, MIGRATIONS.len() as u32);
     }
 
     #[test]
-    fn manifest_embeds_real_sql() {
+    fn builtin_manifest_embeds_real_sql() {
         let first = MIGRATIONS.first().expect("至少一条迁移");
         assert!(
             first.sql.contains("CREATE TABLE notes"),
             "应嵌入 0001_init.sql 内容"
         );
+    }
+
+    #[test]
+    fn manifest_rejects_non_sequential_versions() {
+        let bad = manifest(&[(1, "0001_a", OK_SQL), (3, "0003_c", OK_SQL)]);
+        let error = validate_manifest(&bad).expect_err("版本跳跃必须被拒绝");
+        assert!(matches!(error, DbError::MigrationManifest { .. }));
+    }
+
+    #[test]
+    fn manifest_rejects_empty_sql() {
+        let bad = manifest(&[(1, "0001_a", "   \n  ")]);
+        let error = validate_manifest(&bad).expect_err("空 SQL 必须被拒绝");
+        assert!(matches!(error, DbError::MigrationManifest { .. }));
+    }
+
+    #[test]
+    fn empty_manifest_is_valid_and_noop() {
+        let mut connection = bare_connection();
+        let version = apply_manifest(&mut connection, &[], 0).expect("apply");
+        assert_eq!(version, 0);
+        assert_eq!(current_version(&connection).expect("version"), 0);
+    }
+
+    #[test]
+    fn injectable_manifest_is_applied_and_bumps_version() {
+        let mut connection = bare_connection();
+        let list = manifest(&[(1, "0001_probe", OK_SQL)]);
+
+        let version = apply_manifest(&mut connection, &list, 1).expect("apply");
+        assert_eq!(version, 1);
+        assert_eq!(current_version(&connection).expect("version"), 1);
+
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='probe'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn already_current_database_is_left_untouched() {
+        let mut connection = bare_connection();
+        // 先升到 1
+        apply_manifest(&mut connection, &manifest(&[(1, "0001_probe", OK_SQL)]), 1).expect("first");
+        // 再次执行同一清单：应当是 no-op，不报错也不重复建表
+        let version = apply_manifest(&mut connection, &manifest(&[(1, "0001_probe", OK_SQL)]), 1)
+            .expect("second");
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn schema_too_new_is_refused() {
+        let mut connection = bare_connection();
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {}", LATEST_VERSION + 5))
+            .expect("bump");
+        let error = apply_manifest(&mut connection, MIGRATIONS, LATEST_VERSION)
+            .expect_err("版本过高必须拒绝");
+        assert!(matches!(error, DbError::SchemaTooNew { .. }));
+    }
+
+    #[test]
+    fn failing_migration_rolls_back_entirely() {
+        let mut connection = bare_connection();
+
+        // 第二条迁移语法错误：第一条必须一起回滚，版本不得前进
+        let list = manifest(&[(1, "0001_ok", OK_SQL), (2, "0002_broken", BROKEN_SQL)]);
+        let error = apply_manifest(&mut connection, &list, 2).expect_err("必须失败");
+        assert!(
+            matches!(error, DbError::Migrate { version: 2, .. }),
+            "实际：{error:?}"
+        );
+
+        assert_eq!(
+            current_version(&connection).expect("version"),
+            0,
+            "失败后版本必须保持升级前的值"
+        );
+        let probe_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='probe'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(probe_exists, 0, "失败的事务不得留下第一条迁移建立的表");
+    }
+
+    #[test]
+    fn failing_migration_keeps_previous_version_when_upgrading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(dir.path().join("nested.db")).expect("open");
+
+        {
+            let mut guard = db.connection().expect("conn");
+            let before = current_version(&guard).expect("version");
+            assert_eq!(before, LATEST_VERSION);
+
+            // 模拟"下一版迁移写错了"：版本 2 必然失败
+            let list = manifest(&[
+                (1, "0001_init", MIGRATIONS[0].sql),
+                (2, "0002_broken", BROKEN_SQL),
+            ]);
+            let error = apply_manifest(&mut guard, &list, 2).expect_err("必须失败");
+            assert!(matches!(error, DbError::Migrate { version: 2, .. }));
+            assert_eq!(
+                current_version(&guard).expect("version"),
+                LATEST_VERSION,
+                "升级失败不得推进版本号"
+            );
+            // 把 guard 的作用域收在这里：下面 check_integrity() 需要重新加锁，
+            // 若在此处仍持有连接锁会直接死锁（本测试最初就是这么挂住的）。
+        }
+
+        // 库里原有数据仍然可用（回滚没有破坏它）
+        db.check_integrity().expect("integrity");
+    }
+
+    #[test]
+    fn migrate_error_carries_version_and_name_for_diagnosis() {
+        let mut connection = bare_connection();
+        let list = manifest(&[(1, "0001_broken", BROKEN_SQL)]);
+        let error = apply_manifest(&mut connection, &list, 1).expect_err("必须失败");
+        let text = error.to_string();
+        assert!(
+            text.contains("0001_broken"),
+            "错误信息应含迁移名便于定位：{text}"
+        );
+        assert!(text.contains('1'), "错误信息应含版本号：{text}");
     }
 }

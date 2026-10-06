@@ -375,7 +375,8 @@ fn skips_secret_scan(relative_path: &str) -> bool {
 /// 保守判定：形如 `password = "…"`、`api_key: "…"`、内联口令的连接串、私钥块。
 /// 显式标注 example/placeholder/dummy 的行放行（样例文件需要）。
 ///
-/// **自身豁免**：见 [`skips_secret_scan`]。
+/// **自身豁免**：检查器自身源码与 `scripts/` 下的脚本会被跳过——原因见同文件内
+/// `skips_secret_scan` 的文档注释（该函数为私有，因此这里不建立文档链接）。
 #[must_use]
 pub fn no_hardcoded_secrets(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -518,6 +519,43 @@ pub fn required_files_present(root: &Path) -> Vec<Violation> {
 pub fn no_large_files(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
     collect_large(root, &mut violations, root);
+    violations
+}
+
+/// 检查 PowerShell 脚本是否满足"含非 ASCII 字符则必须有 UTF-8 BOM"。
+///
+/// ## 为什么这是一条硬性检查
+///
+/// Windows PowerShell 5.1 在**没有 BOM** 时会把脚本按系统 ANSI 代码页（简体中文
+/// 环境下是 GBK）解码。中文注释会因此变成乱码，更糟的是乱码字节可能吞掉引号或
+/// 括号，**直接破坏脚本语法**——脚本连解析都过不去。
+///
+/// 这个坑在本项目里真实发生过三次（`check-rules.ps1`、`bootstrap-flutter.ps1`、
+/// `coverage-gate.ps1`），每次都是"改了脚本内容 → 写入工具把 BOM 抹掉 → 脚本突然
+/// 无法运行"。人工记忆靠不住，因此由门禁强制。
+///
+/// 纯 ASCII 的脚本不需要 BOM（也不该加，否则多一段无意义的字节）。
+#[must_use]
+pub fn powershell_scripts_need_bom(root: &Path) -> Vec<Violation> {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+    let mut violations = Vec::new();
+    for file in fsutil::collect_files(&root.join("scripts"), "ps1") {
+        let Ok(bytes) = std::fs::read(&file) else {
+            continue;
+        };
+        let has_bom = bytes.starts_with(&BOM);
+        let has_non_ascii = bytes.iter().any(|byte| *byte > 127);
+        if has_non_ascii && !has_bom {
+            violations.push(Violation::new(
+                "B-ENCODING",
+                Violation::relative(root, &file),
+                1,
+                "脚本含非 ASCII 字符（中文注释/输出）但没有 UTF-8 BOM",
+                "用 UTF-8 **带 BOM** 保存；否则 Windows PowerShell 5.1 会按 ANSI 解码并破坏语法",
+            ));
+        }
+    }
     violations
 }
 
@@ -748,5 +786,205 @@ mod tests {
     fn placeholder_extraction_ignores_positional_arguments() {
         let names = extract_placeholders("format!(\"SELECT {} FROM {table} WHERE a = {0}\")");
         assert_eq!(names, vec!["table".to_owned()]);
+    }
+
+    #[test]
+    fn generated_code_is_exempt_from_panic_rules() {
+        // FFI 桥接的生成文件里必然有 unwrap/expect，它不该把门禁点亮
+        let root = fixture("generated");
+        write(
+            &root,
+            "client/crates/nested-db/src/frb_generated.rs",
+            "pub fn f() {\n    let _ = Some(1).unwrap();\n}\n",
+        );
+        assert!(
+            panic_free_production_code(&root).is_empty(),
+            "生成代码（文件名含 generated）必须豁免"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn todo_and_unimplemented_are_reported_as_e6() {
+        let root = fixture("todo");
+        write(
+            &root,
+            "client/crates/nested-db/src/lib.rs",
+            "pub fn f() {\n    todo!()\n}\n",
+        );
+        let violations = panic_free_production_code(&root);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "E6", "未实现占位应归到 E6 而不是 R1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dbg_macro_is_reported_as_r13() {
+        let root = fixture("dbg");
+        write(
+            &root,
+            "client/crates/nested-db/src/lib.rs",
+            "pub fn f(x: u32) {\n    dbg!(x);\n}\n",
+        );
+        let violations = panic_free_production_code(&root);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "R13");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_delete_in_sql_file_outside_src_is_allowed() {
+        // 迁移 SQL 里当然会有 CREATE/DROP，但本规则只管 src/ 下的 Rust；
+        // 这里验证"非 src 路径不参与扫描"，避免把迁移脚本误判
+        let root = fixture("delete-migrations");
+        write(
+            &root,
+            "client/migrations/0002_gc.sql",
+            "DELETE FROM notes WHERE deleted_at_ms IS NOT NULL;\n",
+        );
+        assert!(no_raw_delete(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn server_depending_on_rusqlite_is_reported() {
+        let root = fixture("isolation-server");
+        write(
+            &root,
+            "server/crates/server-storage/Cargo.toml",
+            "[package]\nname = \"server-storage\"\n\n[dependencies]\nrusqlite = \"0.40\"\n",
+        );
+        let violations = workspace_isolation(&root);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("rusqlite"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn protocol_must_stay_io_free() {
+        let root = fixture("isolation-protocol");
+        write(
+            &root,
+            "shared/protocol/Cargo.toml",
+            "[package]\nname = \"protocol\"\n\n[dependencies]\ntokio = \"1\"\n",
+        );
+        let violations = workspace_isolation(&root);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("tokio"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn required_files_reports_every_missing_entry() {
+        let root = fixture("required");
+        let violations = required_files_present(&root);
+        // 空目录里所有必需文件都缺失，因此违规数应等于清单长度
+        assert!(violations.len() >= 5, "实际：{violations:?}");
+        assert!(violations.iter().all(|v| v.rule == "B1"));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.file.contains("rust-toolchain.toml"))
+        );
+        assert!(violations.iter().any(|v| v.file.contains("Cargo.lock")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn required_files_passes_when_all_present() {
+        let root = fixture("required-ok");
+        for relative in [
+            "client/rust-toolchain.toml",
+            "server/rust-toolchain.toml",
+            "client/Cargo.lock",
+            "server/Cargo.lock",
+            ".gitattributes",
+            ".gitignore",
+            "justfile",
+            "docs/02-工程铁律.md",
+        ] {
+            write(&root, relative, "placeholder\n");
+        }
+        assert!(required_files_present(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn large_files_are_reported() {
+        let root = fixture("large-file");
+        // 6 MiB：超过 5 MiB 上限
+        let content = vec![0_u8; 6 * 1024 * 1024];
+        let path = root.join("sample.bin");
+        std::fs::write(&path, content).expect("write large file");
+
+        let violations = no_large_files(&root);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "V6");
+        assert!(
+            violations[0].message.contains("6.0 MB"),
+            "实际：{}",
+            violations[0].message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn large_files_inside_skipped_dirs_are_ignored() {
+        let root = fixture("large-file-skipped");
+        std::fs::create_dir_all(root.join("client/target")).expect("mkdir");
+        std::fs::write(
+            root.join("client/target/big.bin"),
+            vec![0_u8; 6 * 1024 * 1024],
+        )
+        .expect("write");
+        assert!(
+            no_large_files(&root).is_empty(),
+            "构建产物目录必须跳过，否则每次都会误报"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn powershell_script_with_chinese_and_no_bom_is_reported() {
+        let root = fixture("ps1-no-bom");
+        // 无 BOM 的 UTF-8，含中文注释
+        let path = root.join("scripts").join("sample.ps1");
+        std::fs::create_dir_all(root.join("scripts")).expect("mkdir");
+        std::fs::write(&path, "# 中文注释\nWrite-Host 'ok'\n".as_bytes()).expect("write");
+
+        let violations = powershell_scripts_need_bom(&root);
+        assert_eq!(violations.len(), 1, "实际：{violations:?}");
+        assert_eq!(violations[0].rule, "B-ENCODING");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn powershell_script_with_bom_is_accepted() {
+        let root = fixture("ps1-bom");
+        let path = root.join("scripts").join("sample.ps1");
+        std::fs::create_dir_all(root.join("scripts")).expect("mkdir");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("# 中文注释\nWrite-Host 'ok'\n".as_bytes());
+        std::fs::write(&path, bytes).expect("write");
+
+        assert!(
+            powershell_scripts_need_bom(&root).is_empty(),
+            "带 BOM 的脚本必须放行"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pure_ascii_powershell_script_needs_no_bom() {
+        let root = fixture("ps1-ascii");
+        let path = root.join("scripts").join("sample.ps1");
+        std::fs::create_dir_all(root.join("scripts")).expect("mkdir");
+        std::fs::write(&path, "Write-Host 'ok'\n".as_bytes()).expect("write");
+
+        assert!(
+            powershell_scripts_need_bom(&root).is_empty(),
+            "纯 ASCII 脚本不需要 BOM，也不该被要求加上"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

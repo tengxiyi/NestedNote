@@ -160,6 +160,21 @@ jobs:
       - name: 测试（铁律 Z7）
         run: cargo test --workspace
 
+      # 覆盖率门禁（铁律 Z1）。放在测试之后：测试不就绪时无需再跑一遍插桩构建。
+      #
+      # 只对**已实现**的 crate 卡 80%：占位 crate 若也卡阈值，会因为"可执行代码只有几行"
+      # 而轻松达标，形成自欺的指标。门禁清单与豁免理由写在
+      # scripts/coverage-gate.ps1 头部，且全部 crate 的数字都会打印出来。
+      - name: 安装覆盖率工具
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked
+
+      - name: 覆盖率门禁（铁律 Z1，已实现 crate ≥ 80%）
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: ./scripts/coverage-gate.ps1
+
   # ---------------------------------------------------------------- 服务端
   server:
     name: 服务端（Sync Server）

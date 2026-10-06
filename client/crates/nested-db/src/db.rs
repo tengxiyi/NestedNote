@@ -122,6 +122,32 @@ impl Database {
 
     /// 借用底层连接（只读用途）。
     ///
+    /// # ⚠️ 死锁警告（真实踩过的坑）
+    ///
+    /// 返回的 `MutexGuard` 持有连接锁。**在它存活期间，绝不能再调用任何 `Database`
+    /// 自己的方法**——包括 [`Database::check_integrity`]、[`Database::with_transaction`]、
+    /// [`Database::setting`] 等，因为它们都要重新获取同一把锁，结果是**自己等自己**：
+    /// 进程静默挂起，不报错、不 panic，现象就是"卡住不动"。本项目的测试曾因此挂死一次。
+    ///
+    /// ```no_run
+    /// # use nested_db::Database;
+    /// # fn demo(db: &Database) {
+    /// // 错误写法：guard 仍存活就调 check_integrity → 死锁
+    /// // let guard = db.connection().unwrap();
+    /// // db.check_integrity().unwrap();
+    ///
+    /// // 正确写法：先让 guard 离开作用域，再加锁
+    /// {
+    ///     let guard = db.connection().unwrap();
+    ///     let _ = guard.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0));
+    /// }
+    /// db.check_integrity().unwrap();
+    /// # }
+    /// ```
+    ///
+    /// TECH-DEBT(#8)：计划在 P1 把连接访问收敛为闭包式 API（`with_connection(|c| ...)`），
+    /// 从类型层面消除这个顺序陷阱。
+    ///
     /// # Errors
     ///
     /// 连接已关闭时返回 [`DbError::Sqlite`]。

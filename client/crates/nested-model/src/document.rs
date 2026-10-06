@@ -139,6 +139,14 @@ impl Document {
 }
 
 /// 递归收集块及其子块的文本。
+///
+/// ## 关于列表的重复收集（已修复的缺陷）
+///
+/// [`Block::searchable_text`] 对 `List` 变体**已经把各项文本拼进返回值**，
+/// 因此这里不能再逐项 `push`——否则同一条列表文案会在全文索引里出现两次
+/// （FTS5 会把重复文本算进词频，直接影响相关度排序）。
+/// 正确做法是：列表的"容器文本"直接采用 `searchable_text()`，
+/// 递归只负责处理**嵌套子块**。
 fn collect_text(block: &Block, out: &mut Vec<String>) {
     let text = block.searchable_text();
     if !text.is_empty() {
@@ -147,9 +155,6 @@ fn collect_text(block: &Block, out: &mut Vec<String>) {
     match block {
         Block::List { items, .. } => {
             for item in items {
-                if !item.text.is_empty() {
-                    out.push(item.text.clone());
-                }
                 for child in &item.children {
                     collect_text(child, out);
                 }
@@ -283,6 +288,66 @@ mod tests {
         let text = document.searchable_text();
         assert!(text.contains("hello"));
         assert!(text.contains("单元格"));
+    }
+
+    #[test]
+    fn searchable_text_collects_list_item_text_exactly_once() {
+        // 回归测试：曾经 searchable_text() 与 collect_text() 都会拼列表项文本，
+        // 导致同一条文案在全文索引里出现两次（影响 FTS5 词频与相关度）。
+        let document = Document::from_blocks(
+            vec![Block::List {
+                ordered: false,
+                start: 1,
+                items: vec![crate::ListItem {
+                    text: "独一无二的条目".to_owned(),
+                    children: Vec::new(),
+                }],
+            }],
+            0,
+        );
+
+        let text = document.searchable_text();
+        assert_eq!(
+            text.matches("独一无二的条目").count(),
+            1,
+            "列表项文本必须只出现一次，实际得到：{text}"
+        );
+    }
+
+    #[test]
+    fn searchable_text_includes_nested_children_of_list_items() {
+        let document = Document::from_blocks(
+            vec![Block::List {
+                ordered: false,
+                start: 1,
+                items: vec![crate::ListItem {
+                    text: "父项".to_owned(),
+                    children: vec![Block::paragraph("子块内容")],
+                }],
+            }],
+            0,
+        );
+
+        let text = document.searchable_text();
+        assert!(text.contains("父项"));
+        assert!(text.contains("子块内容"), "嵌套子块也必须进入索引：{text}");
+        assert_eq!(text.matches("父项").count(), 1);
+    }
+
+    #[test]
+    fn searchable_text_includes_nested_list_item_block_children() {
+        // `Block::ListItem` 变体（与 List 内部的 ListItem 结构体是两回事）
+        let document = Document::from_blocks(
+            vec![Block::ListItem {
+                text: "顶层项".to_owned(),
+                children: vec![Block::paragraph("它的子块")],
+            }],
+            0,
+        );
+
+        let text = document.searchable_text();
+        assert!(text.contains("顶层项"));
+        assert!(text.contains("它的子块"));
     }
 
     #[test]

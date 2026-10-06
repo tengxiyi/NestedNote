@@ -95,4 +95,52 @@ mod tests {
     fn invalid_text_is_rejected() {
         assert!(Id::parse("not-a-uuid").is_err());
     }
+
+    #[test]
+    fn from_slice_rejects_wrong_length() {
+        // 数据库 BLOB 列若被外部工具写坏，长度就可能不对
+        assert!(Id::from_slice(&[0_u8; 15]).is_err());
+        assert!(Id::from_slice(&[0_u8; 17]).is_err());
+        assert!(Id::from_slice(&[]).is_err());
+    }
+
+    #[test]
+    fn from_slice_accepts_all_zero_bytes() {
+        // 全零是合法的 UUID（nil），只是我们不会生成它——不得因此报错
+        let id = Id::from_slice(&[0_u8; 16]).expect("nil uuid is structurally valid");
+        assert_eq!(id.as_bytes(), &[0_u8; 16]);
+    }
+
+    #[test]
+    fn default_matches_new() {
+        // Default 必须产生一个可用的新标识，而不是 nil
+        let id = Id::default();
+        assert_ne!(id.as_bytes(), &[0_u8; 16]);
+    }
+
+    #[test]
+    fn display_round_trips_through_parse() {
+        let id = Id::new();
+        let text = id.to_string();
+        assert_eq!(text.len(), 36, "UUID 文本形式应为 36 个字符（含连字符）");
+        assert_eq!(Id::parse(&text).expect("round-trip"), id);
+    }
+
+    #[test]
+    fn as_uuid_exposes_the_same_value() {
+        let id = Id::new();
+        assert_eq!(Id::from_uuid(id.as_uuid()), id);
+    }
+
+    #[test]
+    fn ordering_follows_creation_time() {
+        // UUIDv7 的时间前缀让"创建越晚越大"成立，这是它相比 UUIDv4 的关键优势
+        let first = Id::new();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = Id::new();
+        assert!(
+            first < second,
+            "UUIDv7 应按创建顺序递增：{first} vs {second}"
+        );
+    }
 }
