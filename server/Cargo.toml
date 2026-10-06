@@ -21,7 +21,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "AGPL-3.0-or-later"
-repository = "https://example.invalid/nested"
+repository = "https://github.com/tengxiyi/NestedNote"
 authors = ["拾光笔记 / NestedNote contributors"]
 
 [workspace.dependencies]

@@ -17,6 +17,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/tengxiyi/NestedNote"
 
 # 纯数据契约：这里**故意**只有 serde 与 thiserror。
 # 新增任何依赖都必须先证明它不引入 IO/数据库/网络（技术文档 §4.2 硬约束 2）。
