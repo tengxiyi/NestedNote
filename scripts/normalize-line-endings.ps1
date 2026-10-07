@@ -25,7 +25,15 @@ $patterns = @(
     'server/**/*.rs',
     'shared/**/*.rs',
     '*.md',
-    'docs/**/*.md'
+    'docs/**/*.md',
+    # 脚本本身也纳入：.gitattributes 曾把 *.ps1 声明为 CRLF 而实际全是 LF，
+    # 因为那时没人检查 .ps1，声明与事实不一致却无人发现（见 .gitattributes 注释）
+    'scripts/*.ps1',
+    'client/**/*.dart',
+    'client/**/*.yaml',
+    'client/**/*.yml',
+    '*.gitattributes',
+    'justfile'
 )
 
 $targets = foreach ($pattern in $patterns) {

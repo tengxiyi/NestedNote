@@ -21,11 +21,25 @@ client/migrations/*.sql text eol=lf
 *.yml   text eol=lf
 *.yaml  text eol=lf
 *.json  text eol=lf
+*.dart  text eol=lf
 
-# Windows 脚本用 CRLF
-*.ps1   text eol=crlf
-*.bat   text eol=crlf
-*.cmd   text eol=crlf
+# Windows 脚本：同样用 LF。
+#
+# 这里曾经写的是 `eol=crlf`，但它**从未生效过**——仓库里全部 .ps1
+# 在索引与工作区都是 LF（`git ls-files --eol` 可查）。结果是：
+#   · 每次提交都刷 "LF will be replaced by CRLF" 警告，纯噪音；
+#   · 行尾门禁没检查 .ps1，所以没人发现声明与事实不一致。
+#
+# 之所以选 LF 而不是"改成 CRLF 让声明生效"：
+#   · 让 .ps1 与其余源码统一，减少一类"这个文件该用什么"的判断；
+#   · 避免为 10 个文件制造一次全文件重写的提交（review 无意义）；
+#   · PowerShell 5.1 与 7 都能正确执行 LF 换行的脚本（实测）。
+#
+# ⚠ 与 BOM 要求无关：含中文的 .ps1 **必须**带 UTF-8 BOM（铁律 B-ENCODING），
+#   那是编码问题，不是行尾问题。
+*.ps1   text eol=lf
+*.bat   text eol=lf
+*.cmd   text eol=lf
 
 # 二进制
 *.png   binary
