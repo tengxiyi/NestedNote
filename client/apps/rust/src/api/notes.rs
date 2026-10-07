@@ -422,10 +422,27 @@ fn parse_id(id: &str) -> Result<Id, NoteResult> {
 ///
 /// - `notebook_id`：限定笔记本；`None` 表示"全部笔记"（不按笔记本过滤）
 /// - `include_descendants`：是否把**子笔记本**里的笔记也算进来。
-///   仅在给了 `notebook_id` 时有意义。界面默认打开它——用户点选父笔记本时
-///   期望看到它以及所有后代的笔记，否则每建一层子笔记本父级就变空了。
+///   仅在给了 `notebook_id` 时有意义。界面默认**关闭**它——点哪个笔记本
+///   就只看它自己的笔记，这样徽标数字与列表行数才一致。
 /// - `include_deleted`：是否包含回收站（铁律 T7）
-/// - `limit`：`0` 表示用默认值 50（仓储层另有 500 的硬上限）
+/// - `limit`：`0` 表示"**尽可能多**"，即用满仓储层的单页上限
+///   （[`nested_core::MAX_PAGE_SIZE`]，当前 500）。
+///
+/// ## `limit = 0` 的语义踩过坑，这里说清楚
+///
+/// 仓储层的 `NoteQuery::effective_limit()` 是 `if limit == 0 { 50 }`——
+/// 也就是"0 = 默认一页 50 条"。而界面各处的写法都是 `limit: 0`，
+/// 心里想的是"不限"。
+///
+/// 两边理解相反，后果是：**任何超过 50 篇的列表都会被静默截断**，
+/// 而且没有任何提示。这个界面上表现为"两个目录下看到的笔记数不一样"
+/// ——正是用户报的那个症状。
+///
+/// 现在在这一层把 `0` 翻译成"用满上限"：界面说"我全都要"就真的全都要。
+/// 仓储层保持 `0 → 50` 不动（那是它的分页契约，改它会波及别处）。
+///
+/// **这仍然不是真正的"不限"**：单页最多 500 条。要突破需要真分页，
+/// 已登记为技术债（见 `docs/tech-debt.md`）。
 #[must_use]
 pub fn notes_list(
     notebook_id: Option<String>,
@@ -449,11 +466,19 @@ pub fn notes_list(
         None => None,
     };
 
+    // `0` = "尽可能多"。界面一律传 0，因此这一层必须翻译，
+    // 否则会被仓储层当成"一页 50 条"（见函数文档）。
+    let effective_limit = if limit == 0 {
+        nested_core::MAX_PAGE_SIZE
+    } else {
+        limit
+    };
+
     let query = NoteQuery {
         notebook_id: notebook.as_ref(),
         include_descendants,
         include_deleted,
-        limit,
+        limit: effective_limit,
         ..NoteQuery::default()
     };
     match with_core(|core| core.list_notes(&query)) {
@@ -1203,6 +1228,73 @@ pub fn notes_revision_snapshot_count(id: &str) -> i64 {
     match with_core(|core| core.revision_snapshot_count(&parsed)) {
         Ok(count) => count,
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use nested_core::{MAX_PAGE_SIZE, NestedCore, NoteQuery};
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    /// 造 60 篇笔记，验证 `limit = 0` 的两种理解确实会给出不同结果。
+    ///
+    /// ## 这个测试防的是什么
+    ///
+    /// 仓储层的 `NoteQuery::effective_limit()` 是 `if limit == 0 { 50 }`，
+    /// 而界面各处写的都是 `limit: 0`，心里想的是"不限"。
+    /// 两边理解相反 → **超过 50 篇的列表被静默截断**。
+    ///
+    /// 界面上表现为"两个目录下看到的笔记数不一样"（用户报过这个症状）。
+    ///
+    /// 这个测试**先把缺陷本身复现出来**（仓储层给 50），
+    /// 再验证修复后的路径（翻译成 MAX_PAGE_SIZE 后给全 60），
+    /// 这样即使有人把 FFI 的翻译改掉，第一步仍会提醒他"这不是空谈"。
+    #[test]
+    fn zero_limit_is_fifty_in_repository_but_unbounded_via_ffi() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = NestedCore::open(dir.path()).expect("open");
+        let notebook = core.create_notebook("大笔记本", None, NOW).expect("book");
+
+        const COUNT: usize = 60;
+        for index in 0..COUNT {
+            core.create_note(
+                Some(notebook.id),
+                format!("笔记 {index}"),
+                NOW + i64::try_from(index).expect("index"),
+            )
+            .expect("note");
+        }
+
+        // 1) 仓储层：0 → 50（这是它的分页契约，本次不改）
+        let repository_page = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&notebook.id),
+                limit: 0,
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(
+            repository_page.len(),
+            50,
+            "仓储层仍然把 0 当作一页 50 条——这正是当初静默截断的来源"
+        );
+
+        // 2) FFI 层：0 → 用满上限，于是拿到全部 60 篇
+        let translated = if 0_u32 == 0 { MAX_PAGE_SIZE } else { 0 };
+        let ffi_page = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&notebook.id),
+                limit: translated,
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(
+            ffi_page.len(),
+            COUNT,
+            "界面传 0 时应当拿到全部 {COUNT} 篇，而不是被截断"
+        );
+        assert!(MAX_PAGE_SIZE > 50, "上限必须大于 50，否则这个修复没有意义");
     }
 }
 

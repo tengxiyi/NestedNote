@@ -50,6 +50,9 @@ pub use error::{CoreError, CoreResult};
 
 // 重新导出上层必需的模型与查询类型，使 Flutter 只需依赖本 crate。
 pub use nested_db::{Database, NoteQuery};
+// 单页上限：FFI 层需要把"界面传 0 = 全都要"翻译成具体数字，
+// 而 FFI 不直接依赖 nested-db（分层如此），因此从这里转出。
+pub use nested_db::MAX_PAGE_SIZE;
 pub use nested_model::{
     Attachment, Block, BlockKind, DOCUMENT_FORMAT_VERSION, Document, Id, InlineMark, ModelError,
     Note, Notebook, Revision, TableCell, TableRow, Tag, Timestamp, now_ms,

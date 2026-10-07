@@ -49,7 +49,7 @@ pub mod migrations;
 pub mod repositories;
 pub mod rowmap;
 
-pub use db::{Database, NoteQuery};
+pub use db::{Database, MAX_PAGE_SIZE, NoteQuery};
 pub use error::{DbError, DbResult};
 pub use repositories::notes::is_document_unchanged;
 pub use repositories::sync_operations::SyncOperation;
