@@ -35,6 +35,7 @@ import '../core/note_providers.dart';
 import '../core/trash_providers.dart';
 import 'dialogs.dart';
 import 'icons.dart';
+import 'typography.dart';
 
 /// 每一层笔记本的缩进量（逻辑像素）。
 const double kIndentPerLevel = 13;
@@ -158,7 +159,7 @@ class _NotebookSidebarState extends ConsumerState<NotebookSidebar> {
                           '目录列表读取失败',
                           style: theme.textTheme.labelMedium?.copyWith(
                             color: theme.colorScheme.error,
-                            fontWeight: FontWeight.w600,
+                            fontWeight: kEmphasisWeight,
                           ),
                         ),
                       ),
@@ -719,7 +720,7 @@ class NotebookTreeTile extends StatelessWidget {
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: theme.textTheme.bodyMedium?.copyWith(
-                  fontWeight: selected ? FontWeight.w600 : null,
+                  fontWeight: selected ? kEmphasisWeight : null,
                 ),
               ),
             ),

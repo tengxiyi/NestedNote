@@ -40,6 +40,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/note_providers.dart';
 import 'icons.dart';
+import 'typography.dart';
 import 'revision_history.dart';
 import 'tag_editor.dart';
 
@@ -373,7 +374,7 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
             maxLines: 1,
             textInputAction: TextInputAction.next,
             style: theme.textTheme.headlineSmall?.copyWith(
-              fontWeight: FontWeight.w600,
+              fontWeight: kEmphasisWeight,
             ),
             decoration: const InputDecoration(
               border: InputBorder.none,

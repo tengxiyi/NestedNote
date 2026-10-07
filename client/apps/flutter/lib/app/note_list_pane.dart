@@ -24,6 +24,7 @@ import '../core/note_providers.dart';
 import '../core/trash_providers.dart';
 import 'dialogs.dart';
 import 'icons.dart';
+import 'typography.dart';
 import 'notebook_sidebar.dart';
 import 'tag_editor.dart';
 
@@ -823,7 +824,7 @@ class _NoteRow extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
+                      fontWeight: kEmphasisWeight,
                       color: note.deleted
                           ? theme.colorScheme.onSurfaceVariant
                           : null,
@@ -873,7 +874,7 @@ class _NoteRow extends StatelessWidget {
                         color: expiring
                             ? theme.colorScheme.error
                             : theme.colorScheme.outline,
-                        fontWeight: expiring ? FontWeight.w600 : null,
+                        fontWeight: expiring ? kEmphasisWeight : null,
                       ),
                     ),
                   ),

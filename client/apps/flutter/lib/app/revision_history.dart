@@ -21,6 +21,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/revision_providers.dart';
 import 'icons.dart';
+import 'typography.dart';
 
 /// 修订历史对话框：左侧版本列表，右侧差异。
 ///
@@ -207,7 +208,7 @@ class _RevisionHistoryDialogState
                             Text(
                               '第 ${item.version} 版',
                               style: theme.textTheme.bodyMedium?.copyWith(
-                                fontWeight: isNew ? FontWeight.w600 : null,
+                                fontWeight: isNew ? kEmphasisWeight : null,
                               ),
                             ),
                             Text(
@@ -381,7 +382,7 @@ class _DiffRow extends StatelessWidget {
                   ? '−'
                   : ' ',
               style: theme.textTheme.bodySmall?.copyWith(
-                fontWeight: FontWeight.bold,
+                fontWeight: kEmphasisWeight,
                 color: line.isAdded
                     ? Colors.green.shade800
                     : line.isRemoved
