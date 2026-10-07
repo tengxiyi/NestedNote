@@ -286,6 +286,11 @@ class _NotebookSidebarState extends ConsumerState<NotebookSidebar> {
           label: '移动到…',
           icon: kMoveIcon,
         ),
+        const ContextMenuItem<String>(
+          value: 'duplicate',
+          label: '创建副本',
+          icon: kDuplicateIcon,
+        ),
         const ContextMenuItem<String>.divider(),
         const ContextMenuItem<String>(
           value: 'properties',
@@ -304,6 +309,8 @@ class _NotebookSidebarState extends ConsumerState<NotebookSidebar> {
         await _createNoteIn(node);
       case 'rename':
         await _renameNotebook(node);
+      case 'duplicate':
+        await _duplicateNotebook(node);
       case 'delete':
         await _deleteNotebook(node);
       case 'move':
@@ -338,6 +345,29 @@ class _NotebookSidebarState extends ConsumerState<NotebookSidebar> {
     try {
       await ref.read(noteActionsProvider).create(notebookId: node.id);
       ref.read(selectedNotebookIdProvider.notifier).select(node.id);
+    } on NoteFailure catch (failure) {
+      messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
+    }
+  }
+
+  /// 创建副本（递归复制整棵子树）。
+  ///
+  /// 复制完**提示一句**，告诉用户副本有多少内容——
+  /// 一个含几十篇笔记的笔记本被复制时，界面看起来"什么都没发生"，
+  /// 用户会以为没成功而反复点。
+  Future<void> _duplicateNotebook(NotebookNode node) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref.read(notebookActionsProvider).duplicate(node.id);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            node.noteCount > 0
+                ? '已复制笔记本「${node.name}」及其 ${node.noteCount} 篇笔记。'
+                : '已复制笔记本「${node.name}」（没有笔记）。',
+          ),
+        ),
+      );
     } on NoteFailure catch (failure) {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }

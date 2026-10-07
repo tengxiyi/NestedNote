@@ -145,6 +145,20 @@ const IconData kCheckIcon = Icons.check_circle;
 /// 修订历史入口（编辑器工具栏）。
 const IconData kHistoryIcon = Icons.history;
 
+/// 标签。
+///
+/// 与"文件夹"（笔记本）必须明显不同：标签是**横切**的分类，
+/// 笔记本是**层级**的归属。把两者画得像，用户会以为标签也能嵌套。
+const IconData kTagIcon = Icons.sell_outlined;
+
+/// 编辑标签。
+const IconData kEditTagsIcon = Icons.local_offer_outlined;
+
+/// 复制一份（笔记副本）。
+///
+/// 刻意与"复制文本"的图标区分：那是剪贴板动作，这是创建一个新实体。
+const IconData kDuplicateIcon = Icons.copy_all_outlined;
+
 /// 时间线上的一条修订。
 const IconData kRevisionIcon = Icons.edit_outlined;
 

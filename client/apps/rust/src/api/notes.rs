@@ -98,6 +98,8 @@ pub struct NotePayload {
     pub revisions: Vec<RevisionEntry>,
     /// 修订差异（对比查询返回）。
     pub diff: Option<RevisionDiffPayload>,
+    /// 标签列表（标签查询返回）。
+    pub tags: Vec<TagEntry>,
 }
 
 /// 一次修订对比的结果。
@@ -851,6 +853,177 @@ pub fn notes_move(id: &str, notebook_id: Option<String>, at_ms: i64) -> NoteResu
             note: Some(summary_of(&note)),
             ..NotePayload::default()
         }),
+        Err(failure) => failure,
+    }
+}
+
+// ============================================================ 深拷贝（副本）
+
+/// 复制一篇笔记。
+///
+/// 正文与标签一并复制；**附件只复制引用**（内容寻址，同一份字节）；
+/// **修订历史不复制**——副本从第 1 版重新开始，
+/// 因为修订是"原件发生过什么"的审计材料，副本没有发生过那些事。
+#[must_use]
+pub fn notes_duplicate(id: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.duplicate_note(&parsed, at_ms)) {
+        Ok(note) => NoteResult::ok(NotePayload {
+            note: Some(summary_of(&note)),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 复制一个笔记本（含其下全部笔记与子笔记本，递归）。
+#[must_use]
+pub fn notebooks_duplicate(id: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.duplicate_notebook(&parsed, at_ms)) {
+        Ok(notebook) => NoteResult::ok(NotePayload {
+            notebook: Some(NotebookNode {
+                id: notebook.id.to_string(),
+                name: notebook.name,
+                parent_id: notebook.parent_id.map(|parent| parent.to_string()),
+                // 深度与计数由随后的树查询补全；这里只回报"新建了什么"，
+                // 界面拿到 id 后会刷新树。
+                depth: 0,
+                note_count: 0,
+            }),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+// ================================================================ 标签
+
+/// 一个标签在界面上的表示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagEntry {
+    /// 标签标识。
+    pub id: String,
+    /// 名称。
+    pub name: String,
+}
+
+/// 列出全部标签（不含已删除的）。
+#[must_use]
+pub fn tags_list() -> NoteResult {
+    match with_core(|core| core.list_tags()) {
+        Ok(tags) => NoteResult::ok(NotePayload {
+            tags: tags
+                .into_iter()
+                .map(|tag| TagEntry {
+                    id: tag.id.to_string(),
+                    name: tag.name,
+                })
+                .collect(),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 创建标签。
+///
+/// ## 同名标签在回收站里时会**复活**它
+////// 返回的 `id` 可能是**已存在的那一行**，而不是新建的——
+/// 因为唯一索引不含 `deleted_at_ms`，墓碑仍占着位置。
+/// 界面应当用返回的 id，而不是自己以为的那个。
+#[must_use]
+pub fn tags_create(name: &str, at_ms: i64) -> NoteResult {
+    match with_core(|core| core.create_tag(name, at_ms)) {
+        Ok(tag) => NoteResult::ok(NotePayload {
+            tags: vec![TagEntry {
+                id: tag.id.to_string(),
+                name: tag.name,
+            }],
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 设置一篇笔记的标签集合（**整体覆盖**，不是增量）。
+///
+/// 用覆盖语义而不是 attach/detach：界面上的标签编辑器是"选完点确定"，
+/// 覆盖语义与它一一对应，也不会有"漏掉一次 detach"导致的残留。
+#[must_use]
+pub fn notes_set_tags(id: &str, tag_ids: Vec<String>, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    let mut parsed_tags = Vec::with_capacity(tag_ids.len());
+    for raw in &tag_ids {
+        match Id::parse(raw) {
+            Ok(tag_id) => parsed_tags.push(tag_id),
+            Err(_) => {
+                return NoteResult {
+                    ok: false,
+                    code: Some("INVALID_ID".to_owned()),
+                    hint: Some("标签标识无效。".to_owned()),
+                    debug_detail: None,
+                    value: None,
+                };
+            }
+        }
+    }
+    // 设备标识与写操作必须在同一次加锁内取得（见 notes_create 的说明）
+    let device = match with_core(|core| core.device_id()) {
+        Ok(device) => device,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.set_note_tags(&parsed, &parsed_tags, &device, at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// 列出某篇笔记的标签。
+#[must_use]
+pub fn notes_list_tags(id: &str) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.list_note_tags(&parsed)) {
+        Ok(tags) => NoteResult::ok(NotePayload {
+            tags: tags
+                .into_iter()
+                .map(|tag| TagEntry {
+                    id: tag.id.to_string(),
+                    name: tag.name,
+                })
+                .collect(),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 把标签移入回收站（软删除）。
+///
+/// **不会删除任何笔记**：标签是横切分类，删掉一个分类不该动到被分类的内容。
+/// 效果是"这个标签从所有笔记上消失"。
+///
+/// 删掉之后同名标签可以重建（内核会复活墓碑那一行）。
+#[must_use]
+pub fn tags_delete(id: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.delete_tag(&parsed, at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
         Err(failure) => failure,
     }
 }

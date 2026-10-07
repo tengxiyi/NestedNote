@@ -41,6 +41,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/note_providers.dart';
 import 'icons.dart';
 import 'revision_history.dart';
+import 'tag_editor.dart';
 
 /// 停止输入多久之后自动保存。
 ///
@@ -61,6 +62,19 @@ class NoteEditorPane extends ConsumerStatefulWidget {
 }
 
 class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
+  /// 从列表缓存里取这篇笔记的标题。
+  ///
+  /// 编辑器本身不需要标题（正文即内容），但标签与历史对话框要显示
+  /// "这是哪篇笔记的"。取不到就退回通用标题，而不是显示空串。
+  String _noteTitle(WidgetRef ref) =>
+      ref
+          .read(noteListProvider(const NoteListQuery()))
+          .value
+          ?.where((NoteItem item) => item.id == widget.noteId)
+          .map((NoteItem item) => item.title)
+          .firstOrNull ??
+      '笔记';
+
   final TextEditingController _controller = TextEditingController();
 
   /// 已落盘的内容，用于判断"是否有未保存改动"。
@@ -228,6 +242,26 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                 ),
               ),
               IconButton(
+                tooltip: '标签',
+                visualDensity: VisualDensity.compact,
+                // 与"修订历史"同样的理由：先保存再改标签，
+                // 避免用户以为标签没生效。
+                onPressed: () {
+                  if (_dirty) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('请先保存，再编辑标签。')),
+                    );
+                    return;
+                  }
+                  showTagEditor(
+                    context,
+                    noteId: widget.noteId,
+                    noteTitle: _noteTitle(ref),
+                  );
+                },
+                icon: const Icon(kEditTagsIcon, size: 20),
+              ),
+              IconButton(
                 tooltip: '修订历史',
                 visualDensity: VisualDensity.compact,
                 // 有未保存改动时提示先保存：否则用户会在历史里找不到
@@ -239,21 +273,10 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                     );
                     return;
                   }
-                  // 标题从列表缓存里取：编辑器本身不需要标题（正文即内容），
-                  // 但历史对话框要显示"这是哪篇笔记的历史"。
-                  // 取不到就退回通用标题，而不是显示空串。
-                  final String title =
-                      ref
-                          .read(noteListProvider(const NoteListQuery()))
-                          .value
-                          ?.where((NoteItem item) => item.id == widget.noteId)
-                          .map((NoteItem item) => item.title)
-                          .firstOrNull ??
-                      '笔记';
                   showRevisionHistory(
                     context,
                     noteId: widget.noteId,
-                    noteTitle: title,
+                    noteTitle: _noteTitle(ref),
                   );
                 },
                 icon: const Icon(kHistoryIcon, size: 20),

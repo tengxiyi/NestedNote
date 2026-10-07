@@ -1,4 +1,4 @@
-﻿import 'dart:io';
+import 'dart:io';
 import 'package:nested/src/rust/api/notes.dart';
 import 'package:nested/src/rust/frb_generated.dart';
 import 'app_paths.dart';
@@ -24,8 +24,10 @@ Future<void> main() async {
   if (revs.length >= 2) {
     final diff = await notesRevisionDiff(oldId: revs[1].id, newId: revs[0].id);
     final d = diff.value!.diff!;
-    stdout.writeln('对比 v${d.older.version} → v${d.newer.version}  '
-        'missing=${d.missingSnapshot}  +${d.added} -${d.removed}');
+    stdout.writeln(
+      '对比 v${d.older.version} → v${d.newer.version}  '
+      'missing=${d.missingSnapshot}  +${d.added} -${d.removed}',
+    );
     for (final l in d.lines) {
       stdout.writeln('   ${l.kind}: ${l.text}');
     }

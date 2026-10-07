@@ -206,6 +206,29 @@ class NotebookActions {
     _invalidate();
   }
 
+  /// 复制笔记本（含其下全部笔记与子笔记本，递归），返回新笔记本的标识。
+  ///
+  /// 附件的字节**不复制**——内容寻址让副本与原件指向同一份内容。
+  /// 修订历史也不复制：副本从第 1 版重新开始。
+  Future<String> duplicate(String id) async {
+    final rust.NoteResult result = await rust.notebooksDuplicate(
+      id: id,
+      atMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    if (!result.ok) {
+      throw NoteFailure(
+        code: result.code ?? 'UNKNOWN',
+        hint: result.hint ?? '复制笔记本失败。',
+      );
+    }
+    final String? newId = result.value?.notebook?.id;
+    if (newId == null) {
+      throw const NoteFailure(code: 'EMPTY_PAYLOAD', hint: '内核未返回副本。');
+    }
+    _invalidate();
+    return newId;
+  }
+
   /// 把笔记移到另一个笔记本。
   Future<void> moveNote(String noteId, String? notebookId) async {
     final rust.NoteResult result = await rust.notesMove(

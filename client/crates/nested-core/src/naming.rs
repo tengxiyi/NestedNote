@@ -63,8 +63,15 @@ pub fn copy_name(original: &str, max_chars: usize) -> Result<String> {
         });
     }
 
+    // 已经有后缀时**替换**而不是再追加。
+    //
+    // 否则复制一个副本会得到"报告（副本）（副本）"，每复制一次长一截。
+    // 而"复制笔记本"会连里面的副本一起复制，这个叠加立刻就会发生——
+    // 本项目实现后第一次端到端验证就看到了
+    // `[验证S2]原件（副本）（副本）`。
+    let base = original.strip_suffix(COPY_SUFFIX).unwrap_or(original);
     let budget = max_chars - COPY_SUFFIX.chars().count();
-    let truncated: String = original.chars().take(budget).collect();
+    let truncated: String = base.chars().take(budget).collect();
     Ok(format!("{truncated}{COPY_SUFFIX}"))
 }
 
@@ -75,6 +82,26 @@ mod tests {
     #[test]
     fn short_name_gets_the_suffix() {
         assert_eq!(copy_title("工作").expect("ok"), "工作（副本）");
+    }
+
+    #[test]
+    fn copying_a_copy_replaces_the_suffix_instead_of_stacking_it() {
+        // 复制笔记本会连里面的副本一起复制，叠加立刻就会发生。
+        // 端到端验证时看到过「原件（副本）（副本）」。
+        let once = copy_title("报告").expect("ok");
+        assert_eq!(once, "报告（副本）");
+        let twice = copy_title(&once).expect("ok");
+        assert_eq!(twice, "报告（副本）", "第二次复制不该再加一层后缀");
+        let thrice = copy_title(&twice).expect("ok");
+        assert_eq!(thrice, "报告（副本）");
+    }
+
+    #[test]
+    fn a_name_that_merely_ends_with_the_suffix_text_is_not_mangled_twice() {
+        // 只替换**一个**后缀：即便原名里恰好含"（副本）"，也只当它一个后缀
+        let name = "报告（副本）说明（副本）";
+        // 末尾那个被替换掉，中间那个保留（它是名称的一部分）
+        assert_eq!(copy_title(name).expect("ok"), "报告（副本）说明（副本）");
     }
 
     #[test]

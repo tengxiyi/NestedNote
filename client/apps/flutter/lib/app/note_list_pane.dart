@@ -21,6 +21,7 @@ import '../core/note_providers.dart';
 import '../core/trash_providers.dart';
 import 'dialogs.dart';
 import 'notebook_sidebar.dart';
+import 'tag_editor.dart';
 import 'icons.dart';
 
 /// 中栏：当前笔记本下的笔记列表。
@@ -200,6 +201,16 @@ class NoteListPane extends ConsumerWidget {
               icon: kMoveIcon,
               shortcut: 'Alt+Shift+M',
             ),
+            ContextMenuItem<String>(
+              value: 'tags',
+              label: '标签…',
+              icon: kEditTagsIcon,
+            ),
+            ContextMenuItem<String>(
+              value: 'duplicate',
+              label: '复制一份',
+              icon: kDuplicateIcon,
+            ),
             ContextMenuItem<String>.divider(),
             ContextMenuItem<String>(
               value: 'delete',
@@ -241,12 +252,54 @@ class NoteListPane extends ConsumerWidget {
           _notifyMovedToTrash(messenger, retention);
         case 'move':
           await _moveNote(context, ref, note);
+        case 'tags':
+          await _editTags(context, ref, note);
+        case 'duplicate':
+          await _duplicateNote(context, ref, note);
         case 'properties':
           await _showProperties(context, note);
       }
     } on NoteFailure catch (failure) {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }
+  }
+
+  /// 编辑标签。
+  ///
+  /// 保存后把笔记**重新打开一次**：右栏的编辑器是按 noteId 取正文的，
+  /// 标签变化不影响它；但中栏的行如果有标签展示，需要它重绘。
+  /// 刷新由 `TagActions` 的 `invalidate` 负责，这里不必额外做什么。
+  Future<void> _editTags(
+    BuildContext context,
+    WidgetRef ref,
+    NoteItem note,
+  ) async {
+    await showTagEditor(context, noteId: note.id, noteTitle: note.title);
+  }
+
+  /// 复制一份。
+  ///
+  /// 复制完**不自动打开**副本：用户点"复制一份"通常是为了做点别的，
+  /// 立刻把右栏切走会打断他手上的事。改为提示一句"已复制"，
+  /// 副本就出现在列表里（标题带「（副本）」），需要时再点。
+  Future<void> _duplicateNote(
+    BuildContext context,
+    WidgetRef ref,
+    NoteItem note,
+  ) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final String newId = await ref.read(noteActionsProvider).duplicate(note.id);
+    messenger.showSnackBar(
+      SnackBar(
+        content: const Text('已复制一份（标题带「（副本）」）。'),
+        action: SnackBarAction(
+          label: '打开副本',
+          // 用返回值里的 id，而不是自己拼——与标签复活同理，
+          // 调用方不该假设自己知道新实体的 id
+          onPressed: () => onOpenNote(newId),
+        ),
+      ),
+    );
   }
 
   /// 彻底删除（不可逆）。**必须二次确认**，且确认按钮写明后果。

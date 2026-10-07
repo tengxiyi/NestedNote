@@ -250,6 +250,23 @@ class NoteActions {
     _invalidateLists();
   }
 
+  /// 复制一篇笔记，返回副本的标识。
+  ///
+  /// 正文与标签一并复制；附件只复制引用（内容寻址）；修订历史不复制。
+  Future<String> duplicate(String id) async {
+    final result = await rust.notesDuplicate(id: id, atMs: _nowMs());
+    final NoteItem? item = _unwrap(
+      result,
+      (rust.NotePayload payload) =>
+          payload.note == null ? null : NoteItem.fromRust(payload.note!),
+    );
+    if (item == null) {
+      throw const NoteFailure(code: 'EMPTY_PAYLOAD', hint: '内核未返回副本。');
+    }
+    _invalidateLists();
+    return item.id;
+  }
+
   /// 移入回收站（软删除，铁律 T7）。
   Future<void> delete(String id) async {
     final result = await rust.notesDelete(id: id, atMs: _nowMs());

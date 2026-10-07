@@ -675,6 +675,31 @@ impl NestedCore {
         Ok(tags::list_all(&connection)?)
     }
 
+    /// 把标签移入回收站（软删除）。
+    ///
+    /// ## 删除标签**不**删除笔记
+    ///
+    /// `soft_delete` 只改 `tags` 表，`note_tags` 里的关联行原样保留，
+    /// 而 `list_for_note` 会因 `deleted_at_ms IS NULL` 不再返回已删标签。
+    /// 用户看到的效果是"这个标签从所有笔记上消失了"，笔记本身完好。
+    ///
+    /// 这是刻意的：标签是**横切分类**，删掉一个分类不该动到被分类的内容。
+    ///
+    /// ## 删掉之后同名标签可以复用
+    ///
+    /// 唯一索引不含 `deleted_at_ms`，墓碑仍占位置；但 `create_tag` 会在
+    /// 命中墓碑时**复活那一行**，因此用户不会遇到"删了却建不回来"。
+    ///
+    /// # Errors
+    ///
+    /// 标签不存在 → [`CoreError::NotFound`]。
+    pub fn delete_tag(&self, id: &Id, at_ms: i64) -> CoreResult<()> {
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        tags::soft_delete(&mut connection, id, &device_id, at_ms)?;
+        Ok(())
+    }
+
     /// 列出笔记的标签。
     ///
     /// # Errors
@@ -683,6 +708,31 @@ impl NestedCore {
     pub fn list_note_tags(&self, note_id: &Id) -> CoreResult<Vec<Tag>> {
         let connection = self.database.connection()?;
         Ok(tags::list_for_note(&connection, note_id)?)
+    }
+
+    /// 设置一篇笔记的标签集合（**整体覆盖**，不是增量）。
+    ///
+    /// ## 为什么是覆盖而不是 attach/detach
+    ///
+    /// 界面上的标签编辑器是"勾选完点确定"，覆盖语义与它一一对应。
+    /// 若只暴露增量接口，界面要自己算差集，还要处理"算到一半失败"
+    /// 留下的中间态；而且漏掉一次 `detach` 就会残留一个用户以为已取消的标签。
+    ///
+    /// 覆盖语义把"最终状态是什么"作为唯一输入，既幂等又可重放。
+    ///
+    /// # Errors
+    ///
+    /// 笔记不存在（`note_tags` 的外键会拒绝）→ [`CoreError::Database`]。
+    pub fn set_note_tags(
+        &self,
+        note_id: &Id,
+        tag_ids: &[Id],
+        device_id: &str,
+        at_ms: i64,
+    ) -> CoreResult<()> {
+        let mut connection = self.database.connection()?;
+        tags::set_note_tags(&mut connection, note_id, tag_ids, device_id, at_ms)?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------- 深拷贝
@@ -750,10 +800,8 @@ impl NestedCore {
         if tags_of_source.is_empty() {
             return Ok(());
         }
-        let mut connection = self.database.connection()?;
         let tag_ids: Vec<Id> = tags_of_source.iter().map(|tag| tag.id).collect();
-        tags::set_note_tags(&mut connection, to, &tag_ids, device_id, at_ms)?;
-        Ok(())
+        self.set_note_tags(to, &tag_ids, device_id, at_ms)
     }
 
     /// 复制一个笔记本（含其下**全部**笔记与子笔记本，递归）。
