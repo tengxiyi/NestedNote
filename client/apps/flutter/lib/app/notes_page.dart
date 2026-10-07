@@ -393,6 +393,41 @@ class NotebookSidebar extends ConsumerWidget {
   }
 }
 
+/// 每一层笔记本的缩进量（逻辑像素）。
+const double kIndentPerLevel = 13;
+
+/// 标签距离左边缘的基础内边距。
+const double kIndentBase = 8;
+
+/// 缩进总量上限。左栏宽 [kSidebarWidth]，留下名称的显示空间。
+const double kIndentMax = 118;
+
+/// 计算某个层级在左栏中的缩进量。
+///
+/// ## 为什么要"封顶"而不是"一直加"
+///
+/// 层级没有硬上限（数据层不限制深度），但左栏宽度固定。
+/// 若无限累加，深层级的名称会被挤出可视区域。
+///
+/// ## 为什么封顶前必须保证"每层都不同"
+///
+/// 第一版写成了 `depth.clamp(0, 6) * 14`——**第 7 层开始缩进完全相同**，
+/// 于是两个不同层级的兄弟节点看起来一样深，用户无法判断自己在哪一层。
+/// 「封顶」应当封的是**总宽度**，而不是**层级的区分度**：
+/// 在到达上限之前，每一层都必须给出不同的缩进。
+///
+/// 这样在第 1–9 层之间层级分明；再深则缩进不再增加（但用户仍可通过
+/// 展开/折叠与名称判断），这是宽度受限下的合理取舍。
+///
+/// 提取成独立的纯函数是为了**可测试**：缩进是层级可视化的核心，
+/// 而它在 widget 里很难断言。
+double notebookIndent(int depth) {
+  // 负深度不该出现，但真出现了也不能把内容推到屏幕外
+  final int safeDepth = depth < 0 ? 0 : depth;
+  final double wanted = kIndentBase + (safeDepth * kIndentPerLevel);
+  return wanted > kIndentMax ? kIndentMax : wanted;
+}
+
 /// 左栏的一行。
 class _SidebarTile extends StatelessWidget {
   const _SidebarTile({
@@ -416,8 +451,7 @@ class _SidebarTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    // 每层缩进 14 逻辑像素；设上限，避免深层级把文字挤没
-    final double indent = 8 + (depth.clamp(0, 6) * 14);
+    final double indent = notebookIndent(depth);
 
     return InkWell(
       onTap: onTap,
@@ -656,8 +690,9 @@ class NoteListPane extends ConsumerWidget {
             SimpleDialogOption(
               onPressed: () => Navigator.of(dialogContext).pop(node.id),
               child: Padding(
-                padding: EdgeInsets.only(left: node.depth * 14.0),
-                child: Text(node.name),
+                // 与左栏用同一套缩进规则，避免两处的层级观感不一致
+                padding: EdgeInsets.only(left: notebookIndent(node.depth)),
+                child: Text(node.name, overflow: TextOverflow.ellipsis),
               ),
             ),
         ],

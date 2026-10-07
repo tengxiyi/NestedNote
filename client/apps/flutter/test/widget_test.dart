@@ -235,6 +235,82 @@ void main() {
     expect(addButton.onPressed, isNull, reason: '回收站中不应允许新建');
   });
 
+  group('笔记本层级渲染', () {
+    testWidgets('深层级（6 层）仍能按深度递增缩进', (WidgetTester tester) async {
+      // 层级没有硬上限。这里渲染 6 层，确认每层缩进严格递增——
+      // 第一版用 `depth.clamp(0, 6)` 时，第 7 层起缩进完全相同，
+      // 两个不同层级的节点看起来一样深。
+      final List<NotebookNode> deep = <NotebookNode>[
+        for (int depth = 0; depth <= 5; depth++)
+          node(id: 'n$depth', name: '第$depth层', depth: depth),
+      ];
+      await tester.pumpWidget(harness(notebooks: deep));
+      await tester.pumpAndSettle();
+
+      double leftPaddingOf(String label) {
+        final Finder tile = find.ancestor(
+          of: find.text(label),
+          matching: find.byType(Container),
+        );
+        final Container container = tester.widget<Container>(tile.first);
+        final EdgeInsetsGeometry? padding = container.padding;
+        return padding is EdgeInsets ? padding.left : -1;
+      }
+
+      double previous = -1;
+      for (int depth = 0; depth <= 5; depth++) {
+        final double current = leftPaddingOf('第$depth层');
+        expect(
+          current,
+          greaterThan(previous),
+          reason: '第 $depth 层的缩进应大于上一层（实际 $current vs $previous）',
+        );
+        previous = current;
+      }
+    });
+
+    test('缩进在到达上限前每层都不同，之后不再增加', () {
+      // 这是纯函数层面的不变量，比渲染断言更直接
+      expect(notebookIndent(0), kIndentBase, reason: '顶层只有基础内边距');
+      expect(
+        notebookIndent(1),
+        kIndentBase + kIndentPerLevel,
+        reason: '每层加固定步长',
+      );
+
+      // 上限之前严格递增
+      for (int depth = 1; notebookIndent(depth) < kIndentMax; depth++) {
+        expect(
+          notebookIndent(depth),
+          greaterThan(notebookIndent(depth - 1)),
+          reason: '第 $depth 层必须比上一层更深',
+        );
+      }
+
+      // 至少要能区分到第 8 层（大多数真实用法远低于此）
+      expect(
+        notebookIndent(8),
+        greaterThan(notebookIndent(7)),
+        reason: '8 层之内必须层级分明',
+      );
+
+      // 上限之后不再增加，且绝不超过上限
+      for (final int depth in <int>[20, 50, 999]) {
+        expect(
+          notebookIndent(depth),
+          kIndentMax,
+          reason: '超过上限后应稳定在上限，而不是把名称挤出可视区',
+        );
+      }
+    });
+
+    test('负深度不会被推到屏幕外', () {
+      // 不该出现，但出现了也不能把内容挤出可视区
+      expect(notebookIndent(-1), kIndentBase);
+      expect(notebookIndent(-100), kIndentBase);
+    });
+  });
+
   group('列表时间格式', () {
     // 纯函数直接断言，比解析渲染后的文本更可靠
     final DateTime now = DateTime(2026, 3, 16, 14, 30);
