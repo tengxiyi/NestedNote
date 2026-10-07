@@ -31,6 +31,61 @@ pub fn is_skipped(path: &Path) -> bool {
     })
 }
 
+/// 从仓库根的 `.gitignore` 读出的忽略目录名（一级，仅取简单形式）。
+///
+/// ## 为什么门禁需要知道 `.gitignore`
+///
+/// 铁律 V6 的字面要求是"禁止大文件**入库**"。如果只看文件系统，
+/// 一个被 `.gitignore` 排除、git 永远不会提交的文件也会被判违规——
+/// 那就把规则变成了"仓库目录下不许存在大文件"，与本意不符，
+/// 而且会让 `dist/`（放打包产物，本身就该被忽略）这类目录无法使用。
+///
+/// 本项目实际踩到：打好的绿色包放在 `dist/` 下，V6 直接报违规。
+///
+/// ## 覆盖范围的取舍
+///
+/// 只识别**简单形式**的模式：
+///
+/// - `dir/` 与 `/dir/` 与 `/dir`
+/// - `*.ext`（按扩展名忽略）
+///
+/// 不处理 `!` 取反、`**` 通配、嵌套 `.gitignore`。
+/// 理由：这些形式在本仓库没有出现，为它们写一个完整的 gitignore 匹配器
+/// 不值得（铁律 P2：先测量再优化）。一旦真的用到，这里的宽松会**漏报**
+/// 而不是误报——漏报由 CI 的体积检查兜底，误报却会卡住正常开发。
+#[must_use]
+pub fn gitignored_dirs(root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(root.join(".gitignore")) else {
+        return Vec::new();
+    };
+
+    let mut dirs = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        // 只取目录形式：以 / 结尾，或没有扩展名也没有通配符的裸名
+        let name = line.trim_start_matches('/').trim_end_matches('/');
+        if name.is_empty() || name.contains('*') || name.contains('/') {
+            continue;
+        }
+        if line.ends_with('/') || !name.contains('.') {
+            dirs.push(name.to_owned());
+        }
+    }
+    dirs
+}
+
+/// 判断某个相对路径是否落在 `.gitignore` 的忽略目录内。
+#[must_use]
+pub fn is_gitignored(relative: &str, ignored_dirs: &[String]) -> bool {
+    let normalized = relative.replace('\\', "/");
+    normalized
+        .split('/')
+        .any(|component| ignored_dirs.iter().any(|dir| dir == component))
+}
+
 /// 递归收集匹配扩展名的文件。
 ///
 /// # Errors

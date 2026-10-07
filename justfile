@@ -130,11 +130,35 @@ cli-init dir="":
 # 打包 Windows 桌面应用
 # 产物：client/apps/flutter/build/windows/x64/runner/Release/nested.exe
 # 说明：Cargokit 会在构建过程中自动编译 Rust 内核并打进产物目录，无需先手动 cargo build。
+#
+# ⚠ 必须带 --no-tree-shake-icons，原因见 scripts/check-icon-font.ps1 头部注释：
+#   Flutter 的图标裁剪对"存进 const 列表再按下标取"的 IconData 识别不可靠，
+#   会删掉字形，导致图标在 release 包里渲染成空白（本项目实际踩到：
+#   第 1/2 层的文件夹图标整片消失，而第 3 层之后的还在）。
+#   完整图标字体 1.6 MB，对约 30 MB 的包可忽略，不值得为省它冒这个风险。
 app-build:
-    cd {{client_dir}}/apps/flutter && flutter build windows --release
+    cd {{client_dir}}/apps/flutter && flutter build windows --release --no-tree-shake-icons
+    powershell -NoProfile -File scripts/check-icon-font.ps1
     @echo "完成：{{client_dir}}\apps\flutter\build\windows\x64\runner\Release\nested.exe"
 
+# 打成"解压即用"的绿色包（含中文说明、LICENSE、SHA256SUMS）
+# 产物：dist/NestedNote-<版本>-windows-x64.zip
+# 这是给别人试用的正确方式：对方无需安装 Rust / Flutter。
+# 注意：**单个 exe 不可分发**——Flutter Windows 应用需要同目录的 dll 与 data/。
+app-package:
+    powershell -NoProfile -File scripts/package-windows.ps1
+
+# 只重新打包，不重新构建（产物已存在时用）
+app-repackage:
+    powershell -NoProfile -File scripts/package-windows.ps1 -SkipBuild
+
+# 校验 release 产物里的图标字体是否包含界面上用到的全部图标
+# （图标裁剪漏删字形会让图标变空白，且只有打包后才看得出来）
+check-icons:
+    powershell -NoProfile -File scripts/check-icon-font.ps1
+
 # 直接运行桌面应用（开发模式，支持热重载）
+# ⚠ 需要先装 Flutter（并在 PATH 上）；只想看效果请用 app-package 拿绿色包。
 app-run:
     cd {{client_dir}}/apps/flutter && flutter run -d windows
 

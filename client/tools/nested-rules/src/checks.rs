@@ -515,10 +515,23 @@ pub fn required_files_present(root: &Path) -> Vec<Violation> {
 }
 
 /// V6：禁止大文件入库（磁盘上的附件与样本必须可生成）。
+///
+/// ## 为什么必须尊重 `.gitignore`
+///
+/// 规则的字面要求是"禁止大文件**入库**"。只扫文件系统的话，
+/// 被 `.gitignore` 排除、git 永远不会提交的文件也会被判违规——
+/// 等于变成"仓库目录下不许存在大文件"。
+///
+/// 本项目实际踩到：打好的绿色包（`dist/*.zip`，本身就在 `.gitignore` 里）
+/// 让 `just check-rules` 直接失败，`dist/` 这个约定俗成的产物目录因此不可用。
+///
+/// 忽略 `.gitignore` 也是**安全**的：一个被忽略的文件不可能进入版本库，
+/// 所以跳过它不会漏掉 V6 要防的问题。
 #[must_use]
 pub fn no_large_files(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
-    collect_large(root, &mut violations, root);
+    let ignored = fsutil::gitignored_dirs(root);
+    collect_large(root, &mut violations, root, &ignored);
     violations
 }
 
@@ -628,7 +641,7 @@ pub fn powershell_scripts_need_bom(root: &Path) -> Vec<Violation> {
     violations
 }
 
-fn collect_large(dir: &Path, out: &mut Vec<Violation>, root: &Path) {
+fn collect_large(dir: &Path, out: &mut Vec<Violation>, root: &Path, ignored: &[String]) {
     if fsutil::is_skipped(dir) {
         return;
     }
@@ -640,8 +653,14 @@ fn collect_large(dir: &Path, out: &mut Vec<Violation>, root: &Path) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+
+        // 被 .gitignore 排除的内容不可能入库，因此不属于 V6 的管辖范围
+        if fsutil::is_gitignored(&Violation::relative(root, &path), ignored) {
+            continue;
+        }
+
         if file_type.is_dir() {
-            collect_large(&path, out, root);
+            collect_large(&path, out, root, ignored);
         } else if file_type.is_file()
             && let Ok(metadata) = entry.metadata()
             && metadata.len() > MAX_FILE_BYTES
@@ -1010,6 +1029,42 @@ mod tests {
             no_large_files(&root).is_empty(),
             "构建产物目录必须跳过，否则每次都会误报"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn large_files_in_gitignored_dirs_are_ignored() {
+        // V6 的字面要求是"禁止大文件**入库**"。被 .gitignore 排除的文件
+        // 不可能入库，因此不该报违规——否则 `dist/`（放打包产物）
+        // 这类目录直接不可用。本项目实际踩到过。
+        let root = fixture("large-file-gitignored");
+        std::fs::write(root.join(".gitignore"), "/dist/\n").expect("gitignore");
+        std::fs::create_dir_all(root.join("dist")).expect("mkdir");
+        std::fs::write(
+            root.join("dist/NestedNote-0.1.0.zip"),
+            vec![0_u8; 6 * 1024 * 1024],
+        )
+        .expect("write");
+
+        assert!(
+            no_large_files(&root).is_empty(),
+            "被 .gitignore 排除的大文件不能报 V6"
+        );
+
+        // 但未忽略目录里的大文件仍必须报出来——别把规则改废了
+        std::fs::create_dir_all(root.join("assets")).expect("mkdir");
+        std::fs::write(root.join("assets/big.bin"), vec![0_u8; 6 * 1024 * 1024]).expect("write");
+        let violations = no_large_files(&root);
+        assert_eq!(violations.len(), 1, "非忽略目录里的大文件必须仍被拦下");
+        assert!(
+            violations[0]
+                .file
+                .replace('\\', "/")
+                .contains("assets/big.bin"),
+            "实际：{}",
+            violations[0].file
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
