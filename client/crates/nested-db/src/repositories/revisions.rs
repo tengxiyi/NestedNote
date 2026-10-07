@@ -110,6 +110,77 @@ pub fn count_for_note(connection: &Connection, note_id: &Id) -> Result<i64, DbEr
     Ok(total)
 }
 
+// ---------------------------------------------------------------- 内容快照
+//
+// 设计依据：`docs/adr/0001-修订内容用完整快照.md`
+//
+// `revisions` 原本只有元数据，因此"修订对比"没有内容可对比。
+// 迁移 0003 增加了 `revision_documents`，每个修订保存一份**完整快照**
+// （而不是差量）。取舍见 ADR，这里只强调两条实现约束：
+//
+// 1. 快照必须与 `revisions` 行在**同一事务**里写入（铁律 D1）；
+// 2. 读取一律用 `LEFT JOIN` / 可选返回——**允许缺失**。
+//    迁移 0003 之前的历史修订没有快照，这必须被如实表达，
+//    而**不能**用当前内容回填（那是在伪造审计材料）。
+
+/// 追加一条修订的**内容快照**。
+///
+/// 调用方必须在写 `revisions` 行的**同一事务**里调用它（铁律 D1）：
+/// 只有元数据没有内容的修订，与只有内容没有元数据的快照，都是坏数据。
+///
+/// # Errors
+///
+/// - 修订不存在（外键失败）或写入失败 → [`DbError`]
+pub fn insert_document(
+    connection: &Connection,
+    revision_id: &Id,
+    content: &[u8],
+) -> Result<(), DbError> {
+    connection.execute(
+        "INSERT INTO revision_documents (revision_id, content) VALUES (?1, ?2)",
+        params![revision_id.as_bytes(), content],
+    )?;
+    Ok(())
+}
+
+/// 读取一条修订的内容快照。
+///
+/// 返回 `Ok(None)` 表示**该修订没有快照**（迁移 0003 之前的历史）——
+/// 这与"快照是空的"是两回事，调用方必须区分：
+/// 前者应显示"此版本没有内容快照"，后者才该显示空文档。
+///
+/// # Errors
+///
+/// 查询失败时返回 [`DbError::Sqlite`]。
+pub fn get_document(connection: &Connection, revision_id: &Id) -> Result<Option<Vec<u8>>, DbError> {
+    connection
+        .query_row(
+            "SELECT content FROM revision_documents WHERE revision_id = ?1",
+            params![revision_id.as_bytes()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+}
+
+/// 统计某篇笔记有多少条修订**带**内容快照。
+///
+/// 界面用它说明"历史中有多少版本可以对比"，避免用户以为是功能坏了。
+///
+/// # Errors
+///
+/// 查询失败时返回 [`DbError::Sqlite`]。
+pub fn count_documents_for_note(connection: &Connection, note_id: &Id) -> Result<i64, DbError> {
+    let total: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM revision_documents d
+           JOIN revisions r ON r.id = d.revision_id
+          WHERE r.note_id = ?1",
+        params![note_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +264,92 @@ mod tests {
         let db = Database::open_in_memory().expect("open");
         let guard = db.connection().expect("conn");
         assert!(get(&guard, &Id::new()).expect("get").is_none());
+    }
+
+    // ------------------------------------------------------------ 内容快照
+
+    /// 建一条修订并写入快照，返回修订 id。
+    fn revision_with_snapshot(
+        connection: &Connection,
+        note_id: Id,
+        version: i64,
+        content: &[u8],
+    ) -> Id {
+        let revision = Revision::new(note_id, version, None, "device-a", "note.update", NOW);
+        insert(connection, &revision).expect("insert revision");
+        insert_document(connection, &revision.id, content).expect("insert snapshot");
+        revision.id
+    }
+
+    #[test]
+    fn snapshot_roundtrips() {
+        let db = Database::open_in_memory().expect("open");
+        let guard = db.connection().expect("conn");
+        let note_id = note(&guard);
+        let id = revision_with_snapshot(&guard, note_id, 1, b"{\"blocks\":[]}");
+
+        assert_eq!(
+            get_document(&guard, &id).expect("get"),
+            Some(b"{\"blocks\":[]}".to_vec())
+        );
+        assert_eq!(
+            count_documents_for_note(&guard, &note_id).expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_is_a_full_copy_not_a_shared_reference() {
+        // 快照的语义是"这一刻的完整内容"。若它与 documents 共享引用，
+        // 之后的编辑会**改掉历史**——审计材料就失去意义了。
+        // 这里用两次不同的内容直接验证"各存各的"。
+        let db = Database::open_in_memory().expect("open");
+        let guard = db.connection().expect("conn");
+        let note_id = note(&guard);
+        let v1 = revision_with_snapshot(&guard, note_id, 1, b"first");
+        let v2 = revision_with_snapshot(&guard, note_id, 2, b"second");
+
+        assert_eq!(
+            get_document(&guard, &v1).expect("v1"),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            get_document(&guard, &v2).expect("v2"),
+            Some(b"second".to_vec()),
+            "后写的快照不得影响先前的"
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_is_none_not_empty() {
+        // 迁移 0003 之前的历史修订没有快照。
+        // 这个区别很重要：返回空 Vec 会让界面显示"这一版是空的"，
+        // 用户会以为数据损坏，而实际上只是"那条记录早于快照功能"。
+        let db = Database::open_in_memory().expect("open");
+        let guard = db.connection().expect("conn");
+        let note_id = note(&guard);
+        let revision = Revision::new(note_id, 1, None, "device-a", "note.create", NOW);
+        insert(&guard, &revision).expect("insert");
+
+        assert_eq!(
+            get_document(&guard, &revision.id).expect("get"),
+            None,
+            "没有快照必须是 None，不能退化成空内容"
+        );
+        assert_eq!(
+            count_documents_for_note(&guard, &note_id).expect("count"),
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_for_missing_revision_fails_on_foreign_key() {
+        // 快照不能挂在不存在的修订上——否则它是永远查不到的垃圾
+        let db = Database::open_in_memory().expect("open");
+        let guard = db.connection().expect("conn");
+        assert!(
+            insert_document(&guard, &Id::new(), b"orphan").is_err(),
+            "外键必须拦住指向不存在修订的快照"
+        );
     }
 }

@@ -87,16 +87,20 @@ pub fn create_with_document(
         &document.attachment_ids(),
         note.created_at_ms,
     )?;
-    crate::repositories::revisions::insert(
+    // 修订 + 内容快照必须成对写入（见本函数上方的说明）。
+    // 快照用的就是刚写进 documents 的那份序列化字节——
+    // 两者在同一事务里，因此不可能出现"内容与快照不一致"。
+    insert_revision_with_snapshot(
         &transaction,
-        &nested_model::Revision::new(
-            note.id,
-            note.version,
-            None,
-            device_id,
-            "note.create",
-            note.created_at_ms,
-        ),
+        &note.id,
+        note.version,
+        None,
+        device_id,
+        "note.create",
+        note.created_at_ms,
+        &document
+            .to_bytes()
+            .map_err(|_| DbError::Corrupt { entity: "document" })?,
     )?;
     // 与 save_with_document 对称：创建也要入队（技术债 #12）。
     // 此前只有"更新"入队，导致新建的笔记在 P6 同步时根本不会被推送到其他设备。
@@ -108,6 +112,49 @@ pub fn create_with_document(
         note.created_at_ms,
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// 在给定事务内写入一条修订**及其内容快照**。
+///
+/// ## 为什么必须成对写入（而不是让调用方各写各的）
+///
+/// `revisions` 是元数据，`revision_documents` 是那一刻的完整内容。
+/// 两者只有配套才有意义：
+///
+/// - 有元数据没快照 → "修订对比"里那一条永远读不出内容；
+/// - 有快照没元数据 → 快照挂在不存在的修订上（外键会直接拦住）。
+///
+/// 把配对逻辑收在一个函数里，调用方就不可能只写一半。
+/// 这也是铁律 D1（一次业务操作 = 一个事务）在**这一对表**上的具体落法：
+/// 本函数不自行开关事务，而是复用调用方的事务。
+///
+/// 设计依据：`docs/adr/0001-修订内容用完整快照.md`
+///
+/// # Errors
+///
+/// 写入失败时返回 [`DbError`]。
+#[allow(clippy::too_many_arguments)]
+fn insert_revision_with_snapshot(
+    connection: &Connection,
+    note_id: &Id,
+    version: i64,
+    parent_revision_id: Option<Id>,
+    device_id: &str,
+    operation: &str,
+    at_ms: i64,
+    content: &[u8],
+) -> Result<(), DbError> {
+    let revision = nested_model::Revision::new(
+        *note_id,
+        version,
+        parent_revision_id,
+        device_id,
+        operation,
+        at_ms,
+    );
+    crate::repositories::revisions::insert(connection, &revision)?;
+    crate::repositories::revisions::insert_document(connection, &revision.id, content)?;
     Ok(())
 }
 
@@ -363,16 +410,17 @@ pub fn save_with_document(
         &document.attachment_ids(),
         note.updated_at_ms,
     )?;
-    crate::repositories::revisions::insert(
+    insert_revision_with_snapshot(
         &transaction,
-        &nested_model::Revision::new(
-            note.id,
-            note.version,
-            parent_revision_id,
-            device_id,
-            "note.update",
-            note.updated_at_ms,
-        ),
+        &note.id,
+        note.version,
+        parent_revision_id,
+        device_id,
+        "note.update",
+        note.updated_at_ms,
+        &document
+            .to_bytes()
+            .map_err(|_| DbError::Corrupt { entity: "document" })?,
     )?;
     crate::repositories::sync_operations::enqueue(
         &transaction,
@@ -524,13 +572,20 @@ pub fn purge_deleted_before(
     };
 
     for note_id in &doomed {
-        // 子表：顺序无所谓（彼此之间无外键），但都必须在删主表之前
+        // 子表：顺序**有讲究**——`revision_documents` 有外键指向 `revisions`，
+        // 因此必须先删快照、再删修订，否则会撞 787 外键失败。
+        // （这条约束由迁移 0003 引入；本函数在此之前只需要删四张表。）
         transaction.execute("DELETE FROM note_tags WHERE note_id = ?1", params![note_id])?;
         transaction.execute(
             "DELETE FROM note_attachments WHERE note_id = ?1",
             params![note_id],
         )?;
         transaction.execute("DELETE FROM documents WHERE note_id = ?1", params![note_id])?;
+        transaction.execute(
+            "DELETE FROM revision_documents WHERE revision_id IN
+                 (SELECT id FROM revisions WHERE note_id = ?1)",
+            params![note_id],
+        )?;
         transaction.execute("DELETE FROM revisions WHERE note_id = ?1", params![note_id])?;
         transaction.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
     }
@@ -612,6 +667,12 @@ pub fn purge_one(connection: &mut Connection, id: &Id) -> Result<(), DbError> {
     )?;
     transaction.execute(
         "DELETE FROM documents WHERE note_id = ?1",
+        params![id.as_bytes()],
+    )?;
+    // 快照必须先于 revisions 删除（外键指向 revisions，见迁移 0003）
+    transaction.execute(
+        "DELETE FROM revision_documents WHERE revision_id IN
+             (SELECT id FROM revisions WHERE note_id = ?1)",
         params![id.as_bytes()],
     )?;
     transaction.execute(
@@ -696,6 +757,107 @@ mod tests {
         assert_eq!(count, 1, "失败的事务不得留下半截数据");
     }
 
+    #[test]
+    fn every_revision_has_a_content_snapshot() {
+        // 这是迁移 0003 的核心不变量：**元数据与内容必须成对**。
+        // 有元数据没快照 → "修订对比"里那一条永远读不出内容。
+        // 因此对"创建 + 保存"两条写入路径都验证一遍，而不是只测其中一条。
+        let (db, notebook_id) = fixture();
+        let mut guard = db.connection().expect("conn");
+        let mut note = sample_note(Some(notebook_id), "配对的修订");
+        let mut document = Document::from_blocks(vec![Block::paragraph("v1")], NOW);
+        create_with_document(&mut guard, &note, &document, DEVICE).expect("create");
+
+        note.touch(NOW + 1000);
+        document.blocks.push(Block::paragraph("v2"));
+        document.touch(NOW + 1000);
+        save_with_document(&mut guard, &note, &document, DEVICE, None).expect("save");
+
+        let total: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM revisions WHERE note_id = ?1",
+                [note.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .expect("count revisions");
+        let with_snapshot: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM revision_documents d
+                   JOIN revisions r ON r.id = d.revision_id
+                  WHERE r.note_id = ?1",
+                [note.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .expect("count snapshots");
+        assert_eq!(total, 2, "创建与保存各留一条修订");
+        assert_eq!(
+            with_snapshot, total,
+            "每一条修订都必须有内容快照，否则对比功能对它是空的"
+        );
+    }
+
+    #[test]
+    fn revision_snapshot_reflects_the_content_at_that_moment() {
+        // 快照的语义是"这一刻的内容"。若写入时错拿了当前内容，
+        // 历史会被**静默改写**——这是审计材料最严重的失效方式。
+        let (db, notebook_id) = fixture();
+        let mut guard = db.connection().expect("conn");
+        let mut note = sample_note(Some(notebook_id), "历史内容");
+        let v1 = Document::from_blocks(vec![Block::paragraph("第一版")], NOW);
+        create_with_document(&mut guard, &note, &v1, DEVICE).expect("create");
+
+        note.touch(NOW + 1000);
+        let v2 = Document::from_blocks(vec![Block::paragraph("第二版")], NOW + 1000);
+        save_with_document(&mut guard, &note, &v2, DEVICE, None).expect("save");
+
+        // 取每条修订的快照，反序列化后看正文
+        let mut statement = guard
+            .prepare(
+                "SELECT d.content FROM revision_documents d
+                   JOIN revisions r ON r.id = d.revision_id
+                  WHERE r.note_id = ?1 ORDER BY r.version ASC",
+            )
+            .expect("prepare");
+        let texts: Vec<String> = statement
+            .query_map([note.id.as_bytes()], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query")
+            .map(|bytes| {
+                let doc = Document::from_bytes(&bytes.expect("row")).expect("decode snapshot");
+                doc.blocks
+                    .iter()
+                    .map(nested_model::Block::searchable_text)
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(
+            texts,
+            vec!["第一版".to_owned(), "第二版".to_owned()],
+            "第 1 条快照必须是第一版内容，不能被后来的编辑改写"
+        );
+    }
+
+    #[test]
+    fn purge_one_also_removes_revision_snapshots() {
+        // 快照表有外键指向 revisions，若清理顺序不对会直接撞 787。
+        // 这条既是功能验证，也是"清理顺序"的回归保护。
+        let (db, notebook_id) = fixture();
+        let mut guard = db.connection().expect("conn");
+        let note = sample_note(Some(notebook_id), "带快照的");
+        create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE).expect("create");
+        soft_delete(&mut guard, &note.id, DEVICE, NOW + 1).expect("delete");
+        drop(guard);
+
+        purge_one(&mut db.connection().expect("conn"), &note.id).expect("purge one");
+
+        let guard = db.connection().expect("conn");
+        let snapshots: i64 = guard
+            .query_row("SELECT COUNT(*) FROM revision_documents", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(snapshots, 0, "彻底删除笔记时它的修订快照必须一并清除");
+    }
     #[test]
     fn save_increments_version_and_appends_revision() {
         let (db, notebook_id) = fixture();

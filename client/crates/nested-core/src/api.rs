@@ -46,6 +46,86 @@ impl TrashPurgeReport {
     }
 }
 
+/// 修订的摘要信息（用于对比界面显示"这是哪一版"）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionSummary {
+    /// 版本号。
+    pub version: i64,
+    /// 产生时间（UTC 毫秒）。
+    pub created_at_ms: i64,
+    /// 产生该变更的设备。
+    pub device_id: String,
+    /// 操作类型，如 `note.update`。
+    pub operation: String,
+}
+
+impl From<&nested_model::Revision> for RevisionSummary {
+    fn from(revision: &nested_model::Revision) -> Self {
+        Self {
+            version: revision.version,
+            created_at_ms: revision.created_at_ms,
+            device_id: revision.device_id.clone(),
+            operation: revision.operation.clone(),
+        }
+    }
+}
+
+/// 差异中一行的类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    /// 两版都有。
+    Unchanged,
+    /// 新增。
+    Added,
+    /// 删除。
+    Removed,
+}
+
+/// 差异中的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionDiffLine {
+    /// 类型。
+    pub kind: DiffLineKind,
+    /// 行内容。
+    pub text: String,
+}
+
+/// 两条修订的对比结果。
+///
+/// ## 为什么"缺快照"必须是一个独立变体
+///
+/// 迁移 `0003` 之前的修订没有内容快照。若把它们当成"零差异"返回，
+/// 用户会以为"这两版内容一样"——而事实是**我们不知道**。
+/// 把"未知"呈现为"相同"是会误导人的错误，因此做成独立变体，
+/// 界面无法把它与真正的"无差异"混为一谈。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionDiff {
+    /// 成功比出差异。
+    Diff {
+        /// 旧版本摘要。
+        old: RevisionSummary,
+        /// 新版本摘要。
+        new: RevisionSummary,
+        /// 新增行数。
+        added: usize,
+        /// 删除行数。
+        removed: usize,
+        /// 逐行差异。
+        lines: Vec<RevisionDiffLine>,
+    },
+    /// 至少一侧没有内容快照（迁移 `0003` 之前的历史修订）。
+    MissingSnapshot {
+        /// 旧版本摘要。
+        old: RevisionSummary,
+        /// 新版本摘要。
+        new: RevisionSummary,
+        /// 旧版本是否缺快照。
+        old_missing: bool,
+        /// 新版本是否缺快照。
+        new_missing: bool,
+    },
+}
+
 /// 内核句柄。
 #[derive(Debug)]
 pub struct NestedCore {
@@ -580,6 +660,112 @@ impl NestedCore {
     pub fn list_note_tags(&self, note_id: &Id) -> CoreResult<Vec<Tag>> {
         let connection = self.database.connection()?;
         Ok(tags::list_for_note(&connection, note_id)?)
+    }
+
+    // ------------------------------------------------------------ 修订对比
+
+    /// 某条修订的内容快照（`None` = 该修订没有快照）。
+    ///
+    /// **缺失与"空内容"是两回事**：迁移 `0003` 之前的修订没有快照，
+    /// 返回 `None`；而"空文档"会返回 `Some(空 Document)`。
+    /// 界面必须区分这两者，详见 [`RevisionDiff::MissingSnapshot`]。
+    ///
+    /// # Errors
+    ///
+    /// - 修订不存在 → [`CoreError::NotFound`]
+    /// - 快照字节损坏 → [`CoreError::Validation`]
+    pub fn revision_snapshot(&self, revision_id: &Id) -> CoreResult<Option<Document>> {
+        let connection = self.database.connection()?;
+        // 先确认修订存在——否则"没有快照"与"没有这条修订"会无法区分
+        if revisions::get(&connection, revision_id)?.is_none() {
+            return Err(CoreError::NotFound { entity: "revision" });
+        }
+        match revisions::get_document(&connection, revision_id)? {
+            Some(bytes) => Ok(Some(Document::from_bytes(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 比较两条修订的内容。
+    ///
+    /// ## 顺序约定
+    ///
+    /// 参数是 `(旧, 新)`，与 diff 工具的惯例一致。传反了不会报错，
+    /// 但差异会反向显示（"新增"变"删除"），因此调用方必须注意。
+    ///
+    /// ## 缺快照时**不返回空差异**
+    ///
+    /// 迁移 `0003` 之前的修订没有内容快照。那种情况返回
+    /// [`RevisionDiff::MissingSnapshot`]，而不是"零差异"——
+    /// 后者会让用户以为"这两版一模一样"，而事实是**我们不知道**。
+    /// 把"未知"说成"相同"是会误导人的错误。
+    ///
+    /// # Errors
+    ///
+    /// - 任一修订不存在 → [`CoreError::NotFound`]
+    /// - 快照字节损坏 → [`CoreError::Validation`]
+    pub fn diff_revisions(&self, old: &Id, new: &Id) -> CoreResult<RevisionDiff> {
+        let old_snapshot = self.revision_snapshot(old)?;
+        let new_snapshot = self.revision_snapshot(new)?;
+
+        let (old_revision, new_revision) = {
+            let connection = self.database.connection()?;
+            let old_revision = revisions::get(&connection, old)?
+                .ok_or(CoreError::NotFound { entity: "revision" })?;
+            let new_revision = revisions::get(&connection, new)?
+                .ok_or(CoreError::NotFound { entity: "revision" })?;
+            (old_revision, new_revision)
+        };
+
+        match nested_model::DiffOutcome::from_snapshots(
+            old_snapshot.as_ref(),
+            new_snapshot.as_ref(),
+        ) {
+            nested_model::DiffOutcome::Diff(diff) => Ok(RevisionDiff::Diff {
+                old: RevisionSummary::from(&old_revision),
+                new: RevisionSummary::from(&new_revision),
+                added: diff.added,
+                removed: diff.removed,
+                lines: diff
+                    .lines
+                    .into_iter()
+                    .map(|line| RevisionDiffLine {
+                        kind: match line.kind {
+                            nested_model::DiffKind::Unchanged => DiffLineKind::Unchanged,
+                            nested_model::DiffKind::Added => DiffLineKind::Added,
+                            nested_model::DiffKind::Removed => DiffLineKind::Removed,
+                        },
+                        text: line.text,
+                    })
+                    .collect(),
+            }),
+            nested_model::DiffOutcome::MissingSnapshot { side } => {
+                Ok(RevisionDiff::MissingSnapshot {
+                    old: RevisionSummary::from(&old_revision),
+                    new: RevisionSummary::from(&new_revision),
+                    old_missing: matches!(
+                        side,
+                        nested_model::DiffSide::Old | nested_model::DiffSide::Both
+                    ),
+                    new_missing: matches!(
+                        side,
+                        nested_model::DiffSide::New | nested_model::DiffSide::Both
+                    ),
+                })
+            }
+        }
+    }
+
+    /// 某篇笔记有多少条修订**带**内容快照。
+    ///
+    /// 界面用它区分"没有历史"与"历史存在但都是旧记录（无快照）"。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn revision_snapshot_count(&self, note_id: &Id) -> CoreResult<i64> {
+        let connection = self.database.connection()?;
+        Ok(revisions::count_documents_for_note(&connection, note_id)?)
     }
 
     // -------------------------------------------------------------- 回收站清理
@@ -1200,7 +1386,212 @@ mod tests {
 
     // ---------------------------------------------------------------- 笔记本树
 
-    /// 建一棵三层笔记本树：根 → 中 → 叶。
+    // ------------------------------------------------------------ 修订对比
+
+    /// 造一篇笔记并保存若干个版本，返回 (笔记 id, 各版本的修订 id)。
+    ///
+    /// 每次返回的修订 id 按版本**升序**，便于 `diff_revisions(&ids[0], &ids[1])` 这样写。
+    /// 造一篇笔记并依次保存若干版本，返回 (笔记 id, 各版本的修订 id)。
+    ///
+    /// 每个版本是**一组段落**（而不是一个字符串）——这是本辅助函数第一版的
+    /// 错误：它只把每版的第一个字符串当成一个段落，于是"两版共有的那一行"
+    /// 根本没进快照，diff 自然把它算成新增。
+    /// 段落数不同时 diff 的 added/removed 计数本来就会变，
+    /// 因此测试要按"哪些行出现"断言，而不是数行数。
+    ///
+    /// 返回的修订 id 按版本**升序**。
+    fn note_with_versions(core: &NestedCore, versions: &[&[&str]]) -> (Id, Vec<Id>) {
+        let device = core.device_id().expect("device");
+        let paragraphs = |texts: &[&str], at: i64| {
+            nested_model::Document::from_blocks(
+                texts.iter().map(|t| Block::paragraph(*t)).collect(),
+                at,
+            )
+        };
+
+        let first = versions[0];
+        let mut note = core
+            .create_note_with_document(None, first[0], paragraphs(first, NOW), &device, NOW)
+            .expect("create");
+
+        let mut ids = Vec::new();
+        for (index, texts) in versions.iter().enumerate() {
+            let at = NOW + i64::try_from(index).expect("small") * 1000;
+            if index > 0 {
+                note.touch(at);
+                note = core
+                    .save_note(note.clone(), paragraphs(texts, at), &device, at)
+                    .expect("save");
+            }
+            ids.push(core.revision_history(&note.id, 100).expect("history")[0].id);
+        }
+        // history 是版本倒序，翻正
+        ids.reverse();
+        (note.id, ids)
+    }
+
+    #[test]
+    fn every_write_produces_a_revision_with_a_snapshot() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (note_id, ids) = note_with_versions(&core, &[&["第一版"], &["第二版"], &["第三版"]]);
+
+        assert_eq!(ids.len(), 3, "三次写入应留下三条修订");
+        assert_eq!(
+            core.revision_snapshot_count(&note_id).expect("count"),
+            3,
+            "每条修订都必须有内容快照，否则对比功能对它是空的"
+        );
+    }
+
+    #[test]
+    fn diff_reports_added_and_removed_lines() {
+        let core = NestedCore::open_in_memory().expect("open");
+        // 注意要传三个版本：第 i 个参数对应第 i+1 版，而下面要比的是
+        // "第 2 版 → 第 4 版"。传少了会拿到错误的基线
+        // （本测试第一版就是这样，diff 出来 removed=0）。
+        let (note_id, ids) =
+            note_with_versions(&core, &[&["第一版"], &["旧内容", "共有的"], &["第三版"]]);
+        // 第 4 版换成 [新内容, 共有的]
+        let fourth = {
+            let device = core.device_id().expect("device");
+            let document = nested_model::Document::from_blocks(
+                vec![Block::paragraph("新内容"), Block::paragraph("共有的")],
+                NOW + 5000,
+            );
+            let mut note = core.get_note(&note_id).expect("note");
+            note.touch(NOW + 5000);
+            core.save_note(note, document, &device, NOW + 5000)
+                .expect("save");
+            core.revision_history(&note_id, 100).expect("history")[0].id
+        };
+
+        // ids[1] 是第 2 版（内容 = "旧内容"），fourth 是第 4 版
+        let diff = core.diff_revisions(&ids[1], &fourth).expect("diff");
+        match diff {
+            RevisionDiff::Diff {
+                added,
+                removed,
+                lines,
+                ..
+            } => {
+                // 按**语义**断言"哪些行出现了"，而不是数行数。
+                // 数行数会把"两版段落数不同"这类无关细节变成断言的一部分，
+                // 从而测出错误的失败（本测试第一版与第二版都栽在这里）。
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.kind == DiffLineKind::Removed && l.text == "旧内容"),
+                    "「旧内容」必须作为删除行出现，实际：{lines:?}"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.kind == DiffLineKind::Added && l.text == "新内容"),
+                    "「新内容」必须作为新增行出现，实际：{lines:?}"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.kind == DiffLineKind::Unchanged && l.text == "共有的"),
+                    "未改动的行必须保持 Unchanged，否则对比没有信息量。\
+                     实际差异：{}",
+                    lines
+                        .iter()
+                        .map(|l| format!("{:?}:{}", l.kind, l.text))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+                assert!(added >= 1 && removed >= 1, "两版确实有差异");
+            }
+            other @ RevisionDiff::MissingSnapshot { .. } => {
+                panic!("期望拿到差异，实际：{other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn diff_of_a_revision_with_itself_is_empty() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (_note_id, ids) = note_with_versions(&core, &[&["内容"]]);
+        let diff = core.diff_revisions(&ids[0], &ids[0]).expect("diff");
+        match diff {
+            RevisionDiff::Diff {
+                added,
+                removed,
+                lines,
+                ..
+            } => {
+                assert_eq!((added, removed), (0, 0));
+                assert!(lines.iter().all(|l| l.kind == DiffLineKind::Unchanged));
+            }
+            other @ RevisionDiff::MissingSnapshot { .. } => {
+                panic!("同一版本对比应当是空差异，实际：{other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_revision_without_snapshot_is_reported_as_missing_not_empty() {
+        // 迁移 0003 之前的历史修订没有快照。
+        // 这是本功能最容易出错的地方：把"没有快照"说成"没有差异"，
+        // 用户会以为两版内容相同，而事实是我们不知道。
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "老笔记", NOW).expect("create");
+
+        // ⚠ 必须先取"当前最新修订"，**再**插入 legacy。
+        // legacy 的 version 是 99，一旦插进去它自己就成最新的了，
+        // 再调 revision_history(...)[0] 拿到的会是 legacy 本身——
+        // 于是变成"legacy 和自己比"，两边都缺快照，断言随之失败。
+        // 本测试前两版都栽在这个顺序上，所以把取 id 放在最前面。
+        let current = core.revision_history(&note.id, 100).expect("history")[0].id;
+
+        // 手工造一条"没有快照"的修订，模拟迁移前的数据
+        let legacy =
+            nested_model::Revision::new(note.id, 99, None, "old-device", "note.update", NOW + 1);
+        {
+            let connection = core.database.connection().expect("conn");
+            nested_db::repositories::revisions::insert(&connection, &legacy).expect("insert");
+        }
+
+        assert_eq!(
+            core.revision_snapshot(&legacy.id).expect("snapshot"),
+            None,
+            "没有快照必须返回 None，不能退化成空文档"
+        );
+        assert!(
+            core.revision_snapshot(&current)
+                .expect("snapshot")
+                .is_some(),
+            "前置条件：当前修订必须有快照"
+        );
+
+        let diff = core.diff_revisions(&current, &legacy.id).expect("diff");
+        match diff {
+            RevisionDiff::MissingSnapshot {
+                old_missing,
+                new_missing,
+                ..
+            } => {
+                assert!(new_missing, "legacy 修订缺快照");
+                assert!(!old_missing, "当前修订应当有快照");
+            }
+            RevisionDiff::Diff { added, removed, .. } => panic!(
+                "缺快照绝不能被当成差异（added={added} removed={removed}）——\
+                 那会让用户以为两版内容一样"
+            ),
+        }
+    }
+
+    #[test]
+    fn snapshot_of_missing_revision_is_not_found() {
+        let core = NestedCore::open_in_memory().expect("open");
+        assert!(matches!(
+            core.revision_snapshot(&Id::new()),
+            Err(CoreError::NotFound { .. })
+        ));
+    }
+
+    /// 建一棵三层笔记本树：根 → 中 → 叶。    /// 建一棵三层笔记本树：根 → 中 → 叶。
     fn notebook_tree(core: &NestedCore) -> (Id, Id, Id) {
         let root = core.create_notebook("根", None, NOW).expect("root");
         let mid = core.create_notebook("中", Some(root.id), NOW).expect("mid");

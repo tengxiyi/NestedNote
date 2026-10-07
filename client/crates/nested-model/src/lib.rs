@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod block;
+mod diff;
 mod document;
 mod entity;
 mod error;
@@ -20,6 +21,10 @@ mod id;
 mod time;
 
 pub use block::{Block, BlockKind, InlineMark, ListItem, TableCell, TableRow};
+pub use diff::{
+    DiffKind, DiffLine, DiffOutcome, DiffSide, DocumentDiff, diff_documents, diff_lines,
+    flatten_lines,
+};
 pub use document::{DOCUMENT_FORMAT_VERSION, Document, DocumentMetadata};
 pub use entity::{
     Attachment, MAX_FILENAME_CHARS, MAX_NOTEBOOK_NAME_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_NAME_CHARS,

@@ -42,6 +42,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0002_sync_operations_entity",
         sql: include_str!("../../../migrations/0002_sync_operations_entity.sql"),
     },
+    // 0003：为修订保存内容快照（"修订对比"的数据基础）。
+    // 起因：`revisions` 只存元数据，没有内容可对比。
+    // 决策依据：docs/adr/0001-修订内容用完整快照.md
+    Migration {
+        version: 3,
+        name: "0003_revision_documents",
+        sql: include_str!("../../../migrations/0003_revision_documents.sql"),
+    },
 ];
 
 /// 当前程序支持的最高数据库版本。
