@@ -70,11 +70,36 @@ impl From<nested_db::DbError> for CoreError {
     fn from(error: nested_db::DbError) -> Self {
         match error {
             nested_db::DbError::WouldCreateCycle => Self::WouldCreateCycle,
+            // 仓储层的"冲突"是**语义化**的拒绝（重名、有活着的引用、
+            // 已经不处于可删状态），不是数据库故障。
+            //
+            // 映射成 `Database` 会让界面把它显示成"数据库错误"，
+            // 而用户真正需要看到的是"这个目录里还有笔记，不能彻底删除"。
+            // 错误分类不只是给日志看的，它决定界面怎么向用户解释
+            // （铁律 E2：失败要能引导用户下一步怎么做）。
+            nested_db::DbError::Conflict { entity } => Self::Conflict(format!(
+                "{} 当前状态不允许这个操作",
+                entity_display_name(entity)
+            )),
             other => Self::Database(other),
         }
     }
 }
 
+/// 把仓储层的实体名换成用户看得懂的说法。
+///
+/// 仓储层用英文表名（`"note"`、`"notebook"`），直接拼进提示会是
+/// "note 当前状态不允许这个操作"——用户不知道 note 是什么。
+const fn entity_display_name(entity: &str) -> &'static str {
+    match entity.as_bytes() {
+        b"note" => "笔记",
+        b"notebook" => "笔记本",
+        b"tag" => "标签",
+        b"attachment" => "附件",
+        // 未知实体不猜，给一个中性说法
+        _ => "该对象",
+    }
+}
 impl CoreError {
     /// 稳定错误码（UI 与日志共用，铁律 E3）。
     #[must_use]
@@ -99,18 +124,38 @@ impl CoreError {
     }
 
     /// 面向用户的简短建议（UI 直接展示，**不含**内部细节，铁律 E2）。
+    ///
+    /// ## 为什么 [`Self::Conflict`] 走它自己的那句话
+    ///
+    /// 其余变体的提示是**静态**的（"请检查网络连接后重试"），
+    /// 但"冲突"的原因千差万别，一句话概括不了：
+    ///
+    /// - 标签重名 → "标签名称已存在"
+    /// - 目录里还有没删的笔记 → "这个目录里还有笔记，不能彻底删除"
+    /// - 目录下还有子目录 → "先删掉它下面的子目录"
+    ///
+    /// 曾经这里对冲突一律返回"内容已被其他设备修改，请查看冲突副本"。
+    /// 那个提示**完全是误导**：用户删一个目录被拒，却被告知"别的设备改过它"。
+    /// 更糟的是排查时看到的 hint 是"请尝试重启应用；若从备份恢复数据"——
+    /// 用户会以为数据损坏了，而真实原因只是"目录里还有子目录"。
+    ///
+    /// 因此 `Conflict` 携带的那句话就是给用户看的，直接用；
+    /// 只有确实没有上下文时才退回通用提示。
     #[must_use]
-    pub const fn user_hint(&self) -> &'static str {
+    pub fn user_hint(&self) -> String {
         match self {
-            Self::Database(_) => "请尝试重启应用；若问题持续，请从备份恢复数据。",
-            Self::Validation(_) => "请检查输入内容后重试。",
-            Self::NotFound { .. } => "该内容可能已被删除或移动。",
-            Self::Config(_) => "请检查设置中的数据目录是否可写。",
-            Self::Conflict(_) => "内容已被其他设备修改，请查看冲突副本。",
-            Self::Permission(_) => "请授予所需权限后重试。",
-            Self::Network(_) => "请检查网络连接后重试。",
-            Self::WouldCreateCycle => "请选择另一个位置：目标笔记本在当前笔记本的内部。",
-            Self::NotImplemented(_) => "该功能将在后续版本提供。",
+            Self::Database(_) => "请尝试重启应用；若问题持续，请从备份恢复数据。".to_owned(),
+            Self::Validation(_) => "请检查输入内容后重试。".to_owned(),
+            Self::NotFound { .. } => "该内容可能已被删除或移动。".to_owned(),
+            Self::Config(_) => "请检查设置中的数据目录是否可写。".to_owned(),
+            Self::Conflict(detail) if detail.is_empty() => {
+                "操作被拒绝：相关内容当前的状态不允许这么做。".to_owned()
+            }
+            Self::Conflict(detail) => detail.clone(),
+            Self::Permission(_) => "请授予所需权限后重试。".to_owned(),
+            Self::Network(_) => "请检查网络连接后重试。".to_owned(),
+            Self::WouldCreateCycle => "请选择另一个位置：目标笔记本在当前笔记本的内部。".to_owned(),
+            Self::NotImplemented(_) => "该功能将在后续版本提供。".to_owned(),
         }
     }
 }

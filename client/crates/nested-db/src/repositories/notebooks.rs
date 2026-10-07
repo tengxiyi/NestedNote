@@ -182,6 +182,64 @@ pub fn soft_delete(
     Ok(())
 }
 
+/// 把笔记本及**整棵子树**移入回收站（铁律 T7）。
+///
+/// ## 为什么"只删一个节点"是错的
+///
+/// 笔记本是一棵树。只把父节点标记为删除，子节点仍指向它：
+///
+/// - `list_notebook_tree` 会因为"父节点不存在"而**把子节点归到顶层**，
+///   于是它们在左栏里**跳出来**——用户看到的是目录结构错乱；
+/// - 恢复父节点时，子节点状态不明，树里会出现"看不见的分支"。
+///
+/// 因此删除必须是**整棵子树**的动作，与 [`restore_subtree`] 对称。
+///
+/// 只标记**仍在使用的**节点，重复调用无副作用（幂等）。
+///
+/// # Errors
+///
+/// 笔记本不存在时返回 [`DbError::NotFound`]。
+pub fn soft_delete_subtree(
+    connection: &mut Connection,
+    id: &Id,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<u64, DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    let exists: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM notebooks WHERE id = ?1",
+            params![id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Err(DbError::NotFound { entity: "notebook" });
+    }
+
+    let changed = transaction.execute(
+        "WITH RECURSIVE subtree(id) AS (
+             SELECT id FROM notebooks WHERE id = ?1
+             UNION
+             SELECT n.id FROM notebooks n JOIN subtree s ON n.parent_id = s.id
+         )
+         UPDATE notebooks SET deleted_at_ms = ?2, updated_at_ms = ?2
+          WHERE id IN (SELECT id FROM subtree) AND deleted_at_ms IS NULL",
+        params![id.as_bytes(), at_ms],
+    )?;
+
+    crate::repositories::sync_operations::enqueue(
+        &transaction,
+        id,
+        device_id,
+        "notebook.delete",
+        at_ms,
+    )?;
+    transaction.commit()?;
+    Ok(u64::try_from(changed).unwrap_or(u64::MAX))
+}
+
 /// 把笔记本移动到另一个父节点下（`new_parent` 为 `None` 表示移到顶层）。
 ///
 /// ## 为什么要在这里做环检测，而不是交给调用方
@@ -355,6 +413,187 @@ pub fn purge_deleted_before(
                 SELECT 1 FROM notebooks AS child WHERE child.parent_id = notebooks.id
             )",
         params![deleted_before_ms],
+    )?;
+
+    transaction.commit()?;
+    Ok(u64::try_from(changed).unwrap_or(u64::MAX))
+}
+
+/// 列出**全部**笔记本，含已删除的。
+///
+/// 与 [`list_all`]（只给未删除的）分开而不是加个布尔参数：
+/// "给界面看的清单"与"清理时要遍历的全集"是两种用途，
+/// 混在一起最容易出的错就是**界面不小心把回收站里的东西也列出来**。
+///
+/// 排序与 [`list_all`] 一致（`name ASC`）。
+///
+/// # Errors
+///
+/// 查询失败时返回 [`DbError::Sqlite`]。
+pub fn list_all_including_deleted(connection: &Connection) -> Result<Vec<Notebook>, DbError> {
+    let sql = format!("SELECT {COLUMNS} FROM notebooks ORDER BY name ASC");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([], map_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+}
+
+/// **彻底删除**一个笔记本及其在其中的笔记（不可逆）。
+///
+/// ## 为什么"跳过有子节点"不够：一个会让数据永久滞留的设计
+///
+/// [`purge_deleted_before`] 刻意跳过"仍有子笔记本引用"的行。那样确实
+/// 不会产生孤儿节点——但它导致**父笔记本永远删不掉**：
+///
+/// 1. 父在回收站、子在回收站（可能还没到期）；
+/// 2. 父因"有子节点"被跳过；
+/// 3. 等子也到期、子被删掉，父在这一轮已经处理过了；
+/// 4. 于是父**每轮都被跳过**，永久滞留。
+///
+/// 本项目的真实数据里积了 **49 个**这样的笔记本，而**界面上完全没有
+/// 入口**能看到或清掉它们（回收站只列笔记）。用户看到的现象是
+/// "目录树丢了，而且在回收站里删不掉任何东西"。
+///
+/// 正确做法是**由调用方按深度从深到浅**逐个调用本函数：
+/// 先删叶子（无子节点，可直接删），再删它的父，依此类推。
+/// 这样每一步都不产生孤儿，也没有"永远跳过"的对象。
+///
+/// ## 连带删除的内容与顺序
+///
+/// 该笔记本里的笔记会被一并彻底删除，含文档、修订与修订快照。
+/// 顺序不能颠倒（外键）：
+///
+/// 1. `revision_documents`（指向 `revisions`）
+/// 2. `revisions` / `documents`
+/// 3. `note_tags` / `note_attachments`（关联表）
+/// 4. `notes`
+/// 5. `notebooks`
+///
+/// 附件**字节不进数据库**（内容寻址，铁律 T8），这里只删关联行；
+/// 字节由 GC 按引用计数回收（技术债 #23）。
+///
+/// # Errors
+///
+/// 仍挂着**未删除的**笔记或子笔记本时返回 [`DbError::Conflict`]——
+/// 那说明调用方跳过了更深的层，删下去就会删掉用户还在用的数据。
+/// 笔记本不存在时返回 [`DbError::NotFound`]。
+pub fn purge_one(connection: &mut Connection, id: &Id) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    let found: Option<Option<i64>> = transaction
+        .query_row(
+            "SELECT deleted_at_ms FROM notebooks WHERE id = ?1",
+            params![id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(deleted_at_ms) = found else {
+        return Err(DbError::NotFound { entity: "notebook" });
+    };
+    if deleted_at_ms.is_none() {
+        // 未删除的笔记本不能走"彻底删除"这条不可逆路径。
+        // 这是刻意留的护栏：否则这个接口就成了"删任何笔记本"的通用入口，
+        // 与 notes::purge_one 只接受回收站里的笔记是同一个原则。
+        return Err(DbError::Conflict { entity: "notebook" });
+    }
+
+    let still_live: i64 = transaction.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM notes WHERE notebook_id = ?1 AND deleted_at_ms IS NULL)
+          + (SELECT COUNT(*) FROM notebooks WHERE parent_id = ?1 AND deleted_at_ms IS NULL)",
+        params![id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if still_live > 0 {
+        return Err(DbError::Conflict { entity: "notebook" });
+    }
+
+    let note_ids: Vec<Vec<u8>> = {
+        let mut statement = transaction.prepare("SELECT id FROM notes WHERE notebook_id = ?1")?;
+        let rows = statement.query_map(params![id.as_bytes()], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for note_id in &note_ids {
+        // 四条显式语句，不按表名循环拼接（铁律 Q4）
+        transaction.execute(
+            "DELETE FROM revision_documents
+              WHERE revision_id IN (SELECT id FROM revisions WHERE note_id = ?1)",
+            params![note_id],
+        )?;
+        transaction.execute("DELETE FROM revisions WHERE note_id = ?1", params![note_id])?;
+        transaction.execute("DELETE FROM documents WHERE note_id = ?1", params![note_id])?;
+        transaction.execute("DELETE FROM note_tags WHERE note_id = ?1", params![note_id])?;
+        transaction.execute(
+            "DELETE FROM note_attachments WHERE note_id = ?1",
+            params![note_id],
+        )?;
+        transaction.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
+    }
+
+    transaction
+        .execute(
+            "DELETE FROM notebooks WHERE id = ?1",
+            params![id.as_bytes()],
+        )
+        .map_err(|error| match error {
+            // 外键失败（SQLite 787）= 还有子笔记本指向它。
+            //
+            // ## 为什么在这里翻译，而不是让上层去看 SQLite 错误码
+            //
+            // 上层（`nested-core`）不依赖 rusqlite——那正是分层的意义。
+            // 而且"外键 787"对上层是**实现细节**：它真正要知道的是
+            // "这个笔记本还被引用着，删不掉"。
+            //
+            // 不翻译的后果很实在：错误会一路落到 `CoreError::Database`，
+            // 界面上显示"请尝试重启应用；若问题持续，请从备份恢复数据"——
+            // 用户会以为数据损坏，而真实原因只是"先删子目录"。
+            rusqlite::Error::SqliteFailure(inner, _) if inner.extended_code == 787 => {
+                DbError::Conflict { entity: "notebook" }
+            }
+            other => DbError::from(other),
+        })?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 从回收站恢复一个笔记本（软删除的反操作）。
+///
+/// ## 为什么要连整棵子树一起恢复
+///
+/// 子笔记本的父指针指向它。若只恢复父节点，子节点仍是删除状态，
+/// 于是树里出现"一个已恢复的节点下面挂着看不见的分支"——
+/// 用户会以为子目录丢了。
+///
+/// 因此恢复是**整棵子树**的动作，与删除对称（删除也是整棵子树）。
+/// 只恢复已删除的节点，不动本来就在用的（幂等，重复调用无副作用）。
+///
+/// # Errors
+///
+/// 笔记本不存在时返回 [`DbError::NotFound`]。
+pub fn restore_subtree(connection: &mut Connection, id: &Id) -> Result<u64, DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    let exists: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM notebooks WHERE id = ?1",
+            params![id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Err(DbError::NotFound { entity: "notebook" });
+    }
+
+    // 递归 CTE 一次拿到整棵子树，避免在 Rust 里反复查库
+    let changed = transaction.execute(
+        "WITH RECURSIVE subtree(id) AS (
+             SELECT id FROM notebooks WHERE id = ?1
+             UNION
+             SELECT n.id FROM notebooks n JOIN subtree s ON n.parent_id = s.id
+         )
+         UPDATE notebooks SET deleted_at_ms = NULL
+          WHERE id IN (SELECT id FROM subtree) AND deleted_at_ms IS NOT NULL",
+        params![id.as_bytes()],
     )?;
 
     transaction.commit()?;

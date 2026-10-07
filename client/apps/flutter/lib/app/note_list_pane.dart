@@ -6,12 +6,15 @@
 //! 中栏**只**负责"当前过滤条件下的笔记列表"。它不关心树的形状，
 //! 也不渲染笔记内容。因此切换笔记本时只有这里与右栏需要重建。
 //!
-//! ## 回收站视图的两处特殊处理
+//! ## 回收站视图的三处特殊处理
 //!
 //! 1. 展示**全部**笔记本的已删除笔记，而不是"当前笔记本里的已删除笔记"——
 //!    否则用户会以为"只删了当前笔记本里的"，找不到别处删的东西。
 //! 2. 每行显示**剩余保留天数**。删除是不可逆流程的起点，
 //!    用户必须能看见倒计时（见 `core/trash_providers.dart`）。
+//! 3. **可多选批量彻底删除**，并且**列出已删除的目录**——
+//!    目录同样能被删除，而它曾经完全没有恢复入口，
+//!    用户把它删掉后就再也找不回来了（见 `trashedNotebooksProvider`）。
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -20,12 +23,12 @@ import '../core/notebook_providers.dart';
 import '../core/note_providers.dart';
 import '../core/trash_providers.dart';
 import 'dialogs.dart';
+import 'icons.dart';
 import 'notebook_sidebar.dart';
 import 'tag_editor.dart';
-import 'icons.dart';
 
 /// 中栏：当前笔记本下的笔记列表。
-class NoteListPane extends ConsumerWidget {
+class NoteListPane extends ConsumerStatefulWidget {
   /// 构造。
   const NoteListPane({
     required this.showDeleted,
@@ -44,14 +47,41 @@ class NoteListPane extends ConsumerWidget {
   final ValueChanged<String?> onOpenNote;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<NoteListPane> createState() => _NoteListPaneState();
+}
+
+class _NoteListPaneState extends ConsumerState<NoteListPane> {
+  /// 回收站中已勾选的笔记。
+  ///
+  /// ## 为什么是本地状态而不是 provider
+  ///
+  /// 勾选是**纯界面状态**：退出回收站就该忘掉。放进 provider 会带来
+  /// "离开后又回来，上次勾的还在"这种惊吓——而勾选意味着**不可逆删除**，
+  /// 让用户看到一批他没主动选的、即将被销毁的条目是最糟的体验。
+  final Set<String> _selected = <String>{};
+
+  /// 是否处于多选模式。
+  ///
+  /// 与"勾了几条"分开：多选模式下**允许勾 0 条**，否则用户
+  /// 取消最后一条勾选时模式会意外退出。
+  bool _selecting = false;
+
+  void _exitSelection() {
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final String? notebookId = ref.watch(selectedNotebookIdProvider);
     final String? notebookName = ref.watch(selectedNotebookNameProvider);
     final NoteListQuery query = NoteListQuery(
       // 回收站视图展示**全部**笔记本的已删除笔记，
       // 否则用户会以为"只删了当前笔记本里的"
-      notebookId: showDeleted ? null : notebookId,
-      includeDeleted: showDeleted,
+      notebookId: widget.showDeleted ? null : notebookId,
+      includeDeleted: widget.showDeleted,
     );
     // 用**合并视图**而不是原始查询结果：刚保存过的笔记会在这里被叠加，
     // 因此保存时列表不重查、不重排 → 中栏不闪、滚动位置不跳。
@@ -64,8 +94,14 @@ class NoteListPane extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        _header(context, ref, notes, notebookName, notebookId, theme),
+        if (widget.showDeleted && _selecting)
+          _selectionBar(notes.value ?? const <NoteItem>[], theme)
+        else
+          _header(context, notes, notebookName, notebookId, theme),
         const Divider(height: 1),
+        // 回收站视图额外列出"已删除的目录"。目录曾经完全没有恢复入口，
+        // 用户删掉后就再也找不回来（见 trashedNotebooksProvider 的说明）。
+        if (widget.showDeleted) const _TrashedNotebooksSection(),
         Expanded(
           child: switch (notes) {
             AsyncLoading() => const Center(child: CircularProgressIndicator()),
@@ -74,17 +110,37 @@ class NoteListPane extends ConsumerWidget {
               child: Text('$error', style: theme.textTheme.bodySmall),
             ),
             AsyncData(:final List<NoteItem> value) when value.isEmpty =>
-              _EmptyNoteList(showDeleted: showDeleted),
+              _EmptyNoteList(showDeleted: widget.showDeleted),
             AsyncData(:final List<NoteItem> value) => ListView.builder(
               itemCount: value.length,
               itemBuilder: (BuildContext context, int index) {
                 final NoteItem note = value[index];
                 return _NoteRow(
                   note: note,
-                  selected: note.id == openNoteId,
-                  retentionDays: showDeleted ? retention : null,
-                  onTap: () => onOpenNote(note.id),
-                  onLongPress: () => _noteMenu(context, ref, note, retention),
+                  selected: note.id == widget.openNoteId,
+                  retentionDays: widget.showDeleted ? retention : null,
+                  // 多选模式下显示勾选框，点击即勾选（而不是打开笔记）
+                  selectable: widget.showDeleted && _selecting,
+                  checked: _selected.contains(note.id),
+                  onTap: () {
+                    if (widget.showDeleted && _selecting) {
+                      _toggle(note.id);
+                    } else {
+                      widget.onOpenNote(note.id);
+                    }
+                  },
+                  onLongPress: () {
+                    if (widget.showDeleted) {
+                      // 长按进入多选并勾上这一条——这是移动端与桌面端
+                      // 都通行的"批量选择"起手式，比先找一个"选择"按钮快
+                      setState(() {
+                        _selecting = true;
+                        _selected.add(note.id);
+                      });
+                    } else {
+                      _noteMenu(context, note, retention);
+                    }
+                  },
                 );
               },
             ),
@@ -94,9 +150,113 @@ class NoteListPane extends ConsumerWidget {
     );
   }
 
+  void _toggle(String id) {
+    setState(() {
+      if (!_selected.remove(id)) {
+        _selected.add(id);
+      }
+    });
+  }
+
+  /// 多选模式下顶部的操作条。
+  Widget _selectionBar(List<NoteItem> visible, ThemeData theme) {
+    // 只统计**当前列表里**勾中的：切走再回来时列表可能变了，
+    // 留着已被过滤掉的 id 会让"已选 3 条"与实际可见的对不上。
+    final Set<String> visibleIds = visible.map((NoteItem n) => n.id).toSet();
+    final int count = _selected.intersection(visibleIds).length;
+    final bool allSelected = visible.isNotEmpty && count == visibleIds.length;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(6, 6, 6, 6),
+      child: Row(
+        children: <Widget>[
+          IconButton(
+            tooltip: '退出多选',
+            visualDensity: VisualDensity.compact,
+            onPressed: _exitSelection,
+            icon: const Icon(Icons.close, size: 20),
+          ),
+          Expanded(
+            child: Text('已选 $count 条', style: theme.textTheme.titleSmall),
+          ),
+          TextButton(
+            onPressed: visible.isEmpty
+                ? null
+                : () => setState(() {
+                    if (allSelected) {
+                      _selected.removeAll(visibleIds);
+                    } else {
+                      _selected.addAll(visibleIds);
+                    }
+                  }),
+            child: Text(allSelected ? '取消全选' : '全选'),
+          ),
+          const SizedBox(width: 4),
+          FilledButton.tonal(
+            // 一条都没勾时禁用，而不是弹一个"请先选择"——
+            // 按钮变灰本身就说明了原因，少一次打断。
+            onPressed: count == 0
+                ? null
+                : () => _purgeSelected(_selected.intersection(visibleIds)),
+            style: FilledButton.styleFrom(
+              backgroundColor: theme.colorScheme.errorContainer,
+              foregroundColor: theme.colorScheme.onErrorContainer,
+            ),
+            child: const Text('彻底删除'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 批量彻底删除，**一次确认**，然后如实回报逐条结果。
+  Future<void> _purgeSelected(Set<String> ids) async {
+    final bool confirmed = await confirmDestructive(
+      context,
+      title: '彻底删除 ${ids.length} 条？',
+      message:
+          '这些笔记将被**永久删除**，无法恢复。\n\n'
+          '如果只是想清空位置，可以先不用管——它们会在保留期结束后自动删除。',
+      confirmLabel: '彻底删除',
+    );
+    if (!confirmed || !mounted) {
+      return;
+    }
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    try {
+      final BatchPurgeOutcome outcome = await ref
+          .read(trashActionsProvider)
+          .purgeMany(ids.toList());
+      if (!mounted) {
+        return;
+      }
+      // 部分成功时**保留**失败的那些勾选，让用户能立刻看到还剩什么没删、
+      // 再决定怎么办。全部成功才清空并退出多选。
+      setState(() {
+        if (outcome.allSucceeded) {
+          _exitSelection();
+          return;
+        }
+        // 成功删掉的从勾选里移除；失败的留着——
+        // 界面上它们还在列表里，勾选也就该还在，否则用户会以为
+        // "我勾了 5 条，删完一条都没勾，是不是都没删？"
+        _selected.removeAll(ids);
+        // 凑巧全部失败时至少要留下点什么可操作：保持多选模式即
+        // 让用户能直接重试或取消。
+      });
+      messenger.showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 6),
+          content: Text(outcome.summary),
+        ),
+      );
+    } on NoteFailure catch (failure) {
+      messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
+    }
+  }
+
   Widget _header(
     BuildContext context,
-    WidgetRef ref,
     AsyncValue<List<NoteItem>> notes,
     String? notebookName,
     String? notebookId,
@@ -111,7 +271,7 @@ class NoteListPane extends ConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  showDeleted ? '回收站' : (notebookName ?? '全部笔记'),
+                  widget.showDeleted ? '回收站' : (notebookName ?? '全部笔记'),
                   style: theme.textTheme.titleSmall,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -124,23 +284,24 @@ class NoteListPane extends ConsumerWidget {
             ),
           ),
           IconButton(
-            tooltip: showDeleted ? '回收站中不能新建' : '在此新建笔记',
+            tooltip: widget.showDeleted ? '回收站中不能新建' : '在此新建笔记',
             visualDensity: VisualDensity.compact,
-            onPressed: showDeleted
-                ? null
-                : () => _createNote(context, ref, notebookId),
-            icon: const Icon(kNewNoteIcon, size: 20),
+            // 回收站里除了"新建"，还提供**进入多选**的入口。
+            // 长按也能进，但桌面用户习惯找按钮，两个都给。
+            onPressed: widget.showDeleted
+                ? () => setState(() => _selecting = true)
+                : () => _createNote(context, notebookId),
+            icon: Icon(
+              widget.showDeleted ? Icons.checklist : kNewNoteIcon,
+              size: 20,
+            ),
           ),
         ],
       ),
     );
   }
 
-  Future<void> _createNote(
-    BuildContext context,
-    WidgetRef ref,
-    String? notebookId,
-  ) async {
+  Future<void> _createNote(BuildContext context, String? notebookId) async {
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     try {
       final CreatedNote created = await ref
@@ -157,7 +318,7 @@ class NoteListPane extends ConsumerWidget {
       if (landed != null && landed != notebookId) {
         ref.read(selectedNotebookIdProvider.notifier).select(landed);
       }
-      onOpenNote(created.id);
+      widget.onOpenNote(created.id);
     } on NoteFailure catch (failure) {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }
@@ -173,11 +334,10 @@ class NoteListPane extends ConsumerWidget {
   /// 用户在正常列表里删东西时期望的是"先放起来"，不是"立刻销毁"。
   Future<void> _noteMenu(
     BuildContext context,
-    WidgetRef ref,
     NoteItem note,
     int retention,
   ) async {
-    final List<ContextMenuItem<String>> items = showDeleted
+    final List<ContextMenuItem<String>> items = widget.showDeleted
         ? const <ContextMenuItem<String>>[
             ContextMenuItem<String>(
               value: 'open',
@@ -254,15 +414,15 @@ class NoteListPane extends ConsumerWidget {
     try {
       switch (action) {
         case 'open':
-          onOpenNote(note.id);
+          widget.onOpenNote(note.id);
         case 'restore':
           await ref.read(noteActionsProvider).restore(note.id);
         case 'purge':
           await _purgeNote(context, ref, note);
         case 'delete':
           await ref.read(noteActionsProvider).delete(note.id);
-          if (openNoteId == note.id) {
-            onOpenNote(null);
+          if (widget.openNoteId == note.id) {
+            widget.onOpenNote(null);
           }
           _notifyMovedToTrash(messenger, retention);
         case 'move':
@@ -311,7 +471,7 @@ class NoteListPane extends ConsumerWidget {
           label: '打开副本',
           // 用返回值里的 id，而不是自己拼——与标签复活同理，
           // 调用方不该假设自己知道新实体的 id
-          onPressed: () => onOpenNote(newId),
+          onPressed: () => widget.onOpenNote(newId),
         ),
       ),
     );
@@ -337,8 +497,8 @@ class NoteListPane extends ConsumerWidget {
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     try {
       await ref.read(noteActionsProvider).purge(note.id);
-      if (openNoteId == note.id) {
-        onOpenNote(null);
+      if (widget.openNoteId == note.id) {
+        widget.onOpenNote(null);
       }
       messenger.showSnackBar(const SnackBar(content: Text('已彻底删除。')));
     } on NoteFailure catch (failure) {
@@ -433,6 +593,8 @@ class _NoteRow extends StatelessWidget {
     required this.onTap,
     required this.onLongPress,
     this.retentionDays,
+    this.selectable = false,
+    this.checked = false,
   });
 
   final NoteItem note;
@@ -442,6 +604,12 @@ class _NoteRow extends StatelessWidget {
 
   /// 非 null 时显示"还剩 N 天"（回收站视图用）。
   final int? retentionDays;
+
+  /// 是否处于多选模式（左侧显示勾选框）。
+  final bool selectable;
+
+  /// 是否已勾选。
+  final bool checked;
 
   @override
   Widget build(BuildContext context) {
@@ -480,6 +648,9 @@ class _NoteRow extends StatelessWidget {
       onLongPress: onLongPress,
       onSecondaryTap: onLongPress,
       child: Container(
+        // 多选模式下已勾选的行用一层淡色铺底，与"当前打开的笔记"
+        // 用**不同的视觉通道**：一个是背景色块（打开），
+        // 一个是勾选框（选中）。两者同时存在时用户能分辨。
         color: selected ? theme.colorScheme.primaryContainer : null,
         padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
         child: Column(
@@ -487,6 +658,22 @@ class _NoteRow extends StatelessWidget {
           children: <Widget>[
             Row(
               children: <Widget>[
+                if (selectable) ...<Widget>[
+                  // 勾选框而不是"整行变色"：不可逆删除需要一个
+                  // **明确的、可复核的**选中标记。整行变色在密集列表里
+                  // 容易看漏一条，而勾选框一眼能数清。
+                  SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: Checkbox(
+                      value: checked,
+                      visualDensity: VisualDensity.compact,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      onChanged: (_) => onTap(),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
                 // 笔记图标：**任何位置都用 kNoteIcon**（规则 1）。
                 // 回收站里的笔记形状不变，只改颜色（规则 3）——
                 // 若改成垃圾桶图标，用户会以为"这是一条删除操作"而不是"一篇被删的笔记"。
@@ -565,6 +752,182 @@ class _NoteRow extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// 回收站里"已删除的目录"区块。
+///
+/// ## 为什么必须有它（一条真实的数据丢失路径）
+///
+/// 目录（笔记本）能被删除，但回收站**只列笔记**，于是目录没有任何
+/// 恢复入口。用户把目录删掉后，它就从左栏永久消失了——连带它下面的
+/// 整棵子树（子目录与笔记都还在库里，只是看不见）。
+///
+/// 用户报的原话是"会导致笔记的目录树丢失"。
+///
+/// ## 为什么每行是一个扁平的 Chip 列表
+///
+/// 已删除的目录之间**父指针可能指向另一个已删除的目录**，
+/// 拼成一棵树要处理"父节点也删了/父节点还活着"等一堆情况，
+/// 而且用户在回收站里关心的是"哪个目录被我删了"，
+/// 不是"它们的层级关系"。扁平列出更直接，也更容易逐条恢复。
+class _TrashedNotebooksSection extends ConsumerWidget {
+  const _TrashedNotebooksSection();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final AsyncValue<List<TrashedNotebookItem>> trashed = ref.watch(
+      trashedNotebooksProvider,
+    );
+    final ThemeData theme = Theme.of(context);
+
+    // 加载中与出错都**不占位**：这一块是附加信息，
+    // 为它显示骨架屏或错误条会干扰下面真正的主体（笔记列表）。
+    // 出错时确实少了信息，但静默降级比在中栏顶部插一条红色错误更不打扰。
+    final List<TrashedNotebookItem> items =
+        trashed.value ?? const <TrashedNotebookItem>[];
+    if (items.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final int retention = ref.watch(trashRetentionDaysProvider).value ?? 0;
+
+    return Container(
+      color: theme.colorScheme.surfaceContainerHighest,
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              const Icon(kRecycleBinIcon, size: 15),
+              const SizedBox(width: 6),
+              Text(
+                '已删除的目录（${items.length}）',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          for (final TrashedNotebookItem item in items)
+            _TrashedNotebookRow(item: item, retentionDays: retention),
+        ],
+      ),
+    );
+  }
+}
+
+/// 回收站里的一个目录（一行）。
+class _TrashedNotebookRow extends ConsumerWidget {
+  const _TrashedNotebookRow({required this.item, required this.retentionDays});
+
+  final TrashedNotebookItem item;
+  final int retentionDays;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final ThemeData theme = Theme.of(context);
+    final TrashAge age = trashAgeOf(
+      deletedAtMs: item.deletedAtMs,
+      retentionDays: retentionDays,
+      nowMs: DateTime.now().millisecondsSinceEpoch,
+    );
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: <Widget>[
+          // 目录图标：与左栏**同一套**（规则 1/2），一眼看出这是目录不是笔记。
+          // 回收站里层级关系不重要（父目录可能也删了），因此固定用第一层的
+          // 变体，不做深度区分——否则一个已删子目录会显示成"打开的书包"，
+          // 反而让人以为它还在树里某个确定位置。
+          const Icon(kNotebookRootIcon, size: 15),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  item.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall,
+                ),
+                Text(
+                  age.expired ? '已过期，下次启动将清理' : '还剩 ${age.remainingDays} 天',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: age.expired
+                        ? theme.colorScheme.error
+                        : theme.colorScheme.outline,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          TextButton(
+            onPressed: () => _restore(context, ref),
+            child: const Text('恢复'),
+          ),
+          IconButton(
+            tooltip: '彻底删除这个目录',
+            visualDensity: VisualDensity.compact,
+            onPressed: () => _purge(context, ref),
+            icon: Icon(
+              kRecycleBinIcon,
+              size: 18,
+              color: theme.colorScheme.error,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _restore(BuildContext context, WidgetRef ref) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref.read(trashActionsProvider).restoreNotebook(item.id);
+      messenger.showSnackBar(
+        SnackBar(content: Text('已恢复目录「${item.name}」及其子目录。')),
+      );
+    } on NoteFailure catch (failure) {
+      messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
+    }
+  }
+
+  /// 彻底删除一个目录。
+  ///
+  /// ## 为什么失败是常态，而且必须如实说
+  ///
+  /// 内核会拒绝两种情形：
+  ///
+  /// 1. 目录里还有**没删除的笔记**——删下去就会销毁用户还在用的内容；
+  /// 2. 目录在树里**还有子目录**——这是外键限制，必须先删子目录。
+  ///
+  /// 第二种对用户来说很费解（"我明明删了整个目录"），因此提示里要
+  /// 说清下一步怎么办，而不是只报一句"操作失败"。
+  Future<void> _purge(BuildContext context, WidgetRef ref) async {
+    final bool confirmed = await confirmDestructive(
+      context,
+      title: '彻底删除目录「${item.name}」？',
+      message:
+          '这个目录连同它在回收站里的笔记会被**永久删除**，无法恢复。\n\n'
+          '如果目录里还有没删除的笔记，或它下面还有子目录，'
+          '系统会拒绝——那说明有东西还挂在它下面。',
+      confirmLabel: '彻底删除',
+    );
+    if (!confirmed || !context.mounted) {
+      return;
+    }
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref.read(trashActionsProvider).purgeNotebook(item.id);
+      messenger.showSnackBar(SnackBar(content: Text('已彻底删除目录「${item.name}」。')));
+    } on NoteFailure catch (failure) {
+      messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
+    }
   }
 }
 

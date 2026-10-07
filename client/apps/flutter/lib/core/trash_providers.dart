@@ -25,6 +25,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../src/rust/api/notes.dart' as rust;
 import 'engine_providers.dart';
 import 'note_providers.dart';
+import 'notebook_providers.dart';
 
 /// 一天的毫秒数（用于把"删除时间"换算成"还剩几天"）。
 const int kMsPerDay = 24 * 60 * 60 * 1000;
@@ -157,6 +158,179 @@ class TrashMaintenance {
 /// 回收站维护入口。
 final Provider<TrashMaintenance> trashMaintenanceProvider =
     Provider<TrashMaintenance>(TrashMaintenance.new);
+
+/// 回收站里的笔记本。
+class TrashedNotebookItem {
+  /// 构造。
+  const TrashedNotebookItem({
+    required this.id,
+    required this.name,
+    required this.deletedAtMs,
+    this.parentId,
+  });
+
+  /// 标识。
+  final String id;
+
+  /// 名称。
+  final String name;
+
+  /// 删除时间（UTC 毫秒）。
+  final int deletedAtMs;
+
+  /// 原父目录；`null` 表示它原本在顶层。
+  ///
+  /// 用户恢复前想知道"它会回到哪去"，排查残留时也需要它认父链。
+  final String? parentId;
+
+  /// 从生成类型转换。
+  factory TrashedNotebookItem.fromRust(rust.TrashedNotebook source) =>
+      TrashedNotebookItem(
+        id: source.id,
+        name: source.name,
+        deletedAtMs: source.deletedAtMs.toInt(),
+        parentId: source.parentId,
+      );
+}
+
+/// 回收站里的目录（已删除的笔记本）。
+///
+/// ## 为什么界面必须能看到它们（这是一条真实的数据丢失路径）
+///
+/// 笔记本能被删除，却曾经**没有任何界面能看到或恢复**——回收站只列笔记。
+/// 用户把目录删掉后，那个目录就从左栏永久消失了，连带它下面的整棵子树
+/// （子笔记本与笔记都还在库里，只是看不见）。
+///
+/// 用户报的原话是"会导致笔记的目录树丢失"。
+///
+/// 失败时**抛出**而不是返回空列表：空列表会让界面显示"回收站里没有目录"，
+/// 而真实原因可能是查询出错——那样用户会以为目录真的没了。
+final trashedNotebooksProvider = FutureProvider<List<TrashedNotebookItem>>((
+  Ref ref,
+) async {
+  await ref.watch(engineProvider.future);
+  final rust.NoteResult result = await rust.notebooksTrashed();
+  if (!result.ok) {
+    throw NoteFailure(
+      code: result.code ?? 'UNKNOWN',
+      hint: result.hint ?? '读取回收站中的目录失败。',
+    );
+  }
+  return (result.value?.trashedNotebooks ?? const <rust.TrashedNotebook>[])
+      .map(TrashedNotebookItem.fromRust)
+      .toList(growable: false);
+});
+
+/// 批量彻底删除的结果。
+class BatchPurgeOutcome {
+  /// 构造。
+  const BatchPurgeOutcome({
+    required this.removed,
+    required this.failed,
+    this.failureHint,
+  });
+
+  /// 成功删除的数量。
+  final int removed;
+
+  /// 失败数量。
+  final int failed;
+
+  /// 失败原因摘要（面向用户）。
+  final String? failureHint;
+
+  /// 是否全部成功。
+  bool get allSucceeded => failed == 0;
+
+  /// 供界面显示的一句话。
+  String get summary {
+    if (failed == 0) {
+      return '已彻底删除 $removed 条。';
+    }
+    final String reason = failureHint == null ? '' : '（$failureHint）';
+    return '已彻底删除 $removed 条，$failed 条未能删除$reason';
+  }
+}
+
+/// 回收站的**用户操作**（恢复目录、彻底删除目录、批量彻底删除笔记）。
+///
+/// 与 [TrashMaintenance] 分开：那个是后台维护（到期自动清理），
+/// 这个是用户显式操作。两者的失败处理完全不同——
+/// 自动清理失败要静默重试，用户操作失败必须如实告知。
+class TrashActions {
+  /// 构造。
+  const TrashActions(this._ref);
+
+  final Ref _ref;
+
+  /// 从回收站恢复一个目录（**整棵子树**一起回来）。
+  Future<void> restoreNotebook(String id) async {
+    final rust.NoteResult result = await rust.notebooksRestoreSubtree(id: id);
+    if (!result.ok) {
+      throw NoteFailure(
+        code: result.code ?? 'UNKNOWN',
+        hint: result.hint ?? '恢复目录失败。',
+      );
+    }
+    _refresh();
+  }
+
+  /// 彻底删除一个目录（不可逆）。
+  ///
+  /// 可能被内核拒绝（还挂着没删的笔记、或树里还有子目录）。
+  /// 拒绝是**对的**：彻底删除不可逆，多拦一次远比误删整棵子树好。
+  Future<void> purgeNotebook(String id) async {
+    final rust.NoteResult result = await rust.notebooksPurge(id: id);
+    if (!result.ok) {
+      throw NoteFailure(
+        code: result.code ?? 'UNKNOWN',
+        hint: result.hint ?? '彻底删除目录失败。',
+      );
+    }
+    _refresh();
+  }
+
+  /// **批量彻底删除**笔记，返回逐条统计。
+  ///
+  /// ## 为什么返回统计而不是 void
+  ///
+  /// 批量删除可能**部分成功**。把整批回滚是错的（用户明明可以删掉大部分），
+  /// 而不吭声地只删掉一部分更错——用户会以为全删了。
+  /// 因此把"删了几条、几条失败、为什么"如实交回给界面去说。
+  Future<BatchPurgeOutcome> purgeMany(List<String> ids) async {
+    final rust.NoteResult result = await rust.notesPurgeMany(ids: ids);
+    if (!result.ok) {
+      throw NoteFailure(
+        code: result.code ?? 'UNKNOWN',
+        hint: result.hint ?? '批量彻底删除失败。',
+      );
+    }
+    final rust.BatchPurgeResult? batch = result.value?.batch;
+    if (batch == null) {
+      // 内核契约要求批量操作一定回统计；缺失说明契约被破坏，
+      // 此时报错比返回"0 条成功"更容易定位。
+      throw const NoteFailure(code: 'EMPTY_PAYLOAD', hint: '内核未返回批量删除结果。');
+    }
+    _refresh();
+    return BatchPurgeOutcome(
+      removed: batch.removed.toInt(),
+      failed: batch.failed.toInt(),
+      failureHint: batch.failureHint,
+    );
+  }
+
+  void _refresh() {
+    _ref.invalidate(noteListProvider);
+    _ref.invalidate(noteCountProvider);
+    _ref.invalidate(notebooksTreeProvider);
+    _ref.invalidate(trashedNotebooksProvider);
+  }
+}
+
+/// 回收站用户操作入口。
+final Provider<TrashActions> trashActionsProvider = Provider<TrashActions>(
+  TrashActions.new,
+);
 
 /// 启动时执行一次到期清理，并把结果保留下来供界面提示。
 ///

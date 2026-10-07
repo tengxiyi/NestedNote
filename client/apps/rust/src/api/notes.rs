@@ -110,6 +110,10 @@ pub struct NotePayload {
     pub diff: Option<RevisionDiffPayload>,
     /// 标签列表（标签查询返回）。
     pub tags: Vec<TagEntry>,
+    /// 回收站里的笔记本（回收站查询返回）。
+    pub trashed_notebooks: Vec<TrashedNotebook>,
+    /// 批量操作的结果（批量彻底删除返回）。
+    pub batch: Option<BatchPurgeResult>,
 }
 
 /// 一次修订对比的结果。
@@ -799,7 +803,10 @@ pub fn notebooks_delete(id: &str, at_ms: i64) -> NoteResult {
     }
 }
 
-/// 从回收站恢复笔记本。
+/// 从回收站恢复**一个**笔记本节点（不含子树）。
+///
+/// 只恢复一个节点是有用的：用户可能只想把子目录捞回来。
+/// 想连整棵子树一起恢复用 [`notebooks_restore_subtree`]。
 #[must_use]
 pub fn notebooks_restore(id: &str, at_ms: i64) -> NoteResult {
     let parsed = match parse_id(id) {
@@ -1115,6 +1122,208 @@ pub fn tags_delete(id: &str, at_ms: i64) -> NoteResult {
         Ok(()) => NoteResult::ok(NotePayload::default()),
         Err(failure) => failure,
     }
+}
+
+/// 回收站里的一个笔记本。
+///
+/// ## 为什么需要它（这是一个真实的数据丢失路径）
+///
+/// 笔记本能被删除，却**没有任何界面能看到或恢复它们**——回收站只列笔记。
+/// 用户把目录删掉后，那个目录就从左栏永久消失了，连带它下面的整棵子树
+/// （子笔记本与笔记都还在库里，只是看不见）。
+///
+/// 用户报的原话是"会导致笔记的目录树丢失"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashedNotebook {
+    /// 笔记本标识。
+    pub id: String,
+    /// 名称。
+    pub name: String,
+    /// 删除时间（UTC 毫秒）；界面据此算"还剩 N 天"。
+    pub deleted_at_ms: i64,
+    /// 原父目录标识；`None` 表示它原本在顶层。
+    ///
+    /// ## 为什么这一个字段值得单独加
+    ///
+    /// 已删除的目录之间**父指针可能彼此指向**（整棵子树一起进回收站）。
+    /// 没有这个字段时，界面与维护脚本都只能看到一堆平铺的名字，
+    /// 于是回答不了两个很自然的问题：
+    ///
+    /// - "这个目录原本在哪？"——用户恢复前想知道它会回到哪去；
+    /// - "这几个名字奇怪的目录是谁的子目录？"——排查残留时需要。
+    ///
+    /// 本项目的真实数据里就因为缺它漏掉了 3 个单字目录（`甲`/`乙`/`丙`）：
+    /// 它们自己名字没有脚本前缀，而父链查不到，于是成了"来历不明"的孤儿。
+    pub parent_id: Option<String>,
+}
+
+/// 列出回收站里的笔记本（含它们还剩多少天到期由界面算）。
+///
+/// 界面用它把"删除目录"这个动作变成**可逆**的。
+#[must_use]
+pub fn notebooks_trashed() -> NoteResult {
+    match with_core(|core| core.list_trashed_notebooks()) {
+        Ok(notebooks) => NoteResult::ok(NotePayload {
+            trashed_notebooks: notebooks
+                .into_iter()
+                .map(|notebook| TrashedNotebook {
+                    id: notebook.id.to_string(),
+                    name: notebook.name,
+                    deleted_at_ms: notebook.deleted_at_ms.unwrap_or(0),
+                    parent_id: notebook.parent_id.map(|parent| parent.to_string()),
+                })
+                .collect(),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 从回收站恢复一个笔记本（**整棵子树**一起回来）。
+///
+/// 只恢复父节点会让树上出现"看不见的分支"——用户会以为子目录丢了。
+#[must_use]
+pub fn notebooks_restore_subtree(id: &str) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.restore_notebook_subtree(&parsed)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// **彻底删除**回收站里的一个笔记本（不可逆，界面需二次确认）。
+///
+/// ## 可能被拒绝，而且拒绝是对的
+///
+/// 内核要求：
+///
+/// - 该笔记本必须已在回收站中；
+/// - 它不能还挂着**未删除的**笔记或子笔记本；
+/// - 它在树里还**有子笔记本**时也删不掉（外键限制）。
+///
+/// 因此界面必须**自底向上**逐个删：先删没有子节点的那些。
+/// 失败时把原因如实告诉用户，而不是"点了没反应"。
+#[must_use]
+pub fn notebooks_purge(id: &str) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.purge_notebook(&parsed)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// **整棵子树**移入回收站。
+///
+/// 与 `notebooks_delete`（只删一个节点）不同：只删父节点会让子节点
+/// 失去父指针，`notebooks_tree` 会把孤儿归到顶层，于是它们在左栏里
+/// **跳出来**，看起来像目录结构错乱。
+#[must_use]
+pub fn notebooks_delete_subtree(id: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.delete_notebook_subtree(&parsed, at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// 批量彻底删除的结果。
+///
+/// ## 为什么不是"全成功 / 全失败"
+///
+/// 批量删除必然可能**部分成功**：列表中某几条可能已经不满足删除条件
+/// （比如它下面还有没删的笔记）。这时把整批回滚是错的——
+/// 用户会看到"一条都没删"，而他明明可以删掉其中大部分。
+///
+/// 因此逐个删、如实回报每一条的结果，让界面能说清
+/// "删掉了 7 条，2 条失败：还有笔记在里面"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchPurgeResult {
+    /// 成功删除的数量。
+    pub removed: i64,
+    /// 失败数量。
+    pub failed: i64,
+    /// 失败原因的**去重摘要**（面向用户，不含内部细节）。
+    ///
+    /// 去重而不是逐条列：10 条都因为同一个原因失败时，
+    /// 弹 10 句话没人看，弹 1 句"还有笔记在里面"才有用。
+    pub failure_hint: Option<String>,
+}
+
+/// **批量彻底删除**回收站中的笔记（不可逆，界面必须二次确认）。
+///
+/// ## 一次删一条，不是一条 SQL 删一批
+///
+/// 看起来低效，但这是刻意的：
+///
+/// - 仓储层的 `purge_one` 会**逐条校验**"该笔记确实在回收站中"，
+///   这个护栏是"误调用不会造成不可恢复丢失"的保障；
+///   换成一条 `DELETE ... WHERE id IN (...)` 就绕过了它；
+/// - 回收站里一次几十条的量级，逐条事务的开销可以忽略；
+/// - 逐条还能如实回报"哪几条失败、为什么"。
+///
+/// 删除顺序按传入顺序，失败的不影响后面的——用户勾了 10 条，
+/// 不该因为其中 1 条不满足条件就一条都删不掉。
+#[must_use]
+pub fn notes_purge_many(ids: Vec<String>) -> NoteResult {
+    // 先全部解析：有无效 id 时**整批拒绝**，而不是跳过。
+    // 跳过会让用户以为"我勾的 10 条都处理了"，实际少删了几条却毫无提示。
+    let mut parsed = Vec::with_capacity(ids.len());
+    for raw in &ids {
+        match Id::parse(raw) {
+            Ok(id) => parsed.push(id),
+            Err(_) => {
+                return NoteResult {
+                    ok: false,
+                    code: Some("INVALID_ID".to_owned()),
+                    hint: Some("选中的笔记里有无效标识，已取消本次操作。".to_owned()),
+                    debug_detail: None,
+                    value: None,
+                };
+            }
+        }
+    }
+
+    let mut removed = 0_i64;
+    let mut failed = 0_i64;
+    let mut reasons: Vec<String> = Vec::new();
+
+    for id in &parsed {
+        match with_core(|core| core.purge_note(id)) {
+            Ok(()) => removed += 1,
+            Err(failure) => {
+                failed += 1;
+                // 只收去重后的原因，且最多留几条——这是给用户看的一句话，
+                // 不是日志。真正排查问题要看 debug_detail。
+                if let Some(hint) = failure.hint.or(failure.code) {
+                    if !reasons.contains(&hint) && reasons.len() < 3 {
+                        reasons.push(hint);
+                    }
+                }
+            }
+        }
+    }
+
+    NoteResult::ok(NotePayload {
+        batch: Some(BatchPurgeResult {
+            removed,
+            failed,
+            failure_hint: if reasons.is_empty() {
+                None
+            } else {
+                Some(reasons.join("；"))
+            },
+        }),
+        ..NotePayload::default()
+    })
 }
 
 /// 一条修订记录在界面上的表示。

@@ -219,7 +219,7 @@ void main() {
     expect(find.text('点右上方 + 新建一篇'), findsOneWidget);
   });
 
-  testWidgets('切换回收站后标题变为回收站且新建按钮禁用', (WidgetTester tester) async {
+  testWidgets('切换回收站后标题变为回收站，且提供多选入口', (WidgetTester tester) async {
     await tester.pumpWidget(harness());
     await tester.pumpAndSettle();
 
@@ -229,13 +229,21 @@ void main() {
     expect(find.text('回收站'), findsWidgets);
     expect(find.text('回收站是空的'), findsOneWidget);
 
-    final IconButton addButton = tester.widget<IconButton>(
+    // 回收站里**不能新建笔记**（新建一个立刻就要被删的东西毫无意义），
+    // 因此那个位置的按钮改成了**进入多选**的入口。
+    //
+    // 这里断言的是"新建按钮不存在"，而不是"某个按钮被禁用"——
+    // 后者在按钮换了用途之后就没有意义了（第一版就是这么断言的，
+    // 加了多选功能后它失败，而失败本身是对的）。
+    expect(find.byIcon(kNewNoteIcon), findsNothing, reason: '回收站中不应出现"新建笔记"入口');
+
+    final IconButton selectButton = tester.widget<IconButton>(
       find.ancestor(
-        of: find.byIcon(kNewNoteIcon),
+        of: find.byIcon(Icons.checklist),
         matching: find.byType(IconButton),
       ),
     );
-    expect(addButton.onPressed, isNull, reason: '回收站中不应允许新建');
+    expect(selectButton.onPressed, isNotNull, reason: '回收站必须能进入多选，否则无法批量彻底删除');
   });
 
   group('笔记本层级渲染', () {

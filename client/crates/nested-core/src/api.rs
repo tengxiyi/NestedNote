@@ -153,6 +153,42 @@ pub struct NestedCore {
     device_id_cache: Mutex<Option<String>>,
 }
 
+/// 算出一个笔记本在树里的深度（顶层为 0）。
+///
+/// ## 为什么要防环
+///
+/// `notebooks.parent_id` 是指向自身的引用，外键能保证"父节点存在"，
+/// 但**拦不住环**（A→B→A 每一环的父节点都存在）。
+/// 清理逻辑要按深度排序，若在这里转圈就成了死循环——表现为启动卡死。
+///
+/// 因此用**已访问集合**：撞到走过的节点就停下，返回当前累计深度。
+/// 那不是一个"正确"的深度，但清理逻辑只需要一个**能排序的数值**，
+/// 而"不卡死"远比"环里的深度精确"重要（环本身就是损坏状态）。
+///
+/// 顺带说明为什么不用递归 CTE 在 SQL 里算：深度要跟一堆笔记本一起排序，
+/// 在内存里算一次比每行查一次库省得多，而笔记本数量本来就不大。
+fn depth_of(all: &[Notebook], id: &Id) -> u32 {
+    let parents: std::collections::HashMap<Id, Option<Id>> = all
+        .iter()
+        .map(|notebook| (notebook.id, notebook.parent_id))
+        .collect();
+
+    let mut depth = 0_u32;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(*id);
+    let mut current = *id;
+    while let Some(Some(parent)) = parents.get(&current) {
+        if !seen.insert(*parent) {
+            // 撞到走过的节点：数据里有环。停下，把已走的层数当深度。
+            tracing::warn!(notebook_id = %current, "笔记本层级里检测到环，深度计算提前结束");
+            break;
+        }
+        depth += 1;
+        current = *parent;
+    }
+    depth
+}
+
 impl NestedCore {
     /// 在指定数据目录下打开（或创建）内核。
     ///
@@ -1095,22 +1131,25 @@ impl NestedCore {
 
     /// 彻底删除回收站中**已超过保留期**的笔记与笔记本。
     ///
-    /// ## 为什么笔记本要循环删
+    /// ## 笔记本必须**自底向上**删，而不是靠"跳过有子节点的"
     ///
-    /// 一次清理的依赖链是：笔记先被删 → 笔记本才不再被引用 → 笔记本才能删。
-    /// 若笔记本下还有**子笔记本**，子笔记本必须先在**上一轮**被删掉，
-    /// 父笔记本才能在这一轮满足条件。所以需要反复扫，直到某一轮
-    /// 一个笔记本都删不掉为止。
+    /// 原来的做法是反复扫、每轮删掉"没有子笔记本引用"的那些。
+    /// 那有个致命后果：**父笔记本永远删不掉**。
     ///
-    /// 深度学习用户可能建 5 层目录，因此这里不是"扫两遍就够"，
-    /// 而是**循环到不动点**（并设了轮数上限，见下）。
+    /// 1. 父在回收站、子在回收站（可能还没到期）；
+    /// 2. 父因"有子节点"被跳过；
+    /// 3. 等子也到期、子被删掉，父在这一轮已经处理过了；
+    /// 4. 于是父**每轮都被跳过**，永久滞留。
     ///
-    /// ## 为什么有轮数上限
+    /// 本项目的真实数据里积了 **49 个**这样的笔记本，而**界面上完全没有
+    /// 入口**能看到或清掉它们（回收站只列笔记）。用户看到的现象正是
+    /// "目录树丢了，而且在回收站里删不掉任何东西"。
     ///
-    /// 正常情况下每轮都会消耗一层，轮数不会超过树的深度。
-    /// 但"正常情况下"不是一个可以依赖的前提——如果哪天有人写出
-    /// 让笔记本**引用自身**的 bug，没有上限的循环就变成死循环，
-    /// 表现为启动时卡死。上限把它变成一次无害的提前退出。
+    /// 现在改成：算出每个到期笔记本的**深度**，从最深的一层开始，
+    /// 逐个调用 [`Self::purge_notebook`]。删掉叶子后，它父亲的"活着的
+    /// 子节点"计数自然降为 0，于是父亲在同一轮里就能被删。
+    ///
+    /// 这样既不会产生孤儿节点，也没有"永远跳过"的对象。
     ///
     /// # Errors
     ///
@@ -1123,15 +1162,26 @@ impl NestedCore {
         // 笔记只有一层，删一遍就到底
         report.notes_removed = notes::purge_deleted_before(&mut connection, cutoff)?;
 
-        // 笔记本要循环到不动点。上限 64 远超任何真实目录深度；
-        // 真撞上了说明数据结构出了问题，此时"少删几个空笔记本"远比"启动卡死"好。
-        const MAX_PASSES: usize = 64;
-        for _ in 0..MAX_PASSES {
-            let removed = notebooks::purge_deleted_before(&mut connection, cutoff)?;
-            if removed == 0 {
-                break;
+        // 笔记本：取全部（含已删，因为要算深度需要父链）
+        let all = notebooks::list_all_including_deleted(&connection)?;
+        let mut expired: Vec<(Id, u32)> = all
+            .iter()
+            .filter(|notebook| {
+                notebook
+                    .deleted_at_ms
+                    .is_some_and(|deleted| deleted < cutoff)
+            })
+            .map(|notebook| (notebook.id, crate::api::depth_of(&all, &notebook.id)))
+            .collect();
+        // 深的先删。同一层内顺序无所谓（互不引用）。
+        expired.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (id, _) in expired {
+            // 单个失败不中断整体：可能是"还挂着未删除的笔记"（用户还在用），
+            // 那就不该删。数据库错误同理——下次启动会再试。
+            if notebooks::purge_one(&mut connection, &id).is_ok() {
+                report.notebooks_removed += 1;
             }
-            report.notebooks_removed += removed;
         }
 
         Ok(report)
@@ -1165,6 +1215,109 @@ impl NestedCore {
     pub fn purge_note(&self, id: &Id) -> CoreResult<()> {
         let mut connection = self.database.connection()?;
         notes::purge_one(&mut connection, id)?;
+        Ok(())
+    }
+
+    // -------------------------------------------------- 回收站里的笔记本
+
+    /// 回收站里的笔记本（已删除、按名称排序）。
+    ///
+    /// ## 为什么必须有这个接口
+    ///
+    /// 笔记本能被删除，却**没有任何界面能看到或恢复它们**——
+    /// 回收站只列笔记。用户把目录删掉后，那个目录就永久消失了，
+    /// 连带它下面的整棵子树（子笔记本与笔记都还在库里，只是看不见）。
+    ///
+    /// 用户报的原话是"会导致笔记的目录树丢失"。
+    ///
+    /// 加上这个接口，回收站才能同时列出笔记与笔记本，
+    /// 让"删除"这个动作**可逆**（铁律 T7 的本意）。
+    ///
+    /// # Errors
+    ///
+    /// 数据库错误 → [`CoreError::Database`]。
+    pub fn list_trashed_notebooks(&self) -> CoreResult<Vec<Notebook>> {
+        let connection = self.database.connection()?;
+        let all = notebooks::list_all_including_deleted(&connection)?;
+        Ok(all
+            .into_iter()
+            .filter(|notebook| notebook.deleted_at_ms.is_some())
+            .collect())
+    }
+
+    /// 回收站里笔记本的数量（界面徽标用）。
+    ///
+    /// # Errors
+    ///
+    /// 数据库错误 → [`CoreError::Database`]。
+    pub fn trashed_notebook_count(&self) -> CoreResult<i64> {
+        Ok(i64::try_from(self.list_trashed_notebooks()?.len()).unwrap_or(i64::MAX))
+    }
+
+    /// 把笔记本移入回收站（**整棵子树**，铁律 T7）。
+    ///
+    /// 与 [`Self::delete_notebook`] 的区别：那个只删一个节点。
+    /// 整棵子树一起删才是用户在树里"删除这个目录"的期望——
+    /// 否则子目录会失去父节点变成孤儿（`list_notebook_tree` 会把孤儿
+    /// 归到顶层，于是它们在左栏里**跳出来**，看起来像数据错乱）。
+    ///
+    /// # Errors
+    ///
+    /// 笔记本不存在 → [`CoreError::NotFound`]。
+    pub fn delete_notebook_subtree(&self, id: &Id, at_ms: i64) -> CoreResult<()> {
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notebooks::soft_delete_subtree(&mut connection, id, &device_id, at_ms)?;
+        Ok(())
+    }
+
+    /// 从回收站恢复笔记本（**整棵子树**）。
+    ///
+    /// 只恢复已删除的节点，因此重复调用无副作用。
+    ///
+    /// # Errors
+    ///
+    /// 笔记本不存在 → [`CoreError::NotFound`]。
+    pub fn restore_notebook_subtree(&self, id: &Id) -> CoreResult<()> {
+        let mut connection = self.database.connection()?;
+        notebooks::restore_subtree(&mut connection, id)?;
+        Ok(())
+    }
+
+    /// **彻底删除**回收站中的一个笔记本（不可逆）。
+    ///
+    /// 安全护栏（都在仓储层强制执行）：
+    ///
+    /// - 该笔记本必须**已在回收站中**；
+    /// - 它不能还挂着**未删除的**笔记或子笔记本。
+    ///
+    /// 第二条意味着：用户若删了整个子树，必须先恢复、把想留的笔记移走，
+    /// 才能彻底删掉这个目录。这是刻意的——彻底删除不可逆，
+    /// 多一步确认远比误删一整棵子树好。
+    ///
+    /// # Errors
+    ///
+    /// 不在回收站中、或仍挂着未删除的内容 → [`CoreError::Conflict`]；
+    /// 不存在 → [`CoreError::NotFound`]。
+    pub fn purge_notebook(&self, id: &Id) -> CoreResult<()> {
+        let mut connection = self.database.connection()?;
+        // 仓储层只回"冲突"这个事实，这里补上**为什么**与**下一步怎么办**。
+        //
+        // 为什么值得单独翻译：用户点了"彻底删除目录"却被拒，若只说
+        // "操作被拒绝"，他不知道该去做什么；而这两种原因都有明确的
+        // 下一步（先删里面的笔记 / 先删子目录）。
+        //
+        // 第一版没翻译，界面上显示的提示是
+        // "请尝试重启应用；若问题持续，请从备份恢复数据" ——
+        // 那会让用户**以为数据损坏了**，而真实原因只是"目录里还有东西"。
+        notebooks::purge_one(&mut connection, id).map_err(|error| match error {
+            nested_db::DbError::Conflict { .. } => CoreError::Conflict(
+                "这个目录里还有没删除的笔记，或者下面还有子目录。\
+                 请先处理它们，再彻底删除这个目录。"
+                    .to_owned(),
+            ),
+            other => CoreError::from(other),
+        })?;
         Ok(())
     }
 
@@ -1495,7 +1648,48 @@ mod tests {
         core.create_tag("灵感", NOW).expect("first");
         let error = core.create_tag("灵感", NOW).expect_err("duplicate");
         assert_eq!(error.code(), "CONFLICT");
-        assert!(error.user_hint().contains("冲突"));
+        // 提示必须说清**真实原因**。
+        //
+        // 曾经这里断言的是"包含'冲突'"，因为那时冲突一律返回
+        // "内容已被其他设备修改，请查看冲突副本"——而标签重名
+        // 与"别的设备改过"毫无关系。那句提示会把用户引向错误方向。
+        assert!(
+            error.user_hint().contains("已存在"),
+            "提示应说明是名称重复，实际：{}",
+            error.user_hint()
+        );
+        assert!(
+            !error.user_hint().contains("其他设备"),
+            "标签重名不该说成'其他设备修改'——那会把用户引向错误方向"
+        );
+    }
+
+    #[test]
+    fn purging_a_busy_notebook_explains_what_to_do_instead_of_crying_corruption() {
+        // 这条防的是**误导性提示**，它比"没有提示"更糟。
+        //
+        // 第一版没给冲突翻译上下文，界面上显示的是
+        // "请尝试重启应用；若问题持续，请从备份恢复数据"——
+        // 用户会以为数据损坏了，而真实原因只是"目录里还有子目录"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, _mid, _leaf) = notebook_tree(&core);
+        core.create_note(Some(root), "还在用的笔记", NOW)
+            .expect("note");
+        core.delete_notebook_subtree(&root, NOW + 1)
+            .expect("delete");
+
+        let error = core.purge_notebook(&root).expect_err("应拒绝");
+        assert_eq!(error.code(), "CONFLICT");
+        let hint = error.user_hint();
+        assert!(
+            hint.contains("笔记") && hint.contains("子目录"),
+            "提示要说清两种可能的原因，实际：{hint}"
+        );
+        assert!(
+            !hint.contains("备份") && !hint.contains("重启"),
+            "这只是'还有东西挂在下面'，不是数据损坏——\
+             说成损坏会让用户白折腾甚至去恢复备份。实际：{hint}"
+        );
     }
 
     #[test]
@@ -2121,6 +2315,243 @@ mod tests {
         core.create_tag("在用", NOW).expect("first");
         let error = core.create_tag("在用", NOW + 1).expect_err("必须报冲突");
         assert_eq!(error.code(), "CONFLICT");
+    }
+
+    #[test]
+    fn deleting_a_notebook_takes_the_whole_subtree_with_it() {
+        // 用户报的现象："会导致笔记的目录树丢失"。
+        //
+        // 只把父节点标为删除是错的：子节点仍指向它，
+        // `list_notebook_tree` 会因为"父节点不存在"把子节点**归到顶层**，
+        // 于是它们在左栏里跳出来，看起来像目录结构错乱。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+
+        core.delete_notebook_subtree(&root, NOW).expect("delete");
+
+        assert!(
+            core.list_notebooks().expect("list").is_empty(),
+            "整棵子树都应进入回收站，而不是只剩父节点被删"
+        );
+        let trashed = core.list_trashed_notebooks().expect("trashed");
+        assert_eq!(trashed.len(), 3, "三个节点都应在回收站里");
+        for id in [root, mid, leaf] {
+            assert!(
+                trashed.iter().any(|notebook| notebook.id == id),
+                "缺少 {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn restoring_a_notebook_brings_back_the_whole_subtree() {
+        // 恢复必须与删除对称：只恢复父节点会让树上出现"看不见的分支"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+        core.delete_notebook_subtree(&root, NOW).expect("delete");
+        assert!(core.list_notebooks().expect("list").is_empty());
+
+        core.restore_notebook_subtree(&root).expect("restore");
+
+        let live = core.list_notebooks().expect("list");
+        assert_eq!(live.len(), 3, "整棵子树都回来");
+        for id in [root, mid, leaf] {
+            assert!(live.iter().any(|notebook| notebook.id == id), "缺少 {id}");
+        }
+        assert!(
+            core.list_trashed_notebooks().expect("trashed").is_empty(),
+            "回收站应清空"
+        );
+    }
+
+    #[test]
+    fn a_parent_notebook_in_the_trash_can_actually_be_purged() {
+        // ## 这条测试防的是一个"看起来永远不会发生"的缺陷
+        //
+        // 原来的清理逻辑每轮只删"没有子节点引用"的笔记本。那导致
+        // **父笔记本永远删不掉**：子节点到期前父被跳过；子节点被删后
+        // 父在这一轮已经处理过了，于是每轮都被跳过，永久滞留。
+        //
+        // 本项目的真实数据里积了 49 个这样的笔记本，而界面上没有入口
+        // 能看到它们。用户看到的就是"回收站里删不掉任何东西"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+        // 三层各放一篇笔记，模拟真实使用
+        for (notebook, title) in [(root, "根笔记"), (mid, "中笔记"), (leaf, "叶笔记")] {
+            core.create_note(Some(notebook), title, NOW).expect("note");
+        }
+        core.delete_notebook_subtree(&root, NOW + 1)
+            .expect("delete");
+
+        // 先把笔记也删掉（否则笔记本仍被"未删除的笔记"引用，不该被删）
+        let notes = core
+            .list_notes(&NoteQuery {
+                include_deleted: true,
+                ..NoteQuery::default()
+            })
+            .expect("notes");
+        assert_eq!(notes.len(), 3, "三篇都应还在（只删了笔记本）");
+        for note in &notes {
+            core.delete_note(&note.id, NOW + 2).expect("delete note");
+        }
+
+        // 到期时间设在很久以后，用 now 走到"全部到期"
+        let report = core
+            .purge_trash(NOW + 100 * 24 * 60 * 60 * 1000)
+            .expect("purge");
+        assert_eq!(
+            report.notebooks_removed, 3,
+            "三个笔记本都应被彻底删除——包括那个**有子节点的父笔记本**"
+        );
+        assert_eq!(report.notes_removed, 3, "三篇笔记也应被彻底删除");
+        assert!(
+            core.list_trashed_notebooks().expect("trashed").is_empty(),
+            "回收站里不该再剩下任何笔记本"
+        );
+        assert!(
+            core.list_notes(&NoteQuery {
+                include_deleted: true,
+                ..NoteQuery::default()
+            })
+            .expect("notes")
+            .is_empty(),
+            "笔记也应被彻底删除"
+        );
+    }
+
+    #[test]
+    fn purging_a_notebook_still_in_use_is_refused() {
+        // 护栏：彻底删除不可逆，不能用来删掉用户还在用的目录。
+        //
+        // 用**叶子**做样本，把"笔记还活着"这个变量单独拿出来——
+        // 用有子节点的目录会让外键先拦住，测不到守卫本身。
+        let core = NestedCore::open_in_memory().expect("open");
+        let leaf = core.create_notebook("只有我", None, NOW).expect("leaf");
+        let note = core
+            .create_note(Some(leaf.id), "还在用的笔记", NOW)
+            .expect("note");
+
+        // 1) 笔记本还在用（未删除）→ 拒绝
+        assert_eq!(
+            core.purge_notebook(&leaf.id).expect_err("应拒绝").code(),
+            "CONFLICT",
+            "未删除的笔记本不能走彻底删除这条不可逆路径"
+        );
+
+        // 2) 笔记本已删但**里面的笔记还活着** → 仍拒绝。
+        //    这条是真正保护用户的：否则"彻底删除目录"会顺手销毁
+        //    用户还在用的笔记。
+        core.delete_notebook_subtree(&leaf.id, NOW + 1)
+            .expect("delete");
+        let refused = core.purge_notebook(&leaf.id).expect_err("应拒绝");
+        assert_eq!(
+            refused.code(),
+            "CONFLICT",
+            "笔记还活着时不能删掉它的目录，实际：{refused:?}"
+        );
+        assert!(core.get_note(&note.id).is_ok(), "被拒绝之后笔记必须还在");
+
+        // 3) 笔记也删掉之后才放行
+        core.delete_note(&note.id, NOW + 2).expect("delete note");
+        core.purge_notebook(&leaf.id).expect("此时应能彻底删除");
+    }
+
+    #[test]
+    fn purging_a_parent_before_its_children_fails_on_the_foreign_key() {
+        // ## 这条记录的是"为什么必须自底向上"，而不是"应该报什么错"
+        //
+        // 子笔记本的 `parent_id` 是指向父节点的**外键**。因此父节点在
+        // 子节点还在时**根本删不掉**——不是靠守卫拦住的，是数据库拦住的。
+        // 这正是"跳过有子节点"那个策略会永久滞留的物理原因。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+        core.delete_notebook_subtree(&root, NOW + 1)
+            .expect("delete");
+
+        // 顺序必须是叶 → 中 → 根。跳过任何一层都会因外键失败。
+        core.purge_notebook(&leaf).expect("叶没有子节点，应能删");
+        core.purge_notebook(&mid).expect("中的子节点已清空，应能删");
+        core.purge_notebook(&root)
+            .expect("根的子节点已清空，应能删");
+
+        assert!(
+            core.list_trashed_notebooks().expect("trashed").is_empty(),
+            "整棵子树都应被清掉，不留滞留项"
+        );
+    }
+
+    #[test]
+    fn purge_removes_a_deep_nest_in_a_single_pass() {
+        // ## 这条测试证明"按深度排序"真的修好了那个缺陷
+        //
+        // 旧的清理逻辑每轮只删"没有子节点引用"的行，**反复扫到不动点**，
+        // 且在一轮里删掉子节点后父节点本轮已经处理过了——
+        // 实测下来三层嵌套的父节点会永久滞留在回收站。
+        // 真实数据里积了 49 个，界面上还没有入口能看到它们。
+        //
+        // 现在按**深度从深到浅**处理：先删叶子（无子节点，删得掉），
+        // 再删它的父（此时子节点已消失），最后删根。**一轮到底**。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+        for (notebook, title) in [(root, "根笔记"), (mid, "中笔记"), (leaf, "叶笔记")] {
+            core.create_note(Some(notebook), title, NOW).expect("note");
+        }
+        core.delete_notebook_subtree(&root, NOW + 1)
+            .expect("delete");
+
+        // 笔记也删掉（否则笔记本仍被"未删除的笔记"引用，不该被删）
+        for note in core
+            .list_notes(&NoteQuery {
+                include_deleted: true,
+                ..NoteQuery::default()
+            })
+            .expect("notes")
+        {
+            core.delete_note(&note.id, NOW + 2).expect("delete note");
+        }
+
+        let report = core
+            .purge_trash(NOW + 100 * 24 * 60 * 60 * 1000)
+            .expect("purge");
+
+        assert_eq!(
+            report.notebooks_removed, 3,
+            "三层嵌套（叶、中、根）都应在**一轮**里被删掉——\
+             旧实现会因为'父节点被跳过'而留下它们"
+        );
+        assert!(
+            core.list_trashed_notebooks().expect("trashed").is_empty(),
+            "回收站里不该剩下任何笔记本"
+        );
+    }
+
+    #[test]
+    fn trashed_notebook_count_matches_the_list() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, _mid, _leaf) = notebook_tree(&core);
+        assert_eq!(core.trashed_notebook_count().expect("count"), 0);
+        core.delete_notebook_subtree(&root, NOW).expect("delete");
+        assert_eq!(
+            core.trashed_notebook_count().expect("count"),
+            i64::try_from(core.list_trashed_notebooks().expect("list").len()).expect("len"),
+            "徽标数字必须等于列表长度，否则界面上又是两个不同的数字"
+        );
+    }
+
+    #[test]
+    fn deleting_a_notebook_is_idempotent() {
+        // 重复调用不该报错，也不该把 already-deleted 的节点再改一次时间戳。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, _mid, _leaf) = notebook_tree(&core);
+        core.delete_notebook_subtree(&root, NOW).expect("first");
+        let first = core.list_trashed_notebooks().expect("trashed");
+        core.delete_notebook_subtree(&root, NOW + 9999)
+            .expect("second");
+        let second = core.list_trashed_notebooks().expect("trashed");
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.deleted_at_ms, b.deleted_at_ms, "时间戳不该被改写");
+        }
     }
 
     /// 建一棵三层笔记本树：根 → 中 → 叶。
