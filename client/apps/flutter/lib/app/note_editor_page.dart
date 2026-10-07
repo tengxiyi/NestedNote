@@ -68,7 +68,7 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   /// "这是哪篇笔记的"。取不到就退回通用标题，而不是显示空串。
   String _noteTitle(WidgetRef ref) =>
       ref
-          .read(noteListProvider(const NoteListQuery()))
+          .read(noteListMergedProvider(const NoteListQuery()))
           .value
           ?.where((NoteItem item) => item.id == widget.noteId)
           .map((NoteItem item) => item.title)
@@ -76,6 +76,22 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
       '笔记';
 
   final TextEditingController _controller = TextEditingController();
+
+  /// 标题输入框。
+  ///
+  /// 标题与正文是**两个输入框、一次保存**（见 `notes_save` 的说明）：
+  /// 分成两次调用会出现"标题存了、正文没存"的中间状态。
+  final TextEditingController _titleController = TextEditingController();
+
+  /// 已落盘的标题，用于判断标题是否被改过。
+  String _savedTitle = '';
+
+  /// 正文的焦点节点。
+  ///
+  /// 标题框 `autofocus`，但**只对新建（标题为空的）笔记**合适：
+  /// 打开一篇已有笔记时，用户想接着写正文，焦点却停在标题上会更烦人。
+  /// 因此加载完成后按"标题是否为空"决定把焦点交给谁。
+  final FocusNode _bodyFocus = FocusNode();
 
   /// 已落盘的内容，用于判断"是否有未保存改动"。
   String _savedText = '';
@@ -95,34 +111,81 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   /// 加载失败时的提示。
   String? _loadError;
 
+  /// 用于在 [dispose] 里补一次保存。
+  ///
+  /// ## 为什么必须持有它（这是一个真实的数据丢失缺陷的修法）
+  ///
+  /// `dispose()` 是同步的，不能 `await`，而且之后不能再碰 `ref`。
+  /// 但用户完全可能在"输入后不到 [kAutoSaveDelay]"就切走——
+  /// 那时去抖计时器还没触发，`dispose` 又把它取消掉，**输入就没了**。
+  ///
+  /// 本项目确实丢过数据：症状是"输入文字后切出去再切回来，笔记是空的"。
+  /// 还有一个更隐蔽的同源缺陷：`NoteActions.save` 早先不失效正文缓存，
+  /// 于是切回来时读到旧文本、把新内容盖掉（已修）。
+  ///
+  /// 这里在 initState 里把动作对象存下来，dispose 时直接调用——
+  /// `save()` 的**第一个 await 之前**就取好了文本，所以调用后即使本组件
+  /// 已被销毁，写库仍会完成（不依赖 `mounted`）。
+  NoteActions? _actionsForFlush;
+
   @override
   void initState() {
     super.initState();
+    // 提前取好，供 dispose 补保存用（dispose 时不能再碰 ref）
+    _actionsForFlush = ref.read(noteActionsProvider);
     unawaited(_load());
   }
 
   @override
   void dispose() {
-    // 离开前取消计时器（不等保存结果：dispose 不能异步）。
-    // 真正的保障是离开前的确认流程，这里只是兜底。
     _autoSaveTimer?.cancel();
+    // **补一次保存**：用户可能在去抖窗口内就切走了。
+    //
+    // 这是"输入后切走就丢"的直接修法。注意：
+    // - 只在确实有未保存改动时才写，避免无谓的写与修订记录；
+    // - 不 `await`（dispose 不能异步），但 `save()` 在第一个 await 之前
+    //   就已经取好了文本，因此写库会完成；
+    // - `save()` 内部用 `atMs = now`，不依赖组件还活着。
+    if (_dirty && !_loading && _loadError == null) {
+      unawaited(
+        _actionsForFlush?.save(
+          widget.noteId,
+          title: _titleController.text,
+          text: _controller.text,
+        ),
+      );
+    }
+    _bodyFocus.dispose();
+    _titleController.dispose();
     _controller.dispose();
     super.dispose();
   }
 
   Future<void> _load() async {
     try {
-      final String text = await ref.read(
-        noteTextProvider(widget.noteId).future,
+      // 一次读回标题与正文：它们属于同一篇笔记，分两次读会出现
+      // "标题是新的、正文是旧的"这种自相矛盾的中间画面。
+      //
+      // 不写显式类型：那是 FFI 层的东西，界面只认 NoteSnapshot
+      // （门禁 A-LAYERING 禁止 lib/app 直接 import 生成绑定）。
+      final NoteSnapshot snapshot = await ref.read(
+        noteSnapshotProvider(widget.noteId).future,
       );
       if (!mounted) {
         return;
       }
       setState(() {
-        _controller.text = text;
-        _savedText = text;
+        _titleController.text = snapshot.title;
+        _controller.text = snapshot.text;
+        _savedTitle = snapshot.title;
+        _savedText = snapshot.text;
         _loading = false;
       });
+      // 标题为空（新建的笔记）→ 焦点留在标题上，符合"先起名再写"的顺序；
+      // 已有标题 → 把焦点交给正文，因为用户多半是来接着写的。
+      if (snapshot.title.isNotEmpty) {
+        _bodyFocus.requestFocus();
+      }
     } on NoteFailure catch (failure) {
       if (!mounted) {
         return;
@@ -134,7 +197,9 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     }
   }
 
-  bool get _dirty => _controller.text != _savedText;
+  /// 是否有未保存的改动（标题或正文）。
+  bool get _dirty =>
+      _controller.text != _savedText || _titleController.text != _savedTitle;
 
   /// 输入变化：重置去抖计时器。
   void _onChanged(String _) {
@@ -162,13 +227,17 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     setState(() => _saving = true);
 
     final String text = _controller.text;
+    final String title = _titleController.text;
     try {
-      await ref.read(noteActionsProvider).save(widget.noteId, text);
+      await ref
+          .read(noteActionsProvider)
+          .save(widget.noteId, title: title, text: text);
       if (!mounted) {
         return true;
       }
       setState(() {
         _savedText = text;
+        _savedTitle = title;
         _saving = false;
         _autoSaveFailed = false;
       });
@@ -291,12 +360,37 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
           ),
         ),
         const Divider(height: 1),
+        // 标题区：位于正文上方，字号明显大于正文（参照印象笔记的布局）。
+        //
+        // 它是**独立输入框**而不是"正文第一行特殊对待"：
+        // 后者会让"改标题"与"删掉第一行"变成同一个动作，
+        // 用户想删一行文字却把标题弄没了。
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+          child: TextField(
+            controller: _titleController,
+            autofocus: true,
+            maxLines: 1,
+            textInputAction: TextInputAction.next,
+            style: theme.textTheme.headlineSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              isDense: true,
+              hintText: '标题',
+            ),
+            onChanged: (_) => _onChanged(''),
+            // 在标题里按回车跳到正文，符合"填完标题接着写"的习惯
+            onSubmitted: (_) => FocusScope.of(context).nextFocus(),
+          ),
+        ),
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
             child: TextField(
               controller: _controller,
-              autofocus: true,
+              focusNode: _bodyFocus,
               maxLines: null,
               expands: true,
               textAlignVertical: TextAlignVertical.top,

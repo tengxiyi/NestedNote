@@ -77,7 +77,12 @@ Future<void> main() async {
   final id = created.value!.note!.id;
 
   const text = '第一行：写入成功\n第二行：块模型按行存储\n第三行：可以读回';
-  final saved = await notesSave(id: id, text: text, atMs: now + 1000);
+  final saved = await notesSave(
+    id: id,
+    title: null,
+    text: text,
+    atMs: now + 1000,
+  );
   check('保存正文', saved.ok, saved.hint ?? '');
   check(
     '修订号递增',

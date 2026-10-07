@@ -53,7 +53,11 @@ class NoteListPane extends ConsumerWidget {
       notebookId: showDeleted ? null : notebookId,
       includeDeleted: showDeleted,
     );
-    final AsyncValue<List<NoteItem>> notes = ref.watch(noteListProvider(query));
+    // 用**合并视图**而不是原始查询结果：刚保存过的笔记会在这里被叠加，
+    // 因此保存时列表不重查、不重排 → 中栏不闪、滚动位置不跳。
+    final AsyncValue<List<NoteItem>> notes = ref.watch(
+      noteListMergedProvider(query),
+    );
     final ThemeData theme = Theme.of(context);
     final int retention = ref.watch(trashRetentionDaysProvider).value ?? 0;
 

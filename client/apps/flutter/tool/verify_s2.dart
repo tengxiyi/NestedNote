@@ -80,7 +80,7 @@ Future<void> main() async {
   );
   check('创建笔记', note.ok, note.hint ?? '');
   final noteId = note.value!.note!.id;
-  await notesSave(id: noteId, text: '第一行\n第二行', atMs: now + 1);
+  await notesSave(id: noteId, title: null, text: '第一行\n第二行', atMs: now + 1);
 
   // 给原件打标签
   final tagIdFinal = recreated.value!.tags.first.id;
@@ -136,7 +136,12 @@ Future<void> main() async {
     title: '$kPrefix子笔记',
     atMs: now,
   );
-  await notesSave(id: childNote.value!.note!.id, text: '子内容', atMs: now + 1);
+  await notesSave(
+    id: childNote.value!.note!.id,
+    title: null,
+    text: '子内容',
+    atMs: now + 1,
+  );
 
   final bookDup = await notebooksDuplicate(id: bookId, atMs: now + 4);
   check('复制笔记本', bookDup.ok, bookDup.hint ?? '');

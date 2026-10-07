@@ -46,8 +46,7 @@ const double kIndentBase = 8;
 /// 保证最窄（`kSidebarMinWidth`）时深层级的名称仍有余量。
 const double kIndentMax = 100;
 
-/// 计算某个层级在左栏中的缩进量。
-///
+/// 计算某个层级在左栏中的缩进量。///
 /// ## 为什么要"封顶"而不是"一直加"
 ///
 /// 层级没有硬上限（数据层不限制深度），但左栏宽度有限。
@@ -173,7 +172,19 @@ class _NotebookSidebarState extends ConsumerState<NotebookSidebar> {
                       // 既看得出"它们是同类"，又分得清"自己在哪一层"。
                       icon: folderIconForDepth(node.depth),
                       label: node.name,
-                      trailingCount: node.noteCount,
+                      // 计数只在**最底层**（没有子笔记本的）显示，且是它**直属**的笔记数。
+                      //
+                      // 第一版在所有层级都显示"子树合计"，于是"资料库(6)"里的 6
+                      // 既不是它自己的笔记数、也不是任何一眼能看出的东西——
+                      // 用户的原话是"看不懂 6 是什么"。
+                      //
+                      // 合计值本身也不是没用，但它**不该占据这个位置**：
+                      // 父级右侧的数字会被读成"这个文件夹里有几篇"，
+                      // 而事实是"它连同下面所有层一共有几篇"。把两者混在一个位置，
+                      // 无论显示哪个都会让另一半的用户困惑。
+                      trailingCount: parents.contains(node.id)
+                          ? null
+                          : node.noteCount,
                       selected: node.id == selected,
                       depth: node.depth,
                       onTap: () {

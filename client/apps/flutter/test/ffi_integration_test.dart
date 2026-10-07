@@ -136,6 +136,7 @@ void main() {
     // 保存正文（两个段落）
     final saved = await notesSave(
       id: note.id,
+      title: null,
       text: '第一段\n第二段',
       atMs: now + 1000,
     );
@@ -209,7 +210,12 @@ void main() {
     final id = created.value!.note!.id;
 
     // 第一次保存：内容真的变了
-    final first = await notesSave(id: id, text: '内容 A', atMs: now + 1000);
+    final first = await notesSave(
+      id: id,
+      title: null,
+      text: '内容 A',
+      atMs: now + 1000,
+    );
     expect(first.ok, isTrue);
     expect(first.value!.note!.version.toInt(), 2, reason: '有变更应递增版本');
 
@@ -225,7 +231,12 @@ void main() {
     );
 
     // 第二次保存：内容**完全相同**
-    final second = await notesSave(id: id, text: '内容 A', atMs: now + 2000);
+    final second = await notesSave(
+      id: id,
+      title: null,
+      text: '内容 A',
+      atMs: now + 2000,
+    );
     expect(second.ok, isTrue);
     expect(second.value!.note!.version.toInt(), 2, reason: '内容未变时版本不得前进');
 
@@ -235,7 +246,12 @@ void main() {
     expect(afterSecond.length, 2, reason: '内容未变时不得追加修订记录');
 
     // 第三次保存：内容又变了
-    final third = await notesSave(id: id, text: '内容 B', atMs: now + 3000);
+    final third = await notesSave(
+      id: id,
+      title: null,
+      text: '内容 B',
+      atMs: now + 3000,
+    );
     expect(third.value!.note!.version.toInt(), 3);
 
     final historyResult = await notesRevisionHistory(id: id, limit: 0);

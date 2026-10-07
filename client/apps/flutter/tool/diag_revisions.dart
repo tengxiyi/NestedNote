@@ -30,11 +30,21 @@ Future<void> main() async {
   stdout.writeln('创建后 version=${created.value!.note!.version.toInt()}');
   dump('创建后', await _history(id));
 
-  final first = await notesSave(id: id, text: '内容 A', atMs: now + 1000);
+  final first = await notesSave(
+    id: id,
+    title: null,
+    text: '内容 A',
+    atMs: now + 1000,
+  );
   stdout.writeln('保存1 后 version=${first.value!.note!.version.toInt()}');
   dump('保存1 后', await _history(id));
 
-  final second = await notesSave(id: id, text: '内容 A', atMs: now + 2000);
+  final second = await notesSave(
+    id: id,
+    title: null,
+    text: '内容 A',
+    atMs: now + 2000,
+  );
   stdout.writeln('保存2（内容相同）后 version=${second.value!.note!.version.toInt()}');
   dump('保存2 后', await _history(id));
 

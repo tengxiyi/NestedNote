@@ -12,8 +12,8 @@ Future<void> main() async {
 
   final created = await notesCreate(title: '[验证]快照', atMs: now);
   final id = created.value!.note!.id;
-  await notesSave(id: id, text: '第一版内容', atMs: now + 1000);
-  await notesSave(id: id, text: '第二版内容', atMs: now + 2000);
+  await notesSave(id: id, title: null, text: '第一版内容', atMs: now + 1000);
+  await notesSave(id: id, title: null, text: '第二版内容', atMs: now + 2000);
 
   final history = await notesRevisionHistory(id: id, limit: 0);
   stdout.writeln('修订数=${history.value!.revisions.length}');

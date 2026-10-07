@@ -173,6 +173,7 @@ Future<void> main(List<String> args) async {
       }
       final saved = await notesSave(
         id: note.value!.note!.id,
+        title: null,
         text: body,
         atMs: now,
       );

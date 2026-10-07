@@ -528,9 +528,20 @@ pub fn notes_read(id: &str) -> NoteResult {
     }
 }
 
-/// 保存一篇笔记的内容（自动递增修订号并追加修订记录，铁律 T6）。
+/// 保存一篇笔记的内容与标题（自动递增修订号并追加修订记录，铁律 T6）。
+///
+/// ## 为什么标题与正文一次写
+///
+/// 界面上标题与正文是两个输入框，但用户心里的"这篇笔记"是一个东西。
+/// 若分成两次调用，就会出现"标题存了、正文没存"的中间状态——
+/// 自动保存失败时尤其难看：列表里标题变了，点进去内容还是旧的。
+///
+/// 一次调用也少一次事务、少一次修订记录。
+///
+/// `title` 传 `None` 表示**不动标题**（沿用库里的），
+/// 这样只改正文的调用方（如批量脚本）不必先读一次标题。
 #[must_use]
-pub fn notes_save(id: &str, text: &str, at_ms: i64) -> NoteResult {
+pub fn notes_save(id: &str, title: Option<String>, text: &str, at_ms: i64) -> NoteResult {
     let parsed = match parse_id(id) {
         Ok(parsed) => parsed,
         Err(failure) => return failure,
@@ -552,6 +563,10 @@ pub fn notes_save(id: &str, text: &str, at_ms: i64) -> NoteResult {
         let device = core.device_id()?;
         let mut note = core.get_note(&parsed)?;
         note.set_summary(summary)?;
+        // `None` 表示不动标题：沿用库里的，而不是把标题清空。
+        if let Some(title) = title {
+            note.set_title(title)?;
+        }
         core.save_note(note, document, &device, at_ms)
     }) {
         Ok(note) => NoteResult::ok(NotePayload {
@@ -1211,7 +1226,7 @@ mod tests {
         assert_eq!(note.title, "第一篇");
         assert_eq!(note.version, 1);
 
-        let saved = notes_save(&note.id, "第一行\n第二行", NOW + 1000);
+        let saved = notes_save(&note.id, None, "第一行\n第二行", NOW + 1000);
         assert!(saved.ok, "保存失败：{:?}", saved.hint);
         let saved_note = saved.value.expect("payload").note.expect("note");
         assert_eq!(saved_note.version, 2, "保存必须递增修订号（铁律 T6）");
@@ -1305,7 +1320,7 @@ mod tests {
         assert!(created.ok, "创建失败：{:?}", created.hint);
         let note = created.value.expect("payload").note.expect("note");
 
-        let saved = notes_save(&note.id, "", NOW + 1);
+        let saved = notes_save(&note.id, None, "", NOW + 1);
         assert!(saved.ok, "保存失败：{:?}", saved.hint);
 
         let read = notes_read(&note.id);
@@ -1324,7 +1339,7 @@ mod tests {
         assert!(engine_start(&path).ready);
         let created = notes_create(None, "持久化", NOW);
         let note = created.value.expect("payload").note.expect("note");
-        assert!(notes_save(&note.id, "重启前的正文", NOW + 1).ok);
+        assert!(notes_save(&note.id, None, "重启前的正文", NOW + 1).ok);
 
         // 模拟重启：用同一目录重新启动引擎
         assert!(engine_start(&path).ready);
