@@ -39,6 +39,7 @@ pub mod api;
 pub mod attachments;
 pub mod branding;
 pub mod error;
+pub mod naming;
 
 pub use api::{
     DiffLineKind, NestedCore, RevisionDiff, RevisionDiffLine, RevisionSummary, TrashPurgeReport,

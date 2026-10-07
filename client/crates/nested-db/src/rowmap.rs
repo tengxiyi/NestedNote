@@ -38,6 +38,18 @@ pub fn id_at(row: &Row<'_>, index: usize, entity: &'static str) -> rusqlite::Res
     Id::from_slice(&raw).map_err(|_| corrupt(entity))
 }
 
+/// 从已读出的 BLOB 字节构造 UUID。
+///
+/// 与 [`id_at`] 的区别：这个用于"值已经在手上（例如从 `query_row` 拿到的
+/// `Vec<u8>`）、但不在 `Row` 里"的场合。
+///
+/// # Errors
+///
+/// 不是 16 字节时返回 [`DbError::Corrupt`]。
+pub fn id_from_bytes(raw: &[u8], entity: &'static str) -> Result<Id, DbError> {
+    Id::from_slice(raw).map_err(|_| DbError::Corrupt { entity })
+}
+
 /// 读取可空 UUID。
 ///
 /// # Errors

@@ -632,15 +632,34 @@ impl NestedCore {
 
     /// 创建标签。
     ///
+    /// ## 同名标签在回收站里时会**复活**它
+    ///
+    /// `idx_tags_name_unique` 是 `name COLLATE NOCASE` 上的唯一索引，
+    /// **不含 `deleted_at_ms`**——墓碑仍然占着那个索引位。
+    ///
+    /// 因此删掉"工作"后再新建"工作"不能报重名：那个错误指向一个
+    /// **用户看不见的墓碑**（界面上明明没有"工作"这个标签），
+    /// 是最令人困惑的一类提示。仓储层会复活那一行并复用它的 id，
+    /// 本方法随之返回**复活后的**标签（id 可能与新建的不同）。
+    ///
+    /// 技术债 #13 由此偿还。
+    ///
     /// # Errors
     ///
-    /// 重名 → [`CoreError::Conflict`]；名称为空 → [`CoreError::Validation`]。
+    /// 同名标签**仍在正常使用** → [`CoreError::Conflict`]；
+    /// 名称为空 → [`CoreError::Validation`]。
     pub fn create_tag(&self, name: impl Into<String>, at_ms: i64) -> CoreResult<Tag> {
         let tag = Tag::new(name, at_ms)?;
         let device_id = self.device_id()?;
         let mut connection = self.database.connection()?;
         match tags::insert(&mut connection, &tag, &device_id) {
-            Ok(()) => Ok(tag),
+            // 复活时实际生效的是**原有那一行**，因此要按返回的 id 重新读，
+            // 而不是把刚构造的 tag 返回给调用方——否则调用方拿到的 id
+            // 与库里真实存在的 id 不一致，后续 attach 会因外键失败。
+            Ok(outcome) if outcome.resurrected => {
+                tags::get(&connection, &outcome.id)?.ok_or(CoreError::NotFound { entity: "tag" })
+            }
+            Ok(_) => Ok(tag),
             Err(DbError::Conflict { .. }) => Err(CoreError::Conflict("标签名称已存在".to_owned())),
             Err(other) => Err(CoreError::Database(other)),
         }
@@ -664,6 +683,142 @@ impl NestedCore {
     pub fn list_note_tags(&self, note_id: &Id) -> CoreResult<Vec<Tag>> {
         let connection = self.database.connection()?;
         Ok(tags::list_for_note(&connection, note_id)?)
+    }
+
+    // ---------------------------------------------------------------- 深拷贝
+
+    /// 复制一篇笔记（"复制一份 / 创建副本"）。
+    ///
+    /// ## 复制了什么、没复制什么
+    ///
+    /// | 内容 | 处理 |
+    /// |---|---|
+    /// | 标题 | **加后缀**（附件标题同理），而不是原样复制 |
+    /// | 正文 | 完整复制（同一份序列化字节） |
+    /// | 标签 | 复制关联（`note_tags` 行） |
+    /// | 附件 | **只复制引用，不复制字节** |
+    /// | 修订历史 | **不复制**——副本从第 1 版重新开始 |
+    ///
+    /// ## 附件为什么只复制引用
+    ///
+    /// 这正是内容寻址（铁律 T8）的收益：附件路径由内容哈希决定，
+    /// 因此副本与原件的引用指向**同一份字节**。复制 100 次不会多占磁盘。
+    ///
+    /// 若改成"复制字节"，就在数据库之外引入了 100 份重复文件，
+    /// CAS 的去重能力被绕过——这是个看起来无害、实际会让磁盘爆掉的改动。
+    ///
+    /// ## 修订历史为什么不复制
+    ///
+    /// 修订是"这篇笔记**发生过什么**"的审计材料。副本没有发生过那些事，
+    /// 把历史一起复制过去等于**伪造审计材料**——与迁移 `0003`
+    /// "不回填历史快照"是同一个原则。
+    ///
+    /// # Errors
+    ///
+    /// 原笔记不存在 → [`CoreError::NotFound`]。
+    pub fn duplicate_note(&self, id: &Id, at_ms: i64) -> CoreResult<Note> {
+        let device_id = self.device_id()?;
+        let source = self.get_note(id)?;
+        let document = self.get_note_document(id)?;
+        // 标签不在这里读——`copy_tags_to` 会自己读一次。
+        // 提前读只是为了"失败要趁早"，但那会让失败点在创建**之前**，
+        // 反而留下更难解释的中间状态；不如让复制先成功，标签失败只影响标签。
+
+        let title = crate::naming::copy_title(&source.title)?;
+        let copy =
+            self.create_note_with_document(source.notebook_id, title, document, &device_id, at_ms)?;
+
+        // 标签关联在**单独的写事务**里复制。不能与创建合并：
+        // `create_note_with_document` 自己开关事务，而嵌套事务是被禁止的
+        // （`DbError::NestedTransaction`）。
+        //
+        // 因此这是"两步、各自原子"而不是"一步原子"。写在这里是因为它是个
+        // 真实取舍：若第二步失败，会留下一个**内容完整但没有标签**的副本，
+        // 比"什么都没复制"差一点，但远好过让整个复制失败并丢掉内容。
+        self.copy_tags_to(id, &copy.id, &device_id, at_ms)?;
+
+        Ok(copy)
+    }
+
+    /// 把一篇笔记的标签关联复制到另一篇上。
+    ///
+    /// # Errors
+    ///
+    /// 读取源标签或写入关联失败 → [`CoreError::Database`]。
+    fn copy_tags_to(&self, from: &Id, to: &Id, device_id: &str, at_ms: i64) -> CoreResult<()> {
+        let tags_of_source = self.list_note_tags(from)?;
+        if tags_of_source.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.database.connection()?;
+        let tag_ids: Vec<Id> = tags_of_source.iter().map(|tag| tag.id).collect();
+        tags::set_note_tags(&mut connection, to, &tag_ids, device_id, at_ms)?;
+        Ok(())
+    }
+
+    /// 复制一个笔记本（含其下**全部**笔记与子笔记本，递归）。
+    ///
+    /// 返回新建的子树根。
+    ///
+    /// ## 递归复制，但每篇笔记只复制一次
+    ///
+    /// 笔记只属于一个笔记本（`notes.notebook_id`），因此不存在
+    /// "同一篇笔记被复制两次"的情况——不需要额外的去重表。
+    /// 附件的字节同样**不复制**（理由见 [`Self::duplicate_note`]）。
+    ///
+    /// # Errors
+    ///
+    /// 原笔记本不存在 → [`CoreError::NotFound`]。
+    pub fn duplicate_notebook(&self, id: &Id, at_ms: i64) -> CoreResult<Notebook> {
+        let device_id = self.device_id()?;
+        let source = self.get_notebook(id)?;
+        let title = crate::naming::copy_notebook_name(&source.name)?;
+        let copy = self.create_notebook(title, source.parent_id, at_ms)?;
+        self.copy_notebook_contents(id, &copy.id, &device_id, at_ms)?;
+        Ok(copy)
+    }
+
+    /// 把 `source_id` 的笔记与子笔记本复制到 `target` 下（不复制 `source_id` 自身）。
+    ///
+    /// 一次性取全量笔记与笔记本再按 parent 过滤，而不是每个节点各查一次：
+    /// 笔记本树通常不大，一次读全量能省掉大量往返，也避免递归中反复查库。
+    ///
+    /// # Errors
+    ///
+    /// 读取或写入失败 → [`CoreError::Database`]。
+    fn copy_notebook_contents(
+        &self,
+        source_id: &Id,
+        target: &Id,
+        device_id: &str,
+        at_ms: i64,
+    ) -> CoreResult<()> {
+        let all_notes = self.list_notes(&NoteQuery {
+            include_deleted: false,
+            ..NoteQuery::default()
+        })?;
+        for note in all_notes
+            .iter()
+            .filter(|note| note.notebook_id == Some(*source_id))
+        {
+            let document = self.get_note_document(&note.id)?;
+            let title = crate::naming::copy_title(&note.title)?;
+            let new_note =
+                self.create_note_with_document(Some(*target), title, document, device_id, at_ms)?;
+            self.copy_tags_to(&note.id, &new_note.id, device_id, at_ms)?;
+        }
+
+        let all_notebooks = self.list_notebooks()?;
+        for child in all_notebooks
+            .iter()
+            .filter(|notebook| notebook.parent_id == Some(*source_id))
+        {
+            // 子笔记本的**名称不加后缀**：后缀已经加在子树根上了，
+            // 每层都加会变成"工作（副本）（副本）（副本）"。
+            let child_copy = self.create_notebook(child.name.clone(), Some(*target), at_ms)?;
+            self.copy_notebook_contents(&child.id, &child_copy.id, device_id, at_ms)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ 修订对比
@@ -1595,7 +1750,237 @@ mod tests {
         ));
     }
 
-    /// 建一棵三层笔记本树：根 → 中 → 叶。    /// 建一棵三层笔记本树：根 → 中 → 叶。
+    // ---------------------------------------------------------------- 深拷贝
+
+    #[test]
+    fn duplicating_a_note_copies_content_but_not_history() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (source_id, _ids) = note_with_versions(&core, &[&["第一版"], &["第二版"]]);
+
+        let copy = core.duplicate_note(&source_id, NOW + 9000).expect("copy");
+
+        assert_ne!(copy.id, source_id, "副本必须是新的 id");
+        assert_eq!(copy.version, 1, "副本从第 1 版重新开始");
+        assert!(
+            copy.title.ends_with("（副本）"),
+            "标题要能辨认出是副本，实际：{}",
+            copy.title
+        );
+
+        let source_doc = core.get_note_document(&source_id).expect("doc");
+        let copy_doc = core.get_note_document(&copy.id).expect("doc");
+        assert_eq!(
+            copy_doc.blocks.len(),
+            source_doc.blocks.len(),
+            "正文必须完整复制"
+        );
+
+        // **修订历史不复制**：副本没有"发生过"原件那些事，
+        // 把历史一起复制过去等于伪造审计材料。
+        assert_eq!(
+            core.revision_history(&copy.id, 0).expect("history").len(),
+            1,
+            "副本只应有它自己创建时那一条修订"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_note_keeps_it_in_the_same_notebook() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let book = core.create_notebook("工作", None, NOW).expect("book");
+        let note = core
+            .create_note(Some(book.id), "原标题", NOW)
+            .expect("note");
+
+        let copy = core.duplicate_note(&note.id, NOW + 1).expect("copy");
+        assert_eq!(copy.notebook_id, Some(book.id), "副本应留在同一个笔记本里");
+    }
+
+    #[test]
+    fn duplicating_a_note_copies_its_tags() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "带标签的", NOW).expect("note");
+        let tag_a = core.create_tag("工作", NOW).expect("tag a");
+        let tag_b = core.create_tag("重要", NOW).expect("tag b");
+        {
+            let mut connection = core.database.connection().expect("conn");
+            let device = core.device_id().expect("device");
+            nested_db::repositories::tags::set_note_tags(
+                &mut connection,
+                &note.id,
+                &[tag_a.id, tag_b.id],
+                &device,
+                NOW,
+            )
+            .expect("set tags");
+        }
+
+        let copy = core.duplicate_note(&note.id, NOW + 1).expect("copy");
+        assert_eq!(
+            core.list_note_tags(&copy.id).expect("tags").len(),
+            2,
+            "标签关联要一起复制"
+        );
+        // 附带确认不是"把标签也复制了一份"——用的是同一批标签实体
+        assert_eq!(
+            core.list_tags().expect("all tags").len(),
+            2,
+            "复制笔记不该新建标签实体"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_note_does_not_copy_attachment_bytes() {
+        // 内容寻址（铁律 T8）的收益：副本与原件指向**同一份字节**。
+        // 若这里变成"复制字节"，就在库外引入了重复文件，
+        // CAS 的去重能力被绕过——那是会让磁盘爆掉的改动。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = NestedCore::open(dir.path()).expect("open");
+        let note = core.create_note(None, "带附件的", NOW).expect("note");
+        let device = core.device_id().expect("device");
+        core.attach_bytes_to_note(&note.id, b"hello", "text/plain", "a.txt", &device, NOW)
+            .expect("attach");
+
+        let copy = core.duplicate_note(&note.id, NOW + 1).expect("copy");
+
+        let source_attachments = core.list_attachments_for_note(&note.id).expect("list");
+        let copy_attachments = core.list_attachments_for_note(&copy.id).expect("list");
+        assert_eq!(copy_attachments.len(), 1, "附件的关联要复制");
+        assert_eq!(
+            copy_attachments[0].sha256, source_attachments[0].sha256,
+            "副本引用的应当是**同一份内容**（同哈希），而不是新的一份"
+        );
+
+        // 两边都能按同一个哈希读出**同一份字节**——这正是"只复制引用"的证据。
+        // （别去数 attachments 目录里的文件数：CAS 按哈希前缀分子目录，
+        // 顶层没有文件。本测试第一版就是这样数出 0 的。）
+        let from_source = core
+            .read_attachment(&source_attachments[0].sha256)
+            .expect("read");
+        let from_copy = core
+            .read_attachment(&copy_attachments[0].sha256)
+            .expect("read");
+        assert_eq!(from_source, b"hello", "原件内容应可读");
+        assert_eq!(
+            from_source, from_copy,
+            "副本读到的必须是同一份内容，而不是另一份拷贝"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_notebook_copies_the_whole_subtree() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let root = core.create_notebook("工作", None, NOW).expect("root");
+        let child = core
+            .create_notebook("项目 A", Some(root.id), NOW)
+            .expect("child");
+        core.create_note(Some(root.id), "根下笔记", NOW)
+            .expect("n1");
+        core.create_note(Some(child.id), "子下笔记", NOW)
+            .expect("n2");
+
+        let copy = core.duplicate_notebook(&root.id, NOW + 1).expect("copy");
+        assert!(copy.name.ends_with("（副本）"));
+
+        let copied_notes = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&copy.id),
+                include_descendants: true,
+                ..NoteQuery::default()
+            })
+            .expect("notes");
+        assert_eq!(copied_notes.len(), 2, "根与子的笔记都要复制过来");
+
+        let tree = core.list_notebook_tree().expect("tree");
+        assert!(
+            tree.iter().any(|(n, _)| n.name == "项目 A"),
+            "子笔记本要被复制，且名称保持原样"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_notebook_does_not_stack_suffixes_on_children() {
+        // 后缀只加在子树根上。每层都加会变成"工作（副本）（副本）（副本）"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let root = core.create_notebook("工作", None, NOW).expect("root");
+        core.create_notebook("项目 A", Some(root.id), NOW)
+            .expect("child");
+
+        core.duplicate_notebook(&root.id, NOW + 1).expect("copy");
+
+        let tree = core.list_notebook_tree().expect("tree");
+        for (notebook, _) in &tree {
+            assert!(
+                notebook.name.matches("（副本）").count() <= 1,
+                "名称里不该出现重复后缀：{}",
+                notebook.name
+            );
+        }
+        assert_eq!(
+            tree.iter()
+                .filter(|(n, _)| n.name.ends_with("（副本）"))
+                .count(),
+            1,
+            "只有子树根带后缀"
+        );
+        assert!(tree.iter().any(|(n, _)| n.name == "项目 A"));
+    }
+
+    #[test]
+    fn duplicating_a_missing_note_is_not_found() {
+        let core = NestedCore::open_in_memory().expect("open");
+        assert!(matches!(
+            core.duplicate_note(&Id::new(), NOW),
+            Err(CoreError::NotFound { .. })
+        ));
+        assert!(matches!(
+            core.duplicate_notebook(&Id::new(), NOW),
+            Err(CoreError::NotFound { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------ 标签复用
+
+    #[test]
+    fn creating_a_tag_whose_name_was_deleted_resurrects_it() {
+        // 技术债 #13 在**内核层**的验证：删掉"工作"之后还能再建"工作"。
+        // 用户视角：界面上已经没有这个标签了，凭什么说重名？
+        let core = NestedCore::open_in_memory().expect("open");
+        let first = core.create_tag("工作", NOW).expect("first");
+        {
+            let mut connection = core.database.connection().expect("conn");
+            let device = core.device_id().expect("device");
+            nested_db::repositories::tags::soft_delete(
+                &mut connection,
+                &first.id,
+                &device,
+                NOW + 1,
+            )
+            .expect("delete");
+        }
+        assert!(
+            core.list_tags().expect("tags").is_empty(),
+            "删除后不该出现在列表里"
+        );
+
+        let second = core.create_tag("工作", NOW + 2).expect("应当能复用同名");
+        assert_eq!(
+            second.id, first.id,
+            "复活应复用原 id，而不是新建一个（否则同一逻辑标签在库里堆两行）"
+        );
+        assert_eq!(core.list_tags().expect("tags").len(), 1);
+    }
+
+    #[test]
+    fn creating_a_tag_with_a_live_duplicate_name_is_still_a_conflict() {
+        // 反例对照：只在墓碑上复活，不能悄悄改动一个在用的标签
+        let core = NestedCore::open_in_memory().expect("open");
+        core.create_tag("在用", NOW).expect("first");
+        let error = core.create_tag("在用", NOW + 1).expect_err("必须报冲突");
+        assert_eq!(error.code(), "CONFLICT");
+    }
+
+    /// 建一棵三层笔记本树：根 → 中 → 叶。
     fn notebook_tree(core: &NestedCore) -> (Id, Id, Id) {
         let root = core.create_notebook("根", None, NOW).expect("root");
         let mid = core.create_notebook("中", Some(root.id), NOW).expect("mid");
