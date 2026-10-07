@@ -40,10 +40,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/engine.dart';
 import '../core/engine_providers.dart';
+import '../core/layout_providers.dart';
 import 'icons.dart';
+import 'menu_bar.dart';
+import 'note_editor_page.dart';
 import 'note_list_pane.dart';
 import 'notebook_sidebar.dart';
-import 'note_editor_page.dart';
 
 /// 左栏默认宽度。
 const double kSidebarWidth = 232;
@@ -91,23 +93,24 @@ class _NotesPageState extends ConsumerState<NotesPage> {
   /// 当前在右栏打开的笔记。
   String? _openNoteId;
 
-  /// 左栏是否折叠（窄窗口时给内容让位）。
-  bool _sidebarCollapsed = false;
-
   @override
   Widget build(BuildContext context) {
     final AsyncValue<EngineStatus> engine = ref.watch(engineProvider);
+    // 左栏折叠与三栏模式都放进 provider，好让菜单与快捷键能改它们。
+    // 留在 State 里的话，菜单项得持有一个 State 引用才能改——
+    // 那是把"界面状态"与"谁持有它"绑在一起，很快会变成互相引用。
+    final bool sidebarCollapsed = ref.watch(sidebarCollapsedProvider);
+    final PaneLayout layout = ref.watch(paneLayoutProvider);
 
     return Scaffold(
       appBar: AppBar(
         title: Text(engine.value?.displayName ?? '拾光笔记'),
         titleSpacing: 4,
         leading: IconButton(
-          tooltip: _sidebarCollapsed ? '展开笔记本栏' : '折叠笔记本栏',
-          onPressed: () =>
-              setState(() => _sidebarCollapsed = !_sidebarCollapsed),
+          tooltip: sidebarCollapsed ? '展开笔记本栏' : '折叠笔记本栏',
+          onPressed: () => ref.read(sidebarCollapsedProvider.notifier).toggle(),
           icon: Icon(
-            _sidebarCollapsed ? kExpandSidebarIcon : kCollapseSidebarIcon,
+            sidebarCollapsed ? kExpandSidebarIcon : kCollapseSidebarIcon,
           ),
         ),
         actions: <Widget>[
@@ -131,11 +134,23 @@ class _NotesPageState extends ConsumerState<NotesPage> {
       ),
       body: switch (engine) {
         AsyncError(:final Object error) => _FailureView(message: '$error'),
-        AsyncData() => _ThreePane(
-          showDeleted: _showDeleted,
-          sidebarCollapsed: _sidebarCollapsed,
-          openNoteId: _openNoteId,
-          onOpenNote: (String? id) => setState(() => _openNoteId = id),
+        AsyncData() => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            // 菜单栏放在 AppBar 之下、三栏之上：这样它是**跨三栏**的，
+            // 与用户确认的形态一致（印象笔记也是这个位置）。
+            const AppMenuBar(),
+            const Divider(height: 1),
+            Expanded(
+              child: _ThreePane(
+                showDeleted: _showDeleted,
+                sidebarCollapsed: sidebarCollapsed,
+                layout: layout,
+                openNoteId: _openNoteId,
+                onOpenNote: (String? id) => setState(() => _openNoteId = id),
+              ),
+            ),
+          ],
         ),
         _ => const Center(child: CircularProgressIndicator()),
       },
@@ -196,12 +211,14 @@ class _ThreePane extends StatefulWidget {
   const _ThreePane({
     required this.showDeleted,
     required this.sidebarCollapsed,
+    required this.layout,
     required this.openNoteId,
     required this.onOpenNote,
   });
 
   final bool showDeleted;
   final bool sidebarCollapsed;
+  final PaneLayout layout;
   final String? openNoteId;
   final ValueChanged<String?> onOpenNote;
 
@@ -240,19 +257,38 @@ class _ThreePaneState extends State<_ThreePane> {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final double available = constraints.maxWidth;
-        final bool sidebarVisible = !widget.sidebarCollapsed;
+        // 显示模式决定**哪几栏参与布局**。
+        //
+        // 隐藏的栏不是"宽度设成 0"，而是**根本不放进 Row**——
+        // 留一个 0 宽的子项会连带留下它的分隔条，用户会看到一个
+        // 拖不动的细线。这不只是洁癖：那根线看起来像 bug。
+        final bool sidebarVisible =
+            !widget.sidebarCollapsed && widget.layout != PaneLayout.editorOnly;
+        final bool listVisible = widget.layout != PaneLayout.editorOnly;
+        final bool editorVisible = widget.layout != PaneLayout.listOnly;
 
-        // 分隔条的命中宽度是可拖动的，因此也要从可用宽度里扣掉
-        final double chrome = sidebarVisible
-            ? kSplitterHitWidth * 2
-            : kSplitterHitWidth;
-        final double budget = (available - kReadingPaneMinWidth - chrome).clamp(
+        // 分隔条的命中宽度是可拖动的，因此也要从可用宽度里扣掉。
+        // 只算**实际显示**的分隔条。
+        int splitterCount = 0;
+        if (sidebarVisible && listVisible) {
+          splitterCount++;
+        }
+        if (listVisible && editorVisible) {
+          splitterCount++;
+        }
+        final double chrome = kSplitterHitWidth * splitterCount;
+
+        // 只看列表时没有编辑器，就不必给正文留最小宽度
+        final double reserveForEditor = editorVisible
+            ? kReadingPaneMinWidth
+            : 0;
+        final double budget = (available - reserveForEditor - chrome).clamp(
           0.0,
           double.infinity,
         );
 
         double sidebar = sidebarVisible ? _sidebarWidth : 0;
-        double list = _listWidth;
+        double list = listVisible ? _listWidth : 0;
 
         // 超过预算时按比例压缩（保持两栏的相对关系，而不是把某一栏压到最小）
         final double used = sidebar + list;
@@ -269,25 +305,30 @@ class _ThreePaneState extends State<_ThreePane> {
               SizedBox(width: sidebar, child: const NotebookSidebar()),
               PaneSplitter(tooltip: '拖动调整笔记本栏宽度', onDrag: dragSidebar),
             ],
-            SizedBox(
-              width: list,
-              child: NoteListPane(
-                showDeleted: widget.showDeleted,
-                openNoteId: widget.openNoteId,
-                onOpenNote: widget.onOpenNote,
+            if (listVisible) ...<Widget>[
+              SizedBox(
+                width: list,
+                child: NoteListPane(
+                  showDeleted: widget.showDeleted,
+                  openNoteId: widget.openNoteId,
+                  onOpenNote: widget.onOpenNote,
+                ),
               ),
-            ),
-            PaneSplitter(tooltip: '拖动调整笔记列表宽度', onDrag: dragList),
-            Expanded(
-              child: widget.openNoteId == null
-                  ? const _EmptyReadingPane()
-                  : NoteEditorPane(
-                      // key 让"切换到另一篇笔记"时重建编辑状态，
-                      // 否则会沿用上一篇的文本与"已保存"基准
-                      key: ValueKey<String>(widget.openNoteId!),
-                      noteId: widget.openNoteId!,
-                    ),
-            ),
+              // 编辑器也显示时才有东西可拖：没有它，这根分隔条拖不动任何东西
+              if (editorVisible)
+                PaneSplitter(tooltip: '拖动调整笔记列表宽度', onDrag: dragList),
+            ],
+            if (editorVisible)
+              Expanded(
+                child: widget.openNoteId == null
+                    ? const _EmptyReadingPane()
+                    : NoteEditorPane(
+                        // key 让"切换到另一篇笔记"时重建编辑状态，
+                        // 否则会沿用上一篇的文本与"已保存"基准
+                        key: ValueKey<String>(widget.openNoteId!),
+                        noteId: widget.openNoteId!,
+                      ),
+              ),
           ],
         );
       },

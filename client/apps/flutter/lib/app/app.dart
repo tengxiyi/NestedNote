@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'notes_page.dart';
+import 'shortcuts_host.dart';
 import 'typography.dart';
 
 /// 品牌中文名（与 Rust 侧 `nested_core::branding` 保持一致）。
@@ -29,32 +30,38 @@ class NestedNoteApp extends ConsumerWidget {
     // 品牌色：低饱和的墨绿，长时间阅读不刺眼
     const Color seed = Color(0xFF3F6B5C);
 
-    return MaterialApp(
-      title: kBrandNameZh,
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: seed),
-        useMaterial3: true,
-        // 显式指定含中文字形的字体栈。不指定的话中文全靠回退，
-        // 而回退在不同字号/控件下不稳定 → 同一界面里中文粗细不一
-        //（用户报过这个现象）。见 `typography.dart` 的说明。
-        textTheme: buildTextTheme(Brightness.light),
-        // 数字与西文也要一致：`primaryTextTheme` 与 `textTheme` 分属
-        // 不同来源，只改一个会让 AppBar 标题与正文用上不同字体。
-        primaryTextTheme: buildTextTheme(Brightness.light),
-      ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: seed,
-          brightness: Brightness.dark,
+    // 快捷键宿主包在 `MaterialApp` **外面**：`MaterialApp` 内部的
+    // `DefaultTextEditingShortcuts` 会先吃掉文本框里的按键，
+    // 我们必须在元素树里比它更靠上，才能收到 Ctrl+1/2/3。
+    // 详见 `shortcuts_host.dart` 的说明——这是被测试抓出来的真实缺陷。
+    return AppShortcutHost(
+      child: MaterialApp(
+        title: kBrandNameZh,
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(seedColor: seed),
+          useMaterial3: true,
+          // 显式指定含中文字形的字体栈。不指定的话中文全靠回退，
+          // 而回退在不同字号/控件下不稳定 → 同一界面里中文粗细不一
+          //（用户报过这个现象）。见 `typography.dart` 的说明。
+          textTheme: buildTextTheme(Brightness.light),
+          // 数字与西文也要一致：`primaryTextTheme` 与 `textTheme` 分属
+          // 不同来源，只改一个会让 AppBar 标题与正文用上不同字体。
+          primaryTextTheme: buildTextTheme(Brightness.light),
         ),
-        useMaterial3: true,
-        textTheme: buildTextTheme(Brightness.dark),
-        primaryTextTheme: buildTextTheme(Brightness.dark),
+        darkTheme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: seed,
+            brightness: Brightness.dark,
+          ),
+          useMaterial3: true,
+          textTheme: buildTextTheme(Brightness.dark),
+          primaryTextTheme: buildTextTheme(Brightness.dark),
+        ),
+        // 深色模式跟随系统（铁律 F8：必须支持深色模式）
+        themeMode: ThemeMode.system,
+        home: const NotesPage(),
       ),
-      // 深色模式跟随系统（铁律 F8：必须支持深色模式）
-      themeMode: ThemeMode.system,
-      home: const NotesPage(),
     );
   }
 }
