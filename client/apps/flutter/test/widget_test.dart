@@ -27,6 +27,7 @@ import 'package:nested/app/notes_page.dart';
 import 'package:nested/core/engine.dart';
 import 'package:nested/core/engine_providers.dart';
 import 'package:nested/core/notebook_providers.dart';
+import 'package:nested/app/icons.dart';
 import 'package:nested/core/note_providers.dart';
 
 /// 一个"引擎已就绪"的假状态。
@@ -127,19 +128,15 @@ void main() {
 
     // 中栏：笔记列表
     expect(find.byType(NoteListPane), findsOneWidget);
-    expect(find.byIcon(Icons.add), findsOneWidget, reason: '在此新建笔记');
+    expect(find.byIcon(kNewNoteIcon), findsOneWidget, reason: '在此新建笔记');
 
     // 右栏：未选笔记时的提示
     expect(find.text('从左侧选择一篇笔记'), findsOneWidget);
 
     // 工具栏
-    expect(find.byIcon(Icons.menu_open), findsOneWidget, reason: '折叠左栏');
-    expect(find.byIcon(Icons.delete_outlined), findsOneWidget, reason: '回收站');
-    expect(
-      find.byIcon(Icons.monitor_heart_outlined),
-      findsOneWidget,
-      reason: '引擎自检',
-    );
+    expect(find.byIcon(kCollapseSidebarIcon), findsOneWidget, reason: '折叠左栏');
+    expect(find.byIcon(kRecycleBinIcon), findsOneWidget, reason: '回收站');
+    expect(find.byIcon(kDiagnosticsIcon), findsOneWidget, reason: '引擎自检');
   });
 
   testWidgets('折叠左栏后笔记本树消失，中栏与右栏仍在', (WidgetTester tester) async {
@@ -147,7 +144,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(NotebookSidebar), findsOneWidget);
 
-    await tester.tap(find.byIcon(Icons.menu_open));
+    await tester.tap(find.byIcon(kCollapseSidebarIcon));
     await tester.pumpAndSettle();
 
     expect(find.byType(NotebookSidebar), findsNothing, reason: '折叠后应移除');
@@ -220,7 +217,7 @@ void main() {
     await tester.pumpWidget(harness());
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byIcon(Icons.delete_outlined));
+    await tester.tap(find.byIcon(kRecycleBinIcon));
     await tester.pumpAndSettle();
 
     expect(find.text('回收站'), findsWidgets);
@@ -228,7 +225,7 @@ void main() {
 
     final IconButton addButton = tester.widget<IconButton>(
       find.ancestor(
-        of: find.byIcon(Icons.add),
+        of: find.byIcon(kNewNoteIcon),
         matching: find.byType(IconButton),
       ),
     );
@@ -308,6 +305,184 @@ void main() {
       // 不该出现，但出现了也不能把内容挤出可视区
       expect(notebookIndent(-1), kIndentBase);
       expect(notebookIndent(-100), kIndentBase);
+    });
+  });
+
+  group('分栏可拖动调整宽度', () {
+    /// 取某个部件当前的渲染宽度。
+    double widthOf(WidgetTester tester, Finder finder) =>
+        tester.getSize(finder).width;
+
+    testWidgets('三栏各有一条可拖动分隔条（左栏折叠时剩两条）', (WidgetTester tester) async {
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+      expect(find.byType(PaneSplitter), findsNWidgets(2), reason: '左栏 + 中栏各一条');
+
+      // 展开左栏后是两条分隔条（左|中、中|右）
+      await tester.pumpWidget(
+        harness(
+          notebooks: <NotebookNode>[node(id: 'nb', name: '工作')],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(PaneSplitter), findsNWidgets(2));
+    });
+
+    testWidgets('向右拖动中栏分隔条会加宽中栏', (WidgetTester tester) async {
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+
+      final Finder listPane = find.byType(NoteListPane);
+      final double before = widthOf(tester, listPane);
+
+      // 拖动**第二个**分隔条（中栏与右栏之间）
+      final Finder splitter = find.byType(PaneSplitter).at(1);
+      await tester.drag(splitter, const Offset(60, 0));
+      await tester.pumpAndSettle();
+
+      expect(
+        widthOf(tester, listPane),
+        greaterThan(before),
+        reason: '向右拖动应加宽中栏（$before → ${widthOf(tester, listPane)}）',
+      );
+    });
+
+    testWidgets('向左拖动中栏分隔条会收窄中栏', (WidgetTester tester) async {
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+
+      final Finder listPane = find.byType(NoteListPane);
+      final double before = widthOf(tester, listPane);
+
+      await tester.drag(find.byType(PaneSplitter).at(1), const Offset(-50, 0));
+      await tester.pumpAndSettle();
+
+      expect(widthOf(tester, listPane), lessThan(before));
+    });
+
+    testWidgets('中栏宽度不会超过上限，也不会低于下限', (WidgetTester tester) async {
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+
+      final Finder listPane = find.byType(NoteListPane);
+
+      // 往右猛拖：应停在上限
+      await tester.drag(find.byType(PaneSplitter).at(1), const Offset(1200, 0));
+      await tester.pumpAndSettle();
+      expect(
+        widthOf(tester, listPane),
+        lessThanOrEqualTo(kNoteListMaxWidth + 0.5),
+        reason: '不应无限加宽',
+      );
+
+      // 往左猛拖：应停在下限
+      await tester.drag(
+        find.byType(PaneSplitter).at(1),
+        const Offset(-1200, 0),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        widthOf(tester, listPane),
+        greaterThanOrEqualTo(kNoteListMinWidth - 0.5),
+        reason: '不应被拖到 0 宽——那会让用户以为列表没了',
+      );
+      expect(find.byType(NoteListPane), findsOneWidget, reason: '中栏仍然存在');
+    });
+
+    testWidgets('左栏拖动后仍给右栏留出最小宽度', (WidgetTester tester) async {
+      // 展开左栏
+      await tester.pumpWidget(
+        harness(
+          notebooks: <NotebookNode>[node(id: 'nb', name: '工作')],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(NotebookSidebar), findsOneWidget);
+
+      // 把左栏往右猛拖
+      await tester.drag(find.byType(PaneSplitter).first, const Offset(2000, 0));
+      await tester.pumpAndSettle();
+
+      // 右栏（阅读区提示）必须仍然可见且有合理宽度
+      final Finder reading = find.text('从左侧选择一篇笔记');
+      expect(reading, findsOneWidget, reason: '右栏不能被挤掉');
+      expect(
+        tester
+            .getSize(
+              find.ancestor(of: reading, matching: find.byType(Center)).first,
+            )
+            .width,
+        greaterThan(0),
+      );
+    });
+  });
+
+  group('图标体系', () {
+    testWidgets('不同层级的笔记本用不同的文件夹图标', (WidgetTester tester) async {
+      await tester.pumpWidget(
+        harness(
+          notebooks: <NotebookNode>[
+            // 名称刻意用不会与界面固定文案（"全部笔记""笔记本"）相撞的词，
+            // 否则 find.text 可能匹配到别的部件
+            node(id: 'a', name: '甲层', depth: 0),
+            node(id: 'b', name: '乙层', depth: 1),
+            node(id: 'c', name: '丙层', depth: 2),
+            node(id: 'd', name: '丁层', depth: 3),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 按行部件定位图标：不能用 find.ancestor(byType(Row))——
+      // 那会命中整棵树的 Row，descendant.first 取到的是别的图标
+      // （本项目就在这里踩过一次，测试报"三个层级只有两个不同图标"）。
+      IconData iconOf(String label) {
+        final Finder tile = find.ancestor(
+          of: find.text(label),
+          matching: find.byType(NotebookTreeTile),
+        );
+        final Finder icon = find.descendant(
+          of: tile.first,
+          matching: find.byType(Icon),
+        );
+        return tester.widget<Icon>(icon.first).icon!;
+      }
+
+      final IconData top = iconOf('甲层');
+      final IconData second = iconOf('乙层');
+      final IconData third = iconOf('丙层');
+      final IconData fourth = iconOf('丁层');
+
+      expect(
+        <IconData>{top, second, third},
+        hasLength(3),
+        reason: '第 1/2/3 层必须是三个不同的图标——这是多层级可视化的前提',
+      );
+      expect(fourth, third, reason: '超过图标档位后复用最深一档（形状不再细分，但一致）');
+    });
+
+    test('层级图标取自同一族，超出档位时落到最深一档', () {
+      // 同族：都能在 kFolderIconsByDepth 里找到
+      for (int depth = 0; depth < kFolderIconsByDepth.length; depth++) {
+        expect(folderIconForDepth(depth), kFolderIconsByDepth[depth]);
+      }
+      expect(folderIconForDepth(99), kNotebookDeepIcon, reason: '超出档位用最深一档');
+      expect(folderIconForDepth(-1), kNotebookRootIcon, reason: '非法深度兜底');
+
+      // 三档互不相同（否则层级就分不出来了）
+      expect(
+        kFolderIconsByDepth.toSet(),
+        hasLength(kFolderIconsByDepth.length),
+      );
+    });
+
+    testWidgets('笔记在中栏与右栏用同一个图标', (WidgetTester tester) async {
+      // 一致性要求：同一概念在任何位置必须同形。
+      // 早期版本中栏用 description_outlined、右栏标题用 article_outlined，
+      // 同一个"笔记"在两个位置长得不一样。
+      expect(kNoteIcon, isNot(kEmptyReadingIcon), reason: '笔记与空态提示本就不同');
+      expect(kDeletedNoteIcon, kNoteIcon, reason: '回收站里的笔记只是改了颜色，形状不变');
+      expect(kRecycleBinIcon, isNot(kRecycleBinActiveIcon), reason: '开关两态需可区分');
     });
   });
 

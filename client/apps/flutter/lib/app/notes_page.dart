@@ -42,13 +42,38 @@ import '../core/engine.dart';
 import '../core/engine_providers.dart';
 import '../core/notebook_providers.dart';
 import '../core/note_providers.dart';
+import 'icons.dart';
 import 'note_editor_page.dart';
 
-/// 左栏宽度。
+/// 左栏默认宽度。
 const double kSidebarWidth = 232;
 
-/// 中栏宽度。
+/// 左栏宽度下限（再窄就放不下名称了）。
+const double kSidebarMinWidth = 150;
+
+/// 左栏宽度上限。
+const double kSidebarMaxWidth = 420;
+
+/// 中栏默认宽度。
 const double kNoteListWidth = 300;
+
+/// 中栏宽度下限。
+const double kNoteListMinWidth = 200;
+
+/// 中栏宽度上限。
+const double kNoteListMaxWidth = 480;
+
+/// 右栏（阅读区）的最小宽度。
+///
+/// 拖动左栏或中栏时，至少给右栏留这么多——否则用户能把内容区挤到 0 宽，
+/// 然后以为"笔记打开后是空白的"。
+const double kReadingPaneMinWidth = 260;
+
+/// 分栏拖动条的**可拖动宽度**。
+///
+/// 刻意比视觉宽度（1–3 逻辑像素）大得多：一条 1 像素的线用鼠标几乎抓不住。
+/// 这是桌面应用里很常见的可用性问题——看得见但点不中。
+const double kSplitterHitWidth = 8;
 
 /// 笔记主界面。
 class NotesPage extends ConsumerStatefulWidget {
@@ -81,14 +106,17 @@ class _NotesPageState extends ConsumerState<NotesPage> {
           tooltip: _sidebarCollapsed ? '展开笔记本栏' : '折叠笔记本栏',
           onPressed: () =>
               setState(() => _sidebarCollapsed = !_sidebarCollapsed),
-          icon: Icon(_sidebarCollapsed ? Icons.menu : Icons.menu_open),
+          icon: Icon(
+            _sidebarCollapsed ? kExpandSidebarIcon : kCollapseSidebarIcon,
+          ),
         ),
         actions: <Widget>[
           IconButton(
             tooltip: _showDeleted ? '隐藏回收站' : '显示回收站',
             onPressed: () => setState(() => _showDeleted = !_showDeleted),
             icon: Icon(
-              _showDeleted ? Icons.delete : Icons.delete_outlined,
+              // 开关的"开/关"用同一套图标的变体表达（轮廓 → 实心）
+              _showDeleted ? kRecycleBinActiveIcon : kRecycleBinIcon,
               color: _showDeleted
                   ? Theme.of(context).colorScheme.primary
                   : null,
@@ -97,7 +125,7 @@ class _NotesPageState extends ConsumerState<NotesPage> {
           IconButton(
             tooltip: '引擎自检',
             onPressed: () => _showDiagnostics(context),
-            icon: const Icon(Icons.monitor_heart_outlined),
+            icon: const Icon(kDiagnosticsIcon),
           ),
         ],
       ),
@@ -129,7 +157,7 @@ class _NotesPageState extends ConsumerState<NotesPage> {
                 Row(
                   children: <Widget>[
                     Icon(
-                      check.passed ? Icons.check_circle : Icons.error,
+                      check.passed ? kCheckIcon : kErrorIcon,
                       size: 18,
                       color: check.passed ? Colors.green : Colors.red,
                     ),
@@ -156,8 +184,15 @@ class _NotesPageState extends ConsumerState<NotesPage> {
   }
 }
 
-/// 三栏容器。
-class _ThreePane extends StatelessWidget {
+/// 三栏容器 —— 三栏宽度**均可拖动调整**。
+///
+/// ## 宽度规则
+///
+/// - 左栏与中栏由用户拖动决定宽度，各自有最小/最大值
+/// - 右栏吃掉剩余空间（它是内容区，本来就该占据最大份额）
+/// - 拖动左栏分隔条时，上限由"右栏至少留 [kReadingPaneMinWidth]"决定——
+///   否则用户可以把右栏挤到 0 宽，然后以为"笔记不见了"
+class _ThreePane extends StatefulWidget {
   const _ThreePane({
     required this.showDeleted,
     required this.sidebarCollapsed,
@@ -171,36 +206,195 @@ class _ThreePane extends StatelessWidget {
   final ValueChanged<String?> onOpenNote;
 
   @override
+  State<_ThreePane> createState() => _ThreePaneState();
+}
+
+class _ThreePaneState extends State<_ThreePane> {
+  /// 左栏宽度。
+  double _sidebarWidth = kSidebarWidth;
+
+  /// 中栏宽度。
+  double _listWidth = kNoteListWidth;
+
+  @override
   Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        if (!sidebarCollapsed) ...<Widget>[
-          const SizedBox(width: kSidebarWidth, child: NotebookSidebar()),
-          const VerticalDivider(width: 1),
-        ],
-        SizedBox(
-          width: kNoteListWidth,
-          child: NoteListPane(
-            showDeleted: showDeleted,
-            openNoteId: openNoteId,
-            onOpenNote: onOpenNote,
-          ),
-        ),
-        const VerticalDivider(width: 1),
-        Expanded(
-          child: openNoteId == null
-              ? const _EmptyReadingPane()
-              : NoteEditorPane(
-                  // key 让"切换到另一篇笔记"时重建编辑状态，
-                  // 否则会沿用上一篇的文本与"已保存"基准
-                  key: ValueKey<String>(openNoteId!),
-                  noteId: openNoteId!,
-                ),
-        ),
-      ],
+    // 拖动到底时不要把右栏挤没：给它留一个下限
+    void dragSidebar(double delta) {
+      setState(() {
+        _sidebarWidth = (_sidebarWidth + delta).clamp(
+          kSidebarMinWidth,
+          kSidebarMaxWidth,
+        );
+      });
+    }
+
+    void dragList(double delta) {
+      setState(() {
+        _listWidth = (_listWidth + delta).clamp(
+          kNoteListMinWidth,
+          kNoteListMaxWidth,
+        );
+      });
+    }
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double available = constraints.maxWidth;
+        final bool sidebarVisible = !widget.sidebarCollapsed;
+
+        // 分隔条的命中宽度是可拖动的，因此也要从可用宽度里扣掉
+        final double chrome = sidebarVisible
+            ? kSplitterHitWidth * 2
+            : kSplitterHitWidth;
+        final double budget = (available - kReadingPaneMinWidth - chrome).clamp(
+          0.0,
+          double.infinity,
+        );
+
+        double sidebar = sidebarVisible ? _sidebarWidth : 0;
+        double list = _listWidth;
+
+        // 超过预算时按比例压缩（保持两栏的相对关系，而不是把某一栏压到最小）
+        final double used = sidebar + list;
+        if (used > budget && used > 0) {
+          final double scale = budget / used;
+          sidebar *= scale;
+          list *= scale;
+        }
+
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            if (sidebarVisible) ...<Widget>[
+              SizedBox(width: sidebar, child: const NotebookSidebar()),
+              PaneSplitter(tooltip: '拖动调整笔记本栏宽度', onDrag: dragSidebar),
+            ],
+            SizedBox(
+              width: list,
+              child: NoteListPane(
+                showDeleted: widget.showDeleted,
+                openNoteId: widget.openNoteId,
+                onOpenNote: widget.onOpenNote,
+              ),
+            ),
+            PaneSplitter(tooltip: '拖动调整笔记列表宽度', onDrag: dragList),
+            Expanded(
+              child: widget.openNoteId == null
+                  ? const _EmptyReadingPane()
+                  : NoteEditorPane(
+                      // key 让"切换到另一篇笔记"时重建编辑状态，
+                      // 否则会沿用上一篇的文本与"已保存"基准
+                      key: ValueKey<String>(widget.openNoteId!),
+                      noteId: widget.openNoteId!,
+                    ),
+            ),
+          ],
+        );
+      },
     );
   }
+}
+
+/// 分栏拖动条。
+///
+/// ## 交互细节（都是有意的）
+///
+/// - **命中区域比视觉宽度大**：视觉上是一条细线，但可拖动区域宽 [kSplitterHitWidth]。
+///   1 像素的线用鼠标几乎抓不住，这是桌面应用很常见的可用性问题。
+/// - **悬停时变粗并高亮**：告诉用户"这里可以拖"。
+/// - **光标变成左右调整形状**：桌面端最直接的"可拖动"提示。
+class PaneSplitter extends StatefulWidget {
+  /// 构造。
+  const PaneSplitter({required this.onDrag, this.tooltip, super.key});
+
+  /// 拖动回调，参数是水平位移（逻辑像素）。
+  final ValueChanged<double> onDrag;
+
+  /// 悬停提示。
+  final String? tooltip;
+
+  @override
+  State<PaneSplitter> createState() => _PaneSplitterState();
+}
+
+class _PaneSplitterState extends State<PaneSplitter> {
+  bool _hovered = false;
+  bool _dragging = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final bool active = _hovered || _dragging;
+
+    final Widget bar = MouseRegion(
+      // 竖向分栏用系统的"左右调整"光标：Windows 上是标准的左右箭头，
+      // 用户一眼就知道这里能拖。不必自定义光标图像。
+      cursor: SystemMouseCursors.resizeColumn,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragStart: (_) => setState(() => _dragging = true),
+        onHorizontalDragUpdate: (DragUpdateDetails details) =>
+            widget.onDrag(details.delta.dx),
+        onHorizontalDragEnd: (_) => setState(() => _dragging = false),
+        onHorizontalDragCancel: () => setState(() => _dragging = false),
+        child: SizedBox(
+          width: kSplitterHitWidth,
+          child: Center(
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              width: active ? 3 : 1,
+              color: active
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.outlineVariant,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    if (widget.tooltip == null) {
+      return bar;
+    }
+    return Tooltip(message: widget.tooltip!, child: bar);
+  }
+}
+
+/// 每一层笔记本的缩进量（逻辑像素）。
+const double kIndentPerLevel = 13;
+
+/// 标签距离左边缘的基础内边距。
+const double kIndentBase = 8;
+
+/// 缩进总量上限。左栏宽度可拖动调整，取一个偏保守的值，
+/// 保证最窄（[kSidebarMinWidth]）时深层级的名称仍有余量。
+const double kIndentMax = 100;
+
+/// 计算某个层级在左栏中的缩进量。
+///
+/// ## 为什么要"封顶"而不是"一直加"
+///
+/// 层级没有硬上限（数据层不限制深度），但左栏宽度有限。
+/// 若无限累加，深层级的名称会被挤出可视区域。
+///
+/// ## 为什么封顶前必须保证"每层都不同"
+///
+/// 第一版写成了 `depth.clamp(0, 6) * 14`——**第 7 层开始缩进完全相同**，
+/// 于是两个不同层级的兄弟节点看起来一样深，用户无法判断自己在哪一层。
+/// 「封顶」应当封的是**总宽度**，而不是**层级的区分度**：
+/// 在到达上限之前，每一层都必须给出不同的缩进。
+///
+/// 这样在第 1–9 层之间层级分明；再深则缩进不再增加（用户仍可通过
+/// 展开/折叠与名称判断），这是宽度受限下的合理取舍。
+///
+/// 提取成独立的纯函数是为了**可测试**：缩进是层级可视化的核心，
+/// 而它藏在 widget 里几乎没法断言。
+double notebookIndent(int depth) {
+  // 负深度不该出现，但真出现了也不能把内容推到屏幕外
+  final int safeDepth = depth < 0 ? 0 : depth;
+  final double wanted = kIndentBase + (safeDepth * kIndentPerLevel);
+  return wanted > kIndentMax ? kIndentMax : wanted;
 }
 
 // ============================================================ 左栏：笔记本树
@@ -231,15 +425,15 @@ class NotebookSidebar extends ConsumerWidget {
                 tooltip: '新建顶层笔记本',
                 visualDensity: VisualDensity.compact,
                 onPressed: () => _createNotebook(context, ref, null),
-                icon: const Icon(Icons.create_new_folder_outlined, size: 20),
+                icon: const Icon(kNewNotebookIcon, size: 20),
               ),
             ],
           ),
         ),
         // "全部笔记"是一个显式条目，而不是"未选择"的隐含状态——
         // 用户需要能明确地回到"看所有笔记"。
-        _SidebarTile(
-          icon: Icons.all_inbox_outlined,
+        NotebookTreeTile(
+          icon: kAllNotesIcon,
           label: '全部笔记',
           selected: selected == null,
           depth: 0,
@@ -265,10 +459,12 @@ class NotebookSidebar extends ConsumerWidget {
               itemCount: value.length,
               itemBuilder: (BuildContext context, int index) {
                 final NotebookNode node = value[index];
-                return _SidebarTile(
-                  icon: node.depth == 0
-                      ? Icons.folder_outlined
-                      : Icons.subdirectory_arrow_right,
+                return NotebookTreeTile(
+                  // 层级用**同一套图标的变体**表达（实心 → 打开 → 轮廓）：
+                  // 既看得出"它们是同类"，又分得清"自己在哪一层"。
+                  // 早期版本对第 2 层及更深都用 subdirectory_arrow_right，
+                  // 于是"多层级"在视觉上等于没做。
+                  icon: folderIconForDepth(node.depth),
                   label: node.name,
                   trailingCount: node.noteCount,
                   selected: node.id == selected,
@@ -304,12 +500,12 @@ class NotebookSidebar extends ConsumerWidget {
             ),
             const Divider(height: 1),
             ListTile(
-              leading: const Icon(Icons.create_new_folder_outlined),
+              leading: const Icon(kNewNotebookIcon),
               title: const Text('新建子笔记本'),
               onTap: () => Navigator.of(sheetContext).pop('child'),
             ),
             ListTile(
-              leading: const Icon(Icons.delete_outline),
+              leading: const Icon(kRecycleBinItemIcon),
               title: const Text('移入回收站'),
               subtitle: const Text('其中的笔记不会被删除'),
               onTap: () => Navigator.of(sheetContext).pop('delete'),
@@ -393,44 +589,14 @@ class NotebookSidebar extends ConsumerWidget {
   }
 }
 
-/// 每一层笔记本的缩进量（逻辑像素）。
-const double kIndentPerLevel = 13;
-
-/// 标签距离左边缘的基础内边距。
-const double kIndentBase = 8;
-
-/// 缩进总量上限。左栏宽 [kSidebarWidth]，留下名称的显示空间。
-const double kIndentMax = 118;
-
-/// 计算某个层级在左栏中的缩进量。
-///
-/// ## 为什么要"封顶"而不是"一直加"
-///
-/// 层级没有硬上限（数据层不限制深度），但左栏宽度固定。
-/// 若无限累加，深层级的名称会被挤出可视区域。
-///
-/// ## 为什么封顶前必须保证"每层都不同"
-///
-/// 第一版写成了 `depth.clamp(0, 6) * 14`——**第 7 层开始缩进完全相同**，
-/// 于是两个不同层级的兄弟节点看起来一样深，用户无法判断自己在哪一层。
-/// 「封顶」应当封的是**总宽度**，而不是**层级的区分度**：
-/// 在到达上限之前，每一层都必须给出不同的缩进。
-///
-/// 这样在第 1–9 层之间层级分明；再深则缩进不再增加（但用户仍可通过
-/// 展开/折叠与名称判断），这是宽度受限下的合理取舍。
-///
-/// 提取成独立的纯函数是为了**可测试**：缩进是层级可视化的核心，
-/// 而它在 widget 里很难断言。
-double notebookIndent(int depth) {
-  // 负深度不该出现，但真出现了也不能把内容推到屏幕外
-  final int safeDepth = depth < 0 ? 0 : depth;
-  final double wanted = kIndentBase + (safeDepth * kIndentPerLevel);
-  return wanted > kIndentMax ? kIndentMax : wanted;
-}
-
 /// 左栏的一行。
-class _SidebarTile extends StatelessWidget {
-  const _SidebarTile({
+/// 左栏树中的一行。
+///
+/// 公开（非下划线开头）以便测试按部件定位并断言其图标——
+/// 层级图标是"多层级可视化"的核心，而用 `find.ancestor(byType(Row))`
+/// 这类按容器定位的写法会命中整棵树的 Row，取到别的图标。
+class NotebookTreeTile extends StatelessWidget {
+  const NotebookTreeTile({
     required this.icon,
     required this.label,
     required this.selected,
@@ -438,6 +604,7 @@ class _SidebarTile extends StatelessWidget {
     required this.onTap,
     this.trailingCount,
     this.onLongPress,
+    super.key,
   });
 
   final IconData icon;
@@ -558,7 +725,7 @@ class NoteListPane extends ConsumerWidget {
                 onPressed: showDeleted
                     ? null
                     : () => _createNote(context, ref, notebookId),
-                icon: const Icon(Icons.add, size: 20),
+                icon: const Icon(kNewNoteIcon, size: 20),
               ),
             ],
           ),
@@ -626,18 +793,18 @@ class NoteListPane extends ConsumerWidget {
             const Divider(height: 1),
             if (showDeleted)
               ListTile(
-                leading: const Icon(Icons.restore),
+                leading: const Icon(kRestoreIcon),
                 title: const Text('恢复'),
                 onTap: () => Navigator.of(sheetContext).pop('restore'),
               )
             else ...<Widget>[
               ListTile(
-                leading: const Icon(Icons.drive_file_move_outline),
+                leading: const Icon(kMoveIcon),
                 title: const Text('移动到笔记本…'),
                 onTap: () => Navigator.of(sheetContext).pop('move'),
               ),
               ListTile(
-                leading: const Icon(Icons.delete_outline),
+                leading: const Icon(kRecycleBinItemIcon),
                 title: const Text('移入回收站'),
                 onTap: () => Navigator.of(sheetContext).pop('delete'),
               ),
@@ -739,7 +906,7 @@ class _NoteRow extends StatelessWidget {
                   Padding(
                     padding: const EdgeInsets.only(right: 4),
                     child: Icon(
-                      Icons.delete_outline,
+                      kRecycleBinItemIcon,
                       size: 14,
                       color: theme.colorScheme.outline,
                     ),
@@ -822,7 +989,7 @@ class _EmptyNoteList extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
             Icon(
-              showDeleted ? Icons.delete_outline : Icons.note_add_outlined,
+              showDeleted ? kRecycleBinItemIcon : kEmptyNotesIcon,
               size: 40,
               color: theme.colorScheme.outline,
             ),
@@ -855,7 +1022,7 @@ class _EmptyReadingPane extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.center,
         children: <Widget>[
           Icon(
-            Icons.article_outlined,
+            kEmptyReadingIcon,
             size: 52,
             color: theme.colorScheme.outlineVariant,
           ),
@@ -924,7 +1091,7 @@ class _FailureView extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
-            Icon(Icons.error_outline, size: 48, color: theme.colorScheme.error),
+            Icon(kErrorIcon, size: 48, color: theme.colorScheme.error),
             const SizedBox(height: 16),
             Text('无法读取笔记', style: theme.textTheme.titleLarge),
             const SizedBox(height: 8),

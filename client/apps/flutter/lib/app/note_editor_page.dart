@@ -39,6 +39,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/note_providers.dart';
+import 'icons.dart';
 
 /// 停止输入多久之后自动保存。
 ///
@@ -211,11 +212,7 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
               else
-                Icon(
-                  Icons.cloud_done_outlined,
-                  size: 16,
-                  color: theme.colorScheme.outline,
-                ),
+                Icon(kSavedIcon, size: 16, color: theme.colorScheme.outline),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
@@ -233,7 +230,7 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                 tooltip: '立即保存',
                 visualDensity: VisualDensity.compact,
                 onPressed: _dirty ? _save : null,
-                icon: const Icon(Icons.save_outlined, size: 20),
+                icon: const Icon(kSaveIcon, size: 20),
               ),
             ],
           ),
