@@ -477,6 +477,86 @@ pub fn mark_accessed(connection: &Connection, id: &Id, at_ms: i64) -> Result<(),
     Ok(())
 }
 
+/// **彻底删除**回收站中删除时间早于 `deleted_before_ms` 的笔记。
+///
+/// ## 这是全项目**唯一**的实体硬删除路径
+///
+/// 在此之前，所有实体表都只有软删（铁律 T7），`DELETE FROM` 只出现在
+/// `note_tags` / `note_attachments` 这类**关联表**上（那是关系，不是实体）。
+///
+/// 它存在的唯一理由是"回收站里的东西不能永远占着磁盘"。
+/// 因此它**刻意不是**一个可以随手调用的通用删除接口：
+///
+/// - 只删**已软删且已过期**的行（`deleted_at_ms IS NOT NULL AND < 阈值`），
+///   活跃笔记无论传什么阈值都不会被碰到；
+/// - 阈值由调用方传入（即"现在 − 保留期"），
+///   保留期本身定义在 `nested-core`，本层不猜业务策略；
+/// - 返回删除条数，便于调用方上报"本次清理了多少"。
+///
+/// ## 为什么必须手工删子表
+///
+/// `documents` / `revisions` / `note_tags` / `note_attachments` 四张表都有
+/// `REFERENCES notes (id)`，而 `0001_init.sql` **没有写 `ON DELETE CASCADE`**
+/// （迁移不可改，见铁律 Q2）。因此必须按顺序手工清理，否则会撞外键失败。
+///
+/// `sync_operations` 已在迁移 `0002` 中去掉外键（多态 `entity_id`），
+/// 所以那里的历史队列记录会**原样保留**——这是有意的：
+/// 队列是"已经发生过的事"的记录，不该因为实体消失而被抹掉。
+///
+/// # Errors
+///
+/// 数据库错误原样上抛。
+pub fn purge_deleted_before(
+    connection: &mut Connection,
+    deleted_before_ms: i64,
+) -> Result<u64, DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    // 先选出待删 id：后续每张子表都要用同一批 id，避免在删除过程中
+    // 集合发生变化（先删子表、再删主表，顺序不能反）
+    let doomed: Vec<Vec<u8>> = {
+        let mut statement = transaction.prepare(
+            "SELECT id FROM notes WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms < ?1",
+        )?;
+        let rows =
+            statement.query_map(params![deleted_before_ms], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for note_id in &doomed {
+        // 子表：顺序无所谓（彼此之间无外键），但都必须在删主表之前
+        transaction.execute("DELETE FROM note_tags WHERE note_id = ?1", params![note_id])?;
+        transaction.execute(
+            "DELETE FROM note_attachments WHERE note_id = ?1",
+            params![note_id],
+        )?;
+        transaction.execute("DELETE FROM documents WHERE note_id = ?1", params![note_id])?;
+        transaction.execute("DELETE FROM revisions WHERE note_id = ?1", params![note_id])?;
+        transaction.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
+    }
+
+    transaction.commit()?;
+    Ok(u64::try_from(doomed.len()).unwrap_or(u64::MAX))
+}
+
+/// 统计回收站中"将在 `before_ms` 之前被清理"的笔记数。
+///
+/// 界面用它显示"还剩 N 天"，因此这里刻意与
+/// [`purge_deleted_before`] 使用**同一个判定条件**——
+/// 两处若各写一套，就可能出现"提示还剩 1 天、实际已经被删"。
+///
+/// # Errors
+///
+/// 数据库错误原样上抛。
+pub fn count_purgeable(connection: &Connection, before_ms: i64) -> Result<i64, DbError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM notes WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms < ?1",
+        params![before_ms],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +923,140 @@ mod tests {
                 .expect("exists")
                 .accessed_at_ms,
             Some(NOW + 42)
+        );
+    }
+
+    // ---------------------------------------------------------- 回收站彻底删除
+    //
+    // 这是全项目**唯一**的实体硬删除路径，因此测试要盯住它的边界：
+    // 该删的删掉、不该删的一个都不能碰。
+
+    /// 造一条"已删除"的笔记，返回它的 id。
+    fn deleted_note(db: &Database, notebook_id: &Id, title: &str, deleted_at: i64) -> Id {
+        let mut guard = db.connection().expect("conn");
+        let note = sample_note(Some(*notebook_id), title);
+        create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE).expect("create");
+        soft_delete(&mut guard, &note.id, DEVICE, deleted_at).expect("soft delete");
+        note.id
+    }
+
+    /// 确认某个 id 在 notes 表里彻底不存在了。
+    fn is_gone(db: &Database, id: &Id) -> bool {
+        let guard = db.connection().expect("conn");
+        get(&guard, id).expect("get").is_none()
+    }
+
+    /// 数某个子表里还有多少行指向这条笔记。
+    fn count_children(db: &Database, table: &str, id: &Id) -> i64 {
+        db.connection()
+            .expect("conn")
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE note_id = ?1"),
+                params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .expect("count children")
+    }
+
+    #[test]
+    fn purge_removes_expired_deleted_notes_and_their_children() {
+        let (db, notebook_id) = fixture();
+        let id = deleted_note(&db, &notebook_id, "过期的", NOW - 10_000);
+
+        // 让这条笔记**真的有** documents 子行——否则"子表被清干净"这句
+        // 断言会因为没有子行而平凡通过（假装验证了，其实没验证）。
+        // `soft_delete` 已经入队过 note.delete，这里不必也不该手工再加一条，
+        // 否则下面的队列断言会数到两条，掩盖"队列到底有没有被清"这个真正的问题。
+        {
+            let guard = db.connection().expect("conn");
+            upsert_document(&guard, &id, &Document::empty(NOW)).expect("doc");
+        }
+        assert!(
+            count_children(&db, "documents", &id) == 1,
+            "前置条件：documents 子行必须存在，否则后面的清理断言没有意义"
+        );
+
+        let removed =
+            purge_deleted_before(&mut db.connection().expect("conn"), NOW).expect("purge");
+        assert_eq!(removed, 1, "过期笔记应被删掉");
+        assert!(is_gone(&db, &id), "主表行必须消失");
+
+        // 子表不能留残行（否则它们会变成永远查不到的垃圾）
+        for table in ["documents", "revisions", "note_tags", "note_attachments"] {
+            assert_eq!(
+                count_children(&db, table, &id),
+                0,
+                "{table} 里不应残留已删笔记的行"
+            );
+        }
+
+        // 同步队列**刻意保留**：那是"已经发生过的事"的记录。
+        // 断言精确到 operation，别断言总数——总数会随入队策略变化而漂移，
+        // 把"策略改了"误报成"队列被清空"。
+        let queued: i64 = db
+            .connection()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM sync_operations \
+                 WHERE entity_id = ?1 AND operation = 'note.delete'",
+                params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .expect("count queue");
+        assert_eq!(
+            queued, 1,
+            "「删除」这条队列记录不应因实体消失而被抹掉（迁移 0002 已去掉外键）"
+        );
+    }
+
+    #[test]
+    fn purge_never_touches_notes_that_are_not_deleted() {
+        // 最重要的边界：活跃笔记无论阈值多大都不能被删
+        let (db, notebook_id) = fixture();
+        let mut guard = db.connection().expect("conn");
+        let alive = sample_note(Some(notebook_id), "活着的");
+        create_with_document(&mut guard, &alive, &Document::empty(NOW), DEVICE).expect("create");
+        drop(guard);
+
+        let removed =
+            purge_deleted_before(&mut db.connection().expect("conn"), i64::MAX).expect("purge");
+        assert_eq!(removed, 0, "活跃笔记不该被任何阈值删掉");
+        assert!(!is_gone(&db, &alive.id), "活跃笔记必须还在");
+    }
+
+    #[test]
+    fn purge_respects_the_retention_boundary() {
+        // 边界语义：`deleted_at_ms < before_ms`，即"刚好等于阈值"的不删。
+        // 这个细节决定"还剩 1 天"的显示是否与实际一致。
+        let (db, notebook_id) = fixture();
+        let exactly = deleted_note(&db, &notebook_id, "卡在阈值上", NOW);
+        let older = deleted_note(&db, &notebook_id, "早于阈值", NOW - 1);
+
+        let removed =
+            purge_deleted_before(&mut db.connection().expect("conn"), NOW).expect("purge");
+        assert_eq!(removed, 1);
+        assert!(!is_gone(&db, &exactly), "恰好等于阈值的不应删除");
+        assert!(is_gone(&db, &older), "早于阈值的应删除");
+    }
+
+    #[test]
+    fn count_purgeable_matches_what_purge_would_remove() {
+        // 界面用它显示"还剩 N 天"。两处判定条件若不一致，
+        // 就会出现"提示还剩 1 天、其实已经被删"这类最难解释的现象。
+        let (db, notebook_id) = fixture();
+        deleted_note(&db, &notebook_id, "一个", NOW - 1);
+        deleted_note(&db, &notebook_id, "两个", NOW - 2);
+        deleted_note(&db, &notebook_id, "还没到期", NOW + 100);
+
+        let guard = db.connection().expect("conn");
+        assert_eq!(count_purgeable(&guard, NOW).expect("count"), 2);
+        drop(guard);
+
+        let removed =
+            purge_deleted_before(&mut db.connection().expect("conn"), NOW).expect("purge");
+        assert_eq!(
+            removed, 2,
+            "count_purgeable 的数字必须与 purge 实际删掉的条数一致"
         );
     }
 }

@@ -26,6 +26,26 @@ pub const UNKNOWN_DEVICE_ID: &str = "unknown-device";
 /// 是为了避免 `nested-core` 为了一个字符串而依赖同步引擎（分层更干净）。
 pub const DEVICE_ID_SETTING_KEY: &str = "device.id";
 
+/// 一次回收站清理的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrashPurgeReport {
+    /// 被彻底删除的笔记数。
+    pub notes_removed: u64,
+    /// 被彻底删除的笔记本数。
+    pub notebooks_removed: u64,
+}
+
+impl TrashPurgeReport {
+    /// 本次是否真的删掉了东西。
+    ///
+    /// 调用方（启动时的清理）用它决定**要不要打扰用户**：
+    /// 什么都没删还弹一句提示，是纯噪音，而且会让人以为出了事。
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.notes_removed == 0 && self.notebooks_removed == 0
+    }
+}
+
 /// 内核句柄。
 #[derive(Debug)]
 pub struct NestedCore {
@@ -504,6 +524,26 @@ impl NestedCore {
         Ok(())
     }
 
+    /// 把笔记本移动到另一个父节点下（`new_parent` 为 `None` 表示移到顶层）。
+    ///
+    /// ## 成环会被拒绝，而不是被数据库接受
+    ///
+    /// 自引用外键**不阻止**把祖先移到自己的后代下，但那样会让之后所有
+    /// 深度优先遍历无限递归（表现为界面卡死，而不是报错）。
+    /// 因此仓储层做环检测，这里把结果翻译成 [`CoreError::WouldCreateCycle`]——
+    /// 一条**可读的拒绝**，而不是一个看起来像故障的数据库错误。
+    ///
+    /// # Errors
+    ///
+    /// - 目标或新父节点不存在 → [`CoreError::NotFound`]
+    /// - 会成环 → [`CoreError::WouldCreateCycle`]
+    pub fn move_notebook(&self, id: &Id, new_parent: Option<&Id>, at_ms: i64) -> CoreResult<()> {
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notebooks::move_to_parent(&mut connection, id, new_parent, &device_id, at_ms)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ 标签
 
     /// 创建标签。
@@ -540,6 +580,87 @@ impl NestedCore {
     pub fn list_note_tags(&self, note_id: &Id) -> CoreResult<Vec<Tag>> {
         let connection = self.database.connection()?;
         Ok(tags::list_for_note(&connection, note_id)?)
+    }
+
+    // -------------------------------------------------------------- 回收站清理
+
+    /// 回收站保留期（天）。
+    ///
+    /// ## ⚠ 这是全项目**唯一**会不经用户操作就销毁数据的参数
+    ///
+    /// 铁律 T1 的原意是"用户数据在任何情况下都不得丢失"。自动清理是这条铁律的
+    /// **显式例外**，由产品决定引入（与主流笔记应用一致）。
+    ///
+    /// 因此：
+    /// - 保留期只在这里定义一次，**不要在别处再写一个 15**——
+    ///   两处各写一份会出现"提示还剩 3 天、实际已经删了"；
+    /// - 想关闭自动清理，把这个值改得极大即可（**不要**去注释掉调用点，
+    ///   那会让"自动清理"变成一段死代码，下次没人知道它为什么在）；
+    /// - 界面必须显示剩余天数，让不可逆的操作**可预期**。
+    pub const TRASH_RETENTION_DAYS: i64 = 15;
+
+    /// 保留期对应的毫秒数。
+    #[must_use]
+    pub const fn trash_retention_ms() -> i64 {
+        Self::TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    }
+
+    /// 彻底删除回收站中**已超过保留期**的笔记与笔记本。
+    ///
+    /// ## 为什么笔记本要循环删
+    ///
+    /// 一次清理的依赖链是：笔记先被删 → 笔记本才不再被引用 → 笔记本才能删。
+    /// 若笔记本下还有**子笔记本**，子笔记本必须先在**上一轮**被删掉，
+    /// 父笔记本才能在这一轮满足条件。所以需要反复扫，直到某一轮
+    /// 一个笔记本都删不掉为止。
+    ///
+    /// 深度学习用户可能建 5 层目录，因此这里不是"扫两遍就够"，
+    /// 而是**循环到不动点**（并设了轮数上限，见下）。
+    ///
+    /// ## 为什么有轮数上限
+    ///
+    /// 正常情况下每轮都会消耗一层，轮数不会超过树的深度。
+    /// 但"正常情况下"不是一个可以依赖的前提——如果哪天有人写出
+    /// 让笔记本**引用自身**的 bug，没有上限的循环就变成死循环，
+    /// 表现为启动时卡死。上限把它变成一次无害的提前退出。
+    ///
+    /// # Errors
+    ///
+    /// 数据库错误 → [`CoreError::Database`]。
+    pub fn purge_trash(&self, now_ms: i64) -> CoreResult<TrashPurgeReport> {
+        let cutoff = now_ms.saturating_sub(Self::trash_retention_ms());
+        let mut report = TrashPurgeReport::default();
+        let mut connection = self.database.connection()?;
+
+        // 笔记只有一层，删一遍就到底
+        report.notes_removed = notes::purge_deleted_before(&mut connection, cutoff)?;
+
+        // 笔记本要循环到不动点。上限 64 远超任何真实目录深度；
+        // 真撞上了说明数据结构出了问题，此时"少删几个空笔记本"远比"启动卡死"好。
+        const MAX_PASSES: usize = 64;
+        for _ in 0..MAX_PASSES {
+            let removed = notebooks::purge_deleted_before(&mut connection, cutoff)?;
+            if removed == 0 {
+                break;
+            }
+            report.notebooks_removed += removed;
+        }
+
+        Ok(report)
+    }
+
+    /// 回收站中还有多少条笔记"已到期、下次清理就会被删"。
+    ///
+    /// 界面用它显示"已过期，下次启动将清理"。判定条件与
+    /// [`Self::purge_trash`] **共用同一个阈值来源**，不会出现两处不一致。
+    ///
+    /// # Errors
+    ///
+    /// 数据库错误 → [`CoreError::Database`]。
+    pub fn count_expired_trash(&self, now_ms: i64) -> CoreResult<i64> {
+        let cutoff = now_ms.saturating_sub(Self::trash_retention_ms());
+        let connection = self.database.connection()?;
+        Ok(notes::count_purgeable(&connection, cutoff)?)
     }
 
     // ------------------------------------------------------------------ 统计
@@ -1068,6 +1189,227 @@ mod tests {
         let mid = core.create_notebook("中", Some(root.id), NOW).expect("mid");
         let leaf = core.create_notebook("叶", Some(mid.id), NOW).expect("leaf");
         (root.id, mid.id, leaf.id)
+    }
+
+    // ------------------------------------------------------------ 移动笔记本
+
+    #[test]
+    fn moving_a_notebook_reparents_it() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, _mid, leaf) = notebook_tree(&core);
+
+        core.move_notebook(&leaf, Some(&root), NOW + 1)
+            .expect("把叶节点提到根下");
+
+        let tree = core.list_notebook_tree().expect("tree");
+        let shape: Vec<(&str, u32)> = tree
+            .iter()
+            .map(|(notebook, depth)| (notebook.name.as_str(), *depth))
+            .collect();
+        assert_eq!(shape, vec![("根", 0), ("中", 1), ("叶", 1)]);
+    }
+
+    #[test]
+    fn moving_a_notebook_to_top_level_works() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (_root, mid, _leaf) = notebook_tree(&core);
+        core.move_notebook(&mid, None, NOW + 1).expect("移到顶层");
+
+        // ⚠ 不要按下标断言：`list_notebook_tree` 的**兄弟节点按名称排序**
+        // （它取自 list_all 的 ORDER BY name），不是插入顺序。
+        // 按名字查深度才是稳定的写法——本测试第一版就是在这里失败的。
+        let tree = core.list_notebook_tree().expect("tree");
+        let depth_of = |name: &str| -> Option<u32> {
+            tree.iter()
+                .find(|(notebook, _)| notebook.name == name)
+                .map(|(_, depth)| *depth)
+        };
+        assert_eq!(depth_of("中"), Some(0), "移到顶层后深度应为 0");
+        assert_eq!(depth_of("叶"), Some(1), "叶节点应随父节点一起上移");
+        assert_eq!(depth_of("根"), Some(0));
+    }
+
+    #[test]
+    fn moving_a_notebook_into_its_own_descendant_is_refused() {
+        // 这条是"不报错但会卡死"的防线：数据库会接受这次 UPDATE，
+        // 之后 list_notebook_tree 就会无限递归。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, _mid, leaf) = notebook_tree(&core);
+
+        let error = core
+            .move_notebook(&root, Some(&leaf), NOW + 1)
+            .expect_err("把根移到叶下必须被拒绝");
+
+        // 关键：错误码必须可区分，不能是泛化的 DATABASE_ERROR——
+        // 那会让界面提示"请重启应用"，而实际上是"换个位置就好"。
+        assert_eq!(error.code(), "WOULD_CREATE_CYCLE");
+        // 而且**不能**被标记为可重试：重试永远不会成功
+        assert!(!error.is_retryable(), "成环是确定性失败，不该重试");
+
+        // 树必须保持原样
+        let tree = core.list_notebook_tree().expect("tree");
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[0].1, 0);
+        assert_eq!(tree[2].1, 2, "被拒绝的移动不应改动层级");
+    }
+
+    // -------------------------------------------------------------- 回收站清理
+
+    #[test]
+    fn trash_retention_is_15_days() {
+        // 保留期是产品决定，写死在测试里是为了"改它时必须有人看见"
+        assert_eq!(NestedCore::TRASH_RETENTION_DAYS, 15);
+        assert_eq!(NestedCore::trash_retention_ms(), 15 * 24 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn purge_removes_only_notes_past_the_retention_period() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let cutoff = NOW - NestedCore::trash_retention_ms();
+
+        // 刚删的：必须留着（用户还能恢复）
+        let recent = core.create_note(None, "刚删的", NOW).expect("create");
+        core.delete_note(&recent.id, NOW).expect("delete");
+
+        // 删了很久的：应该被清理
+        let old = core.create_note(None, "很久前删的", NOW).expect("create");
+        core.delete_note(&old.id, cutoff - 1).expect("delete");
+
+        // 活着的：任何情况都不能碰
+        let alive = core.create_note(None, "活着的", NOW).expect("create");
+
+        let report = core.purge_trash(NOW).expect("purge");
+        assert_eq!(report.notes_removed, 1);
+        assert!(!report.is_empty());
+
+        assert!(core.get_note(&recent.id).is_ok(), "未到期的必须还在");
+        assert!(
+            matches!(core.get_note(&old.id), Err(CoreError::NotFound { .. })),
+            "过期的应被彻底删除"
+        );
+        assert!(core.get_note(&alive.id).is_ok(), "活跃笔记不该被碰到");
+    }
+
+    #[test]
+    fn purge_removes_a_notebook_only_after_its_notes_are_purged() {
+        // 依赖链：笔记先走 → 笔记本才不再被引用 → 笔记本才能删。
+        // 这条测试同时证明"清理不会产生孤儿笔记"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let cutoff = NOW - NestedCore::trash_retention_ms();
+        let book = core.create_notebook("要清掉的", None, NOW).expect("book");
+        let note = core
+            .create_note(Some(book.id), "里面的笔记", NOW)
+            .expect("note");
+
+        // 同一时刻删掉两者（模拟用户删整个笔记本）
+        core.delete_note(&note.id, cutoff - 1).expect("del note");
+        core.delete_notebook(&book.id, cutoff - 1)
+            .expect("del book");
+
+        let report = core.purge_trash(NOW).expect("purge");
+        assert_eq!(report.notes_removed, 1);
+        assert_eq!(report.notebooks_removed, 1, "笔记清掉后笔记本才能被清");
+    }
+
+    #[test]
+    fn purge_keeps_a_deleted_notebook_that_still_has_a_live_note() {
+        // 最重要的安全性质：定时清理**绝不能**制造孤儿笔记。
+        // 用户删了笔记本但把里面的笔记恢复了 → 笔记本必须留着。
+        let core = NestedCore::open_in_memory().expect("open");
+        let cutoff = NOW - NestedCore::trash_retention_ms();
+        let book = core.create_notebook("有活笔记的", None, NOW).expect("book");
+        core.create_note(Some(book.id), "活着的笔记", NOW)
+            .expect("note");
+        core.delete_notebook(&book.id, cutoff - 1)
+            .expect("del book");
+
+        let report = core.purge_trash(NOW).expect("purge");
+        assert_eq!(report.notebooks_removed, 0, "还有活笔记引用时必须跳过");
+
+        // ⚠ 不能去 list_notebook_tree 里找它：那个列表**只含未删除的**笔记本，
+        // 而这条笔记本在回收站里（deleted_at_ms 非空），本来就不该出现在树里。
+        // 正确的验证方式是证明**行还在**——用"能恢复"来证明。
+        // 本测试第一版就是误用了树查询而失败的。
+        assert!(
+            core.restore_notebook(&book.id, NOW + 1).is_ok(),
+            "被跳过的笔记本必须仍然存在（能恢复），否则它的笔记就成了孤儿"
+        );
+
+        // 恢复后应当重新出现在树里，且活笔记仍在它下面
+        let tree = core.list_notebook_tree().expect("tree");
+        assert!(
+            tree.iter().any(|(n, _)| n.name == "有活笔记的"),
+            "恢复后应回到树里"
+        );
+        let notes = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&book.id),
+                include_descendants: true,
+                ..NoteQuery::default()
+            })
+            .expect("notes");
+        assert_eq!(notes.len(), 1, "那篇活笔记必须还在这个笔记本下");
+    }
+
+    #[test]
+    fn purge_walks_deep_notebook_nests_to_a_fixed_point() {
+        // 目录可以有任意层深。清理必须循环到不动点，
+        // 而不是"扫两遍就以为够了"。
+        let core = NestedCore::open_in_memory().expect("open");
+        let cutoff = NOW - NestedCore::trash_retention_ms();
+
+        let mut parent: Option<Id> = None;
+        let mut ids: Vec<Id> = Vec::new();
+        for depth in 0..5 {
+            let book = core
+                .create_notebook(format!("第{depth}层"), parent, NOW)
+                .expect("book");
+            parent = Some(book.id);
+            ids.push(book.id);
+        }
+        // 从**最深**的开始删，这样每轮只能解开一层
+        for id in ids.iter().rev() {
+            core.delete_notebook(id, cutoff - 1).expect("del");
+        }
+
+        let report = core.purge_trash(NOW).expect("purge");
+        assert_eq!(
+            report.notebooks_removed, 5,
+            "五层嵌套应当被全部清掉（需要多轮才能解开）"
+        );
+
+        let tree = core.list_notebook_tree().expect("tree");
+        assert!(tree.is_empty(), "清理后树应当是空的，实际：{tree:?}");
+    }
+
+    #[test]
+    fn purge_on_empty_trash_is_a_no_op() {
+        let core = NestedCore::open_in_memory().expect("open");
+        core.create_note(None, "还在", NOW).expect("create");
+        let report = core.purge_trash(NOW).expect("purge");
+        assert!(report.is_empty(), "没有可清理的东西时不该报告删了东西");
+        assert_eq!(core.count_expired_trash(NOW).expect("count"), 0);
+    }
+
+    #[test]
+    fn count_expired_trash_agrees_with_what_purge_removes() {
+        // 界面按这个数字提示"下次启动将清理"。若两处判定不一致，
+        // 用户会遇到"提示要清理，结果没清"或反过来的情况。
+        let core = NestedCore::open_in_memory().expect("open");
+        let cutoff = NOW - NestedCore::trash_retention_ms();
+        for (title, at) in [("a", cutoff - 1), ("b", cutoff - 2), ("c", NOW)] {
+            let note = core.create_note(None, title, NOW).expect("create");
+            core.delete_note(&note.id, at).expect("delete");
+        }
+
+        let predicted = core.count_expired_trash(NOW).expect("count");
+        assert_eq!(predicted, 2);
+        let report = core.purge_trash(NOW).expect("purge");
+        assert_eq!(
+            i64::try_from(report.notes_removed).expect("fits"),
+            predicted,
+            "count_expired_trash 的数字必须等于 purge 实际删掉的条数"
+        );
     }
 
     #[test]

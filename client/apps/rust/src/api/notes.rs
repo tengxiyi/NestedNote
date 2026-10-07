@@ -647,6 +647,83 @@ pub fn notebooks_restore(id: &str, at_ms: i64) -> NoteResult {
     }
 }
 
+/// 重命名笔记本。
+#[must_use]
+pub fn notebooks_rename(id: &str, name: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.rename_notebook(&parsed, name, at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// 把笔记本移动到另一个父节点下（`parent_id` 为 `None` 时移到顶层）。
+///
+/// 会成环的移动返回 `code = "WOULD_CREATE_CYCLE"`——
+/// 界面应据此提示"请选择另一个位置"，而不是当成故障。
+#[must_use]
+pub fn notebooks_move(id: &str, parent_id: Option<String>, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    let parent = match parent_id.as_deref().map(Id::parse) {
+        Some(Ok(target)) => Some(target),
+        Some(Err(_)) => {
+            return NoteResult {
+                ok: false,
+                code: Some("INVALID_ID".to_owned()),
+                hint: Some("目标笔记本标识无效。".to_owned()),
+                debug_detail: None,
+                value: None,
+            };
+        }
+        None => None,
+    };
+    match with_core(|core| core.move_notebook(&parsed, parent.as_ref(), at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// 回收站保留期（天）。
+///
+/// 界面需要它来显示"还剩 N 天"。**不要在 Dart 侧另写一个常量**——
+/// 两处各写一份就会出现"提示还剩 3 天、实际已经删了"。
+#[must_use]
+pub fn trash_retention_days() -> i64 {
+    nested_core::NestedCore::TRASH_RETENTION_DAYS
+}
+
+/// 彻底删除回收站中已超过保留期的内容，返回被删除的条数（笔记数, 笔记本数）。
+///
+/// 应用启动时调用一次即可。**注意**：这是全项目唯一不经用户操作就销毁数据的
+/// 路径，调用方应当把"删掉了什么"告诉用户，而不是悄悄删。
+#[must_use]
+pub fn trash_purge(now_ms: i64) -> (i64, i64) {
+    match with_core(|core| core.purge_trash(now_ms)) {
+        Ok(report) => (
+            i64::try_from(report.notes_removed).unwrap_or(i64::MAX),
+            i64::try_from(report.notebooks_removed).unwrap_or(i64::MAX),
+        ),
+        // 清理失败绝不能影响应用启动：这是后台维护动作，不是用户操作。
+        // 返回 (0,0) 而不是抛错——下次启动会再试。
+        Err(_) => (0, 0),
+    }
+}
+
+/// 已到期、下次清理就会被删掉的笔记数（用于界面提示）。
+#[must_use]
+pub fn trash_expired_count(now_ms: i64) -> i64 {
+    match with_core(|core| core.count_expired_trash(now_ms)) {
+        Ok(count) => count,
+        Err(_) => 0,
+    }
+}
+
 /// 把一篇笔记移到另一个笔记本（`notebook_id` 为 `None` 时移出笔记本）。
 #[must_use]
 pub fn notes_move(id: &str, notebook_id: Option<String>, at_ms: i64) -> NoteResult {

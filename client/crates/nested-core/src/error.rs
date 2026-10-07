@@ -8,8 +8,13 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum CoreError {
     /// 数据库错误。
+    ///
+    /// 注意这里**没有** `#[from]`：转换由下方手写的 `From<DbError>` 完成，
+    /// 因为有一个 `DbError` 变体需要映射到**别的** `CoreError` 变体
+    /// （`WouldCreateCycle`）——用 `#[from]` 会把它一并吞进这里，
+    /// 让用户看到"请重启应用"这种误导性提示。
     #[error("数据库错误：{0}")]
-    Database(#[from] nested_db::DbError),
+    Database(nested_db::DbError),
 
     /// 领域模型校验错误。
     #[error("数据校验失败：{0}")]
@@ -38,9 +43,36 @@ pub enum CoreError {
     #[error("网络错误：{0}")]
     Network(String),
 
+    /// 该操作会让笔记本树成环（把笔记本移到它自己或它的后代下）。
+    ///
+    /// ## 为什么必须单独一个变体，而不是让它落进 `Database`
+    ///
+    /// `DbError::WouldCreateCycle` 若映射到 [`Self::Database`]，用户会看到
+    /// "请尝试重启应用；若问题持续，请从备份恢复数据"——**完全误导**：
+    /// 这是一次被正确拒绝的非法操作，不是故障，重试与重启都不会有用。
+    ///
+    /// 错误变体的粒度决定了 UI 能否给出有用的提示。
+    #[error("不能把笔记本移动到它自己或它的子笔记本下")]
+    WouldCreateCycle,
+
     /// 功能尚未实现（P0 阶段的明确占位，**禁止**用来掩盖半成品）。
     #[error("功能尚未实现：{0}")]
     NotImplemented(&'static str),
+}
+
+/// 数据库错误 → 内核错误。
+///
+/// 手写而不是 `#[from]`，只为处理一个特例：`WouldCreateCycle` 不是"数据库出错"，
+/// 而是一次**被正确拒绝的非法操作**。让它落进 `Database` 会让 UI 提示
+/// "请尝试重启应用；若问题持续，请从备份恢复数据"——用户会以为数据坏了，
+/// 而实际上换个位置就好。
+impl From<nested_db::DbError> for CoreError {
+    fn from(error: nested_db::DbError) -> Self {
+        match error {
+            nested_db::DbError::WouldCreateCycle => Self::WouldCreateCycle,
+            other => Self::Database(other),
+        }
+    }
 }
 
 impl CoreError {
@@ -55,6 +87,7 @@ impl CoreError {
             Self::Conflict(_) => "CONFLICT",
             Self::Permission(_) => "PERMISSION_ERROR",
             Self::Network(_) => "NETWORK_ERROR",
+            Self::WouldCreateCycle => "WOULD_CREATE_CYCLE",
             Self::NotImplemented(_) => "NOT_IMPLEMENTED",
         }
     }
@@ -76,6 +109,7 @@ impl CoreError {
             Self::Conflict(_) => "内容已被其他设备修改，请查看冲突副本。",
             Self::Permission(_) => "请授予所需权限后重试。",
             Self::Network(_) => "请检查网络连接后重试。",
+            Self::WouldCreateCycle => "请选择另一个位置：目标笔记本在当前笔记本的内部。",
             Self::NotImplemented(_) => "该功能将在后续版本提供。",
         }
     }

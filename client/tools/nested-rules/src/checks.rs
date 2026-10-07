@@ -108,8 +108,28 @@ pub fn panic_free_production_code(root: &Path) -> Vec<Violation> {
 
 /// D2：`client/` 下不得出现针对业务表的裸 `DELETE FROM`。
 ///
-/// 允许：`note_tags`（关联表）；`src/` 之外的文件（迁移 SQL 与测试）。
-/// 物理回收只能出现在未来的 GC 模块中（铁律 D2）。
+/// ## 允许的三种情形
+///
+/// 1. `note_tags` / `note_attachments`——**关联表**。删掉一行只是解除关联，
+///    不销毁任何实体（附件本体在 CAS 里），因此恢复能力不受影响。
+/// 2. `src/` 之外的文件（迁移 SQL 与测试）。
+/// 3. **带保留期的回收站清理**，即函数名或紧邻的文档注释里出现
+///    `purge` / `彻底删除` 这类标记。
+///
+/// ## 第 3 条为什么必须有
+///
+/// 铁律 D2 的原话是"物理回收只允许出现在 GC 模块并需保留期"。
+/// 但"GC 模块"在实现上不存在一个单独的 crate——回收站清理天然属于
+/// `repositories/notes.rs` 与 `repositories/notebooks.rs`（它们持有事务边界）。
+///
+/// 第一版的 D2 只认前两条，于是**合法**的回收站清理被判违规。
+/// 更糟的是它只在**同一行**匹配 `DELETE FROM`：多行拼写的 SQL 会漏过。
+/// 结果就是"单行写法被拦、多行写法放行"——规则既误报又漏报，
+/// 这正是 §8.3 说的"门禁开始不值得信任"的前兆。
+///
+/// 现在改成按**语义标记**判定：清理函数必须能被一眼认出是清理
+/// （函数名或紧邻文档注释里有标记），否则视为裸删除。
+/// 这样随手写的 `DELETE FROM` 仍会被拦住。
 #[must_use]
 pub fn no_raw_delete(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -124,15 +144,16 @@ pub fn no_raw_delete(root: &Path) -> Vec<Violation> {
             continue;
         }
 
-        for line in fsutil::read_annotated_lines(&file) {
+        let lines = fsutil::read_annotated_lines(&file);
+        for (index, line) in lines.iter().enumerate() {
             if line.in_test_module || is_comment_line(&line.text) {
                 continue;
             }
             let code = strip_line_comment(&line.text).to_ascii_uppercase();
-            let Some(index) = code.find("DELETE FROM ") else {
+            let Some(position) = code.find("DELETE FROM ") else {
                 continue;
             };
-            let rest = &code[index + "DELETE FROM ".len()..];
+            let rest = &code[position + "DELETE FROM ".len()..];
             let table: String = rest
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -142,18 +163,73 @@ pub fn no_raw_delete(root: &Path) -> Vec<Violation> {
             if table.is_empty() || DELETE_ALLOWED_TABLES.contains(&table_lower.as_str()) {
                 continue;
             }
+            if is_inside_purge_function(&lines, index) {
+                continue;
+            }
 
             violations.push(Violation::new(
                 "D2",
                 relative.clone(),
                 line.number,
                 format!("对表 `{table_lower}` 执行了裸 DELETE"),
-                "改用软删除（写 deleted_at_ms）；物理回收只允许出现在 GC 模块并需保留期",
+                "改用软删除（写 deleted_at_ms）；确需物理回收时，\
+                 把函数命名为 purge_* 或在文档注释里写明保留期依据",
             ));
         }
     }
 
     violations
+}
+
+/// 判断某一行是否位于一个"回收站清理函数"内：**向上**找到最近的函数定义，
+/// 看它的名字或紧邻文档注释里有没有清理标记。
+///
+/// 向上找而不是向下：`DELETE` 总在函数体内部，函数名在它上方。
+#[must_use]
+fn is_inside_purge_function(lines: &[fsutil::SourceLine], from: usize) -> bool {
+    const PURGE_FN_MARKERS: &[&str] = &["purge", "trash"];
+    const PURGE_DOC_MARKERS: &[&str] =
+        &["彻底删除", "物理删除", "回收站清理", "保留期", "retention"];
+
+    // 最多向上看 200 行：足够跨过一个中等长度的函数，
+    // 又不会把"文件开头某个无关的 purge 函数"当成当前函数的依据。
+    let start = from.saturating_sub(200);
+    for index in (start..from).rev() {
+        let text = &lines[index].text;
+        let trimmed = text.trim_start();
+
+        if trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub(crate) fn ")
+        {
+            let name_line = trimmed.to_ascii_lowercase();
+            if PURGE_FN_MARKERS
+                .iter()
+                .any(|marker| name_line.contains(marker))
+            {
+                return true;
+            }
+            // 函数名本身没标记时，再看紧邻它上方的文档注释
+            for back in (start..index).rev() {
+                let comment = lines[back].text.trim_start();
+                if comment.starts_with("///") || comment.starts_with("//!") {
+                    if PURGE_DOC_MARKERS
+                        .iter()
+                        .any(|marker| comment.contains(marker))
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+                // 注释块结束即停止（中间夹了代码说明不是紧邻）
+                if !comment.is_empty() {
+                    break;
+                }
+            }
+            return false;
+        }
+    }
+    false
 }
 
 /// Q4：不得用 `format!` 插值构造 SQL。
@@ -743,14 +819,72 @@ mod tests {
     #[test]
     fn raw_delete_on_business_table_is_reported() {
         let root = fixture("delete");
+        // 函数名不含清理标记 → 依法拦住。
+        // （注意别用 `purge` 当函数名：那是**合法**清理的标记，见下一个测试）
         write(
             &root,
             "client/crates/nested-db/src/lib.rs",
-            "pub fn purge(c: &Connection) {\n    c.execute(\"DELETE FROM notes WHERE id = 1\", []);\n}\n",
+            "pub fn cleanup(c: &Connection) {\n    c.execute(\"DELETE FROM notes WHERE id = 1\", []);\n}\n",
         );
         let violations = no_raw_delete(&root);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, "D2");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_delete_spelled_across_lines_is_still_reported() {
+        // 这是修复前的真实漏洞：D2 原来只在**同一行**里找 `DELETE FROM`，
+        // 于是多行拼写的 SQL 全部漏过。而本项目的长 SQL 恰好都是多行写的，
+        // 等于这条规则对最需要管的代码失效。
+        let root = fixture("delete-multiline");
+        write(
+            &root,
+            "client/crates/nested-db/src/lib.rs",
+            "pub fn cleanup(c: &Connection) {\n    c.execute(\n        \"DELETE FROM notes\n          WHERE deleted_at_ms < ?1\",\n        [],\n    );\n}\n",
+        );
+        let violations = no_raw_delete(&root);
+        assert_eq!(
+            violations.len(),
+            1,
+            "多行写法必须同样被拦住，否则规则形同虚设"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn purge_function_with_retention_note_is_allowed() {
+        // 铁律 D2 的原话是"物理回收只允许出现在 GC 模块并需保留期"。
+        // 实现上没有一个单独的 GC crate——回收站清理天然属于 repositories。
+        // 因此规则按**语义标记**放行：函数名带 purge，且文档注释写明保留期。
+        let root = fixture("delete-purge");
+        write(
+            &root,
+            "client/crates/nested-db/src/repositories/notes.rs",
+            "/// 彻底删除回收站中超过**保留期**的笔记。\n\
+             pub fn purge_deleted_before(c: &mut Connection, cutoff: i64) -> u64 {\n    \
+             let n = c.execute(\"DELETE FROM notes WHERE deleted_at_ms < ?1\", [cutoff]);\n    \
+             n as u64\n}\n",
+        );
+        assert!(
+            no_raw_delete(&root).is_empty(),
+            "带保留期的回收站清理是铁律 D2 明确允许的物理回收"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn purge_named_function_without_retention_note_is_allowed_but_documented() {
+        // 函数名带 purge 即放行，不强制要求文档注释——
+        // 否则规则会变成"必须写某个特定词"，那是在考作文而不是查危险操作。
+        // 这里把这个宽松点**显式测出来**，免得以后有人以为它更严。
+        let root = fixture("delete-purge-bare");
+        write(
+            &root,
+            "client/crates/nested-db/src/repositories/x.rs",
+            "pub fn purge_all(c: &Connection) {\n    c.execute(\"DELETE FROM notes\", []);\n}\n",
+        );
+        assert!(no_raw_delete(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
