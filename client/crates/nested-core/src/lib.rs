@@ -40,7 +40,10 @@ pub mod attachments;
 pub mod branding;
 pub mod error;
 
-pub use api::{NestedCore, UNKNOWN_DEVICE_ID};
+pub use api::{
+    DiffLineKind, NestedCore, RevisionDiff, RevisionDiffLine, RevisionSummary, TrashPurgeReport,
+    UNKNOWN_DEVICE_ID,
+};
 pub use attachments::{AttachmentService, GcReport};
 pub use error::{CoreError, CoreResult};
 

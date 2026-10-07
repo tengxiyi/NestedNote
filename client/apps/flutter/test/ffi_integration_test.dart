@@ -213,22 +213,34 @@ void main() {
     expect(first.ok, isTrue);
     expect(first.value!.note!.version.toInt(), 2, reason: '有变更应递增版本');
 
-    final afterFirst = await notesRevisionHistory(id: id, limit: 0);
-    expect(afterFirst.length, 2, reason: '创建 + 一次保存 = 2 条修订');
+    final firstHistory = await notesRevisionHistory(id: id, limit: 0);
+    expect(firstHistory.ok, isTrue, reason: '历史查询失败：${firstHistory.hint}');
+    // 注意 `notes_revision_history` 现在返回 NoteResult 而不是裸 List：
+    // 失败时会带错误码，而不是静默返回空列表（那会让"查询失败"与
+    // "没有历史"长得一样）。这条断言同时验证了"失败可见"这个设计。
+    expect(
+      firstHistory.value!.revisions.length,
+      2,
+      reason: '创建 + 一次保存 = 2 条修订',
+    );
 
     // 第二次保存：内容**完全相同**
     final second = await notesSave(id: id, text: '内容 A', atMs: now + 2000);
     expect(second.ok, isTrue);
     expect(second.value!.note!.version.toInt(), 2, reason: '内容未变时版本不得前进');
 
-    final afterSecond = await notesRevisionHistory(id: id, limit: 0);
+    final secondResult = await notesRevisionHistory(id: id, limit: 0);
+    expect(secondResult.ok, isTrue);
+    final afterSecond = secondResult.value!.revisions;
     expect(afterSecond.length, 2, reason: '内容未变时不得追加修订记录');
 
     // 第三次保存：内容又变了
     final third = await notesSave(id: id, text: '内容 B', atMs: now + 3000);
     expect(third.value!.note!.version.toInt(), 3);
 
-    final afterThird = await notesRevisionHistory(id: id, limit: 0);
+    final historyResult = await notesRevisionHistory(id: id, limit: 0);
+    expect(historyResult.ok, isTrue, reason: '历史查询失败：${historyResult.hint}');
+    final afterThird = historyResult.value!.revisions;
     expect(afterThird.length, 3);
 
     // 修订父链：v3 的父是 v2，v2 的父是 v1，v1 无父

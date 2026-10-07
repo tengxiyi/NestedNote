@@ -40,6 +40,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/note_providers.dart';
 import 'icons.dart';
+import 'revision_history.dart';
 
 /// 停止输入多久之后自动保存。
 ///
@@ -225,6 +226,37 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                     color: _autoSaveFailed ? theme.colorScheme.error : null,
                   ),
                 ),
+              ),
+              IconButton(
+                tooltip: '修订历史',
+                visualDensity: VisualDensity.compact,
+                // 有未保存改动时提示先保存：否则用户会在历史里找不到
+                // 自己刚写的内容，以为丢了。
+                onPressed: () {
+                  if (_dirty) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('请先保存，再查看修订历史。')),
+                    );
+                    return;
+                  }
+                  // 标题从列表缓存里取：编辑器本身不需要标题（正文即内容），
+                  // 但历史对话框要显示"这是哪篇笔记的历史"。
+                  // 取不到就退回通用标题，而不是显示空串。
+                  final String title =
+                      ref
+                          .read(noteListProvider(const NoteListQuery()))
+                          .value
+                          ?.where((NoteItem item) => item.id == widget.noteId)
+                          .map((NoteItem item) => item.title)
+                          .firstOrNull ??
+                      '笔记';
+                  showRevisionHistory(
+                    context,
+                    noteId: widget.noteId,
+                    noteTitle: title,
+                  );
+                },
+                icon: const Icon(kHistoryIcon, size: 20),
               ),
               IconButton(
                 tooltip: '立即保存',

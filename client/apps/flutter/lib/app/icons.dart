@@ -130,3 +130,60 @@ const IconData kErrorIcon = Icons.error_outline;
 
 /// 加载成功。
 const IconData kCheckIcon = Icons.check_circle;
+
+/// 差异中一行的类型。
+///
+/// ## 为什么要"颜色 + 符号"双重表达（铁律 U 组）
+///
+/// 差异视图习惯用绿/红区分新增与删除，但**只靠颜色是不够的**：
+/// 约 8% 的男性有红绿色觉障碍，他们看不出这两色的差别。
+/// 因此每一行同时带 `+` / `−` 前景标记，两个通道各自独立可读。
+///
+/// 这里刻意用 ASCII 的 `+` 与 `-`（渲染时用 U+2212 减号以求美观），
+/// 而不是"新增/删除"文字：前者是 diff 的通用约定，用户一眼就懂。
+///
+/// 修订历史入口（编辑器工具栏）。
+const IconData kHistoryIcon = Icons.history;
+
+/// 时间线上的一条修订。
+const IconData kRevisionIcon = Icons.edit_outlined;
+
+/// 时间线上最新的一条修订。
+const IconData kRevisionLatestIcon = Icons.circle;
+
+/// "新版本"标记（时间线上当前选中的那一版）。
+///
+/// 是函数而不是常量：它需要 `BuildContext` 取主题色。
+/// 用函数而不是"在调用处拼一个 Container"，是为了让两个标记的样式只有一处定义。
+Widget revisionBadge(BuildContext context, {required bool isNew}) =>
+    _RevBadge(label: isNew ? '新' : '旧', strong: isNew);
+
+/// 修订时间线上的小标记。
+class _RevBadge extends StatelessWidget {
+  const _RevBadge({required this.label, required this.strong});
+
+  final String label;
+  final bool strong;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: strong
+            ? theme.colorScheme.primary
+            : theme.colorScheme.outlineVariant,
+        borderRadius: BorderRadius.circular(3),
+      ),
+      child: Text(
+        label,
+        style: theme.textTheme.labelSmall?.copyWith(
+          color: strong
+              ? theme.colorScheme.onPrimary
+              : theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
+}

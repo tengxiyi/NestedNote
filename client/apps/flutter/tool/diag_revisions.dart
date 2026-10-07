@@ -28,16 +28,29 @@ Future<void> main() async {
   final created = await notesCreate(title: '保存语义', atMs: now);
   final id = created.value!.note!.id;
   stdout.writeln('创建后 version=${created.value!.note!.version.toInt()}');
-  dump('创建后', await notesRevisionHistory(id: id, limit: 0));
+  dump('创建后', await _history(id));
 
   final first = await notesSave(id: id, text: '内容 A', atMs: now + 1000);
   stdout.writeln('保存1 后 version=${first.value!.note!.version.toInt()}');
-  dump('保存1 后', await notesRevisionHistory(id: id, limit: 0));
+  dump('保存1 后', await _history(id));
 
   final second = await notesSave(id: id, text: '内容 A', atMs: now + 2000);
   stdout.writeln('保存2（内容相同）后 version=${second.value!.note!.version.toInt()}');
-  dump('保存2 后', await notesRevisionHistory(id: id, limit: 0));
+  dump('保存2 后', await _history(id));
 
   await engineClose();
   dir.deleteSync(recursive: true);
+}
+
+/// 取修订历史（解开 NoteResult；失败直接报错退出）。
+///
+/// `notes_revision_history` 现在返回 NoteResult 而不是裸 List——
+/// 失败会带错误码，而不是静默返回空列表（那会让"查询失败"与"没有历史"长得一样）。
+Future<List<RevisionEntry>> _history(String id) async {
+  final result = await notesRevisionHistory(id: id, limit: 0);
+  if (!result.ok) {
+    stderr.writeln('读取修订历史失败：code=${result.code} hint=${result.hint}');
+    exit(1);
+  }
+  return result.value?.revisions ?? const <RevisionEntry>[];
 }

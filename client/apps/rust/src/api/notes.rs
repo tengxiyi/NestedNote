@@ -94,6 +94,81 @@ pub struct NotePayload {
     pub notebook: Option<NotebookNode>,
     /// 笔记本树（树查询返回，已按展开顺序排列）。
     pub notebooks: Vec<NotebookNode>,
+    /// 修订历史（历史查询返回，按版本倒序）。
+    pub revisions: Vec<RevisionEntry>,
+    /// 修订差异（对比查询返回）。
+    pub diff: Option<RevisionDiffPayload>,
+}
+
+/// 一次修订对比的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionDiffPayload {
+    /// 旧版本摘要。
+    pub older: RevisionSummaryEntry,
+    /// 新版本摘要。
+    pub newer: RevisionSummaryEntry,
+    /// 新增行数。
+    pub added: i64,
+    /// 删除行数。
+    pub removed: i64,
+    /// 是否因**缺少内容快照**而无法对比。
+    ///
+    /// 为 `true` 时 `lines` 必定为空——但**不能**把它当成"两版相同"。
+    /// 界面必须据此显示"此版本没有内容快照"，否则用户会以为内容没变，
+    /// 而事实是我们不知道。这是本功能最容易出错的地方。
+    pub missing_snapshot: bool,
+    /// 旧版本是否缺快照。
+    pub old_missing: bool,
+    /// 新版本是否缺快照。
+    pub new_missing: bool,
+    /// 逐行差异。
+    pub lines: Vec<RevisionDiffEntry>,
+}
+
+/// 修订摘要（对比界面显示"这是哪一版"）。
+///
+/// ## 为什么不直接复用内核的 `RevisionSummary`
+///
+/// 试过写 `pub type RevisionSummaryEntry = nested_core::RevisionSummary;`，
+/// 但 `flutter_rust_bridge` **不解析类型别名**——它把别名当成了不透明类型，
+/// 生成出 `RustAutoOpaqueInner<RevisionSummary>` 这类代码，编译直接失败
+/// （22 个错误）。跨语言边界的类型必须是具体的。
+///
+/// 因此这里保留一份具体结构，但**用 `From` 做唯一转换点**：
+/// 字段一旦在两边不一致，编译器会在那个 `From` 上报错，而不是悄悄漂移。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionSummaryEntry {
+    /// 版本号。
+    pub version: i64,
+    /// 产生时间（UTC 毫秒）。
+    pub created_at_ms: i64,
+    /// 产生该变更的设备。
+    pub device_id: String,
+    /// 操作类型，如 `"note.update"`。
+    pub operation: String,
+}
+
+impl From<nested_core::RevisionSummary> for RevisionSummaryEntry {
+    fn from(summary: nested_core::RevisionSummary) -> Self {
+        Self {
+            version: summary.version,
+            created_at_ms: summary.created_at_ms,
+            device_id: summary.device_id,
+            operation: summary.operation,
+        }
+    }
+}
+
+/// 差异中的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionDiffEntry {
+    /// 类型：`"unchanged"` / `"added"` / `"removed"`。
+    ///
+    /// 用字符串而不是枚举，是为了让 Dart 侧直接用 `switch` 分支——
+    /// FRB 对枚举的支持需要额外配置，而这三个值很稳定。
+    pub kind: String,
+    /// 行内容。
+    pub text: String,
 }
 
 impl NoteResult {
@@ -799,31 +874,125 @@ pub struct RevisionEntry {
 
 /// 某篇笔记的修订历史，**按版本倒序**（最新在前）。
 ///
-/// ## 为什么把它暴露到界面
+/// ## 返回值为什么是 [`NoteResult`] 而不是裸 `Vec`
 ///
-/// 铁律 T6 要求"每一次修改必须可追踪"。暴露它有两个直接价值：
+/// 第一版签名是 `-> Vec<RevisionEntry>`，失败时返回空列表。
+/// 那是个错误设计（本项目在 `notebooks_tree` 上已经踩过一次同样的坑）：
+/// **"查询失败"与"这篇笔记没有历史"变成了同一个结果**，
+/// 界面会显示"还没有历史版本"，而真实原因可能是数据库出错。
 ///
-/// 1. **可验证**：跨语言测试能断言"无变更的保存不产生修订"（技术债 #11 的
-///    关键语义），而不必只相信 Rust 侧的单元测试；
-/// 2. **P3 的版本历史面板**会直接消费它。
+/// 现在失败会带上错误码与提示，界面能如实告知。
 #[must_use]
-pub fn notes_revision_history(id: &str, limit: u32) -> Vec<RevisionEntry> {
-    let Ok(parsed) = Id::parse(id) else {
-        return Vec::new();
+pub fn notes_revision_history(id: &str, limit: u32) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
     };
     match with_core(|core| core.revision_history(&parsed, limit)) {
-        Ok(revisions) => revisions
-            .into_iter()
-            .map(|revision| RevisionEntry {
-                id: revision.id.to_string(),
-                version: revision.version,
-                parent_id: revision.parent_revision_id.map(|parent| parent.to_string()),
-                device_id: revision.device_id,
-                operation: revision.operation,
-                created_at_ms: revision.created_at_ms,
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+        Ok(revisions) => NoteResult::ok(NotePayload {
+            revisions: revisions
+                .into_iter()
+                .map(|revision| RevisionEntry {
+                    id: revision.id.to_string(),
+                    version: revision.version,
+                    parent_id: revision.parent_revision_id.map(|parent| parent.to_string()),
+                    device_id: revision.device_id,
+                    operation: revision.operation,
+                    created_at_ms: revision.created_at_ms,
+                })
+                .collect(),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 比较两条修订的内容，返回逐行差异。
+///
+/// `old_id` → `new_id` 的顺序与 diff 工具惯例一致。传反了不会报错，
+/// 但差异会反向显示（"新增"变"删除"）。
+///
+/// ## 缺快照时返回 `missing_snapshot = true`，而不是空差异
+///
+/// 迁移 `0003` 之前的修订没有内容快照。那种情况**不能**当作"零差异"——
+/// 用户会以为两版内容相同，而事实是我们不知道。
+/// 界面必须把这两种情况分开显示。
+#[must_use]
+pub fn notes_revision_diff(old_id: &str, new_id: &str) -> NoteResult {
+    let old = match parse_id(old_id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    let new = match parse_id(new_id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+
+    match with_core(|core| core.diff_revisions(&old, &new)) {
+        Ok(nested_core::RevisionDiff::Diff {
+            older,
+            newer,
+            added,
+            removed,
+            lines,
+        }) => NoteResult::ok(NotePayload {
+            diff: Some(RevisionDiffPayload {
+                older: older.into(),
+                newer: newer.into(),
+                added: i64::try_from(added).unwrap_or(i64::MAX),
+                removed: i64::try_from(removed).unwrap_or(i64::MAX),
+                missing_snapshot: false,
+                old_missing: false,
+                new_missing: false,
+                lines: lines
+                    .into_iter()
+                    .map(|line| RevisionDiffEntry {
+                        kind: match line.kind {
+                            nested_core::DiffLineKind::Unchanged => "unchanged".to_owned(),
+                            nested_core::DiffLineKind::Added => "added".to_owned(),
+                            nested_core::DiffLineKind::Removed => "removed".to_owned(),
+                        },
+                        text: line.text,
+                    })
+                    .collect(),
+            }),
+            ..NotePayload::default()
+        }),
+        Ok(nested_core::RevisionDiff::MissingSnapshot {
+            older,
+            newer,
+            old_missing,
+            new_missing,
+        }) => NoteResult::ok(NotePayload {
+            diff: Some(RevisionDiffPayload {
+                older: older.into(),
+                newer: newer.into(),
+                added: 0,
+                removed: 0,
+                // 这个标志位是**关键**：界面据它显示"此版本没有内容快照"，
+                // 而不是显示一个看起来"两版相同"的空差异
+                missing_snapshot: true,
+                old_missing,
+                new_missing,
+                lines: Vec::new(),
+            }),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 某篇笔记有多少条修订**带**内容快照。
+///
+/// 界面用它区分"没有历史"与"有历史但都是旧记录（无快照）"。
+#[must_use]
+pub fn notes_revision_snapshot_count(id: &str) -> i64 {
+    let Ok(parsed) = Id::parse(id) else {
+        return 0;
+    };
+    match with_core(|core| core.revision_snapshot_count(&parsed)) {
+        Ok(count) => count,
+        Err(_) => 0,
     }
 }
 

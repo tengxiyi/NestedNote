@@ -103,9 +103,13 @@ pub enum RevisionDiff {
     /// 成功比出差异。
     Diff {
         /// 旧版本摘要。
-        old: RevisionSummary,
+        ///
+        /// 字段名用 `older`/`newer` 而不是 `old`/`new`：
+        /// `new` 在 Dart 里是保留字，跨语言生成时会变成 `new_` 这种别扭的名字。
+        /// 从源头避开比在每处调用点迁就更好。
+        older: RevisionSummary,
         /// 新版本摘要。
-        new: RevisionSummary,
+        newer: RevisionSummary,
         /// 新增行数。
         added: usize,
         /// 删除行数。
@@ -116,9 +120,9 @@ pub enum RevisionDiff {
     /// 至少一侧没有内容快照（迁移 `0003` 之前的历史修订）。
     MissingSnapshot {
         /// 旧版本摘要。
-        old: RevisionSummary,
+        older: RevisionSummary,
         /// 新版本摘要。
-        new: RevisionSummary,
+        newer: RevisionSummary,
         /// 旧版本是否缺快照。
         old_missing: bool,
         /// 新版本是否缺快照。
@@ -722,8 +726,8 @@ impl NestedCore {
             new_snapshot.as_ref(),
         ) {
             nested_model::DiffOutcome::Diff(diff) => Ok(RevisionDiff::Diff {
-                old: RevisionSummary::from(&old_revision),
-                new: RevisionSummary::from(&new_revision),
+                older: RevisionSummary::from(&old_revision),
+                newer: RevisionSummary::from(&new_revision),
                 added: diff.added,
                 removed: diff.removed,
                 lines: diff
@@ -741,8 +745,8 @@ impl NestedCore {
             }),
             nested_model::DiffOutcome::MissingSnapshot { side } => {
                 Ok(RevisionDiff::MissingSnapshot {
-                    old: RevisionSummary::from(&old_revision),
-                    new: RevisionSummary::from(&new_revision),
+                    older: RevisionSummary::from(&old_revision),
+                    newer: RevisionSummary::from(&new_revision),
                     old_missing: matches!(
                         side,
                         nested_model::DiffSide::Old | nested_model::DiffSide::Both
