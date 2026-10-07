@@ -264,6 +264,22 @@ class NoteActions {
     _invalidateLists();
   }
 
+  /// **彻底删除**一篇笔记（不可逆）。
+  ///
+  /// ## 为什么这个入口如此窄
+  ///
+  /// 全项目的实体硬删除只有两处：回收站到期自动清理，以及这里。
+  /// 后者是**用户显式要求**的（在回收站里点"彻底删除"并二次确认），
+  /// 界面上的调用点只有 [NoteListPane] 的回收站菜单一处。
+  ///
+  /// 刻意**不**提供"批量彻底删除"这类便利方法：
+  /// 一次误操作销毁多条不可恢复的数据，代价远大于省下的点击。
+  Future<void> purge(String id) async {
+    final result = await rust.notesPurge(id: id);
+    _unwrap(result, (rust.NotePayload _) => null);
+    _invalidateLists();
+  }
+
   void _invalidateLists() {
     // 按**值**失效：传一个新的等值对象即可命中同一个 provider
     // （NoteListQuery 实现了 == / hashCode，因此 new 一个也能匹配）。

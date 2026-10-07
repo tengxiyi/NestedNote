@@ -557,6 +557,73 @@ pub fn count_purgeable(connection: &Connection, before_ms: i64) -> Result<i64, D
     Ok(count)
 }
 
+/// **彻底删除指定的、已在回收站中的**一篇笔记。
+///
+/// ## 与 [`purge_deleted_before`] 的分工
+///
+/// - [`purge_deleted_before`]：按**时间**批量清理（到期自动回收）；
+/// - 本函数：按**标识**删一篇（用户在回收站里显式点"彻底删除"）。
+///
+/// ## 为什么必须先校验"已在回收站中"
+///
+/// 这是用户可达的硬删除入口，调用点只有回收站菜单。
+/// 但**接口本身不能假设调用方守规矩**：如果哪天真有人从别处调它，
+/// "删掉一篇还在用的笔记"是不可恢复的事故。
+///
+/// 因此这里要求 `deleted_at_ms IS NOT NULL`——**只有已经进过回收站的
+/// 内容才允许被彻底删除**。活跃笔记即便传对 id 也删不掉。
+/// 这条约束由测试 `purge_one_refuses_an_active_note` 钉住。
+///
+/// # Errors
+///
+/// 笔记不存在或**不在回收站中** → [`DbError::NotFound`]。
+pub fn purge_one(connection: &mut Connection, id: &Id) -> Result<(), DbError> {
+    let transaction = crate::db::begin_write_transaction(&mut *connection)?;
+
+    // 只认"已软删"的行。这一句同时承担两个作用：
+    // 确认存在，以及拒绝删除活跃笔记。
+    let eligible: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM notes WHERE id = ?1 AND deleted_at_ms IS NOT NULL",
+            params![id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if eligible.is_none() {
+        return Err(DbError::NotFound { entity: "note" });
+    }
+
+    // 子表必须先清（0001 没有 ON DELETE CASCADE，迁移不可改：铁律 Q2）。
+    //
+    // 这里刻意把四条删除**逐条写出来**，而不是 `for table in [...] { format!("DELETE FROM {table} ...") }`：
+    // 后者虽然表名来自编译期常量、并无注入风险，但会命中 Q4 规则
+    // （禁止用 format! 插值构造 SQL）。要让规则放行就得把 `table` 这个
+    // **变量名**加进白名单——那等于给所有叫 table 的变量开后门，
+    // 将来真有人用它绑定外部输入时就没人拦了。
+    //
+    // 四条重复的语句换规则不被削弱，这个交换是值得的。
+    transaction.execute(
+        "DELETE FROM note_tags WHERE note_id = ?1",
+        params![id.as_bytes()],
+    )?;
+    transaction.execute(
+        "DELETE FROM note_attachments WHERE note_id = ?1",
+        params![id.as_bytes()],
+    )?;
+    transaction.execute(
+        "DELETE FROM documents WHERE note_id = ?1",
+        params![id.as_bytes()],
+    )?;
+    transaction.execute(
+        "DELETE FROM revisions WHERE note_id = ?1",
+        params![id.as_bytes()],
+    )?;
+    transaction.execute("DELETE FROM notes WHERE id = ?1", params![id.as_bytes()])?;
+
+    transaction.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,5 +1125,54 @@ mod tests {
             removed, 2,
             "count_purgeable 的数字必须与 purge 实际删掉的条数一致"
         );
+    }
+
+    #[test]
+    fn purge_one_removes_a_trashed_note_and_its_children() {
+        let (db, notebook_id) = fixture();
+        let id = deleted_note(&db, &notebook_id, "要彻底删的", NOW);
+        {
+            let guard = db.connection().expect("conn");
+            upsert_document(&guard, &id, &Document::empty(NOW)).expect("doc");
+        }
+
+        purge_one(&mut db.connection().expect("conn"), &id).expect("purge one");
+
+        assert!(is_gone(&db, &id), "主表行必须消失");
+        for table in ["documents", "revisions", "note_tags", "note_attachments"] {
+            assert_eq!(
+                count_children(&db, table, &id),
+                0,
+                "{table} 里不应残留已彻底删除笔记的行"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_one_refuses_an_active_note() {
+        // 最重要的一条：这个接口**不能**变成"删任何笔记"的通用入口。
+        // 它只允许删已经进过回收站的内容——即便调用方传对了 id。
+        // 没有这条约束，任何一处误调用都会造成不可恢复的数据丢失。
+        let (db, notebook_id) = fixture();
+        let mut guard = db.connection().expect("conn");
+        let alive = sample_note(Some(notebook_id), "还在用的");
+        create_with_document(&mut guard, &alive, &Document::empty(NOW), DEVICE).expect("create");
+        drop(guard);
+
+        let error = purge_one(&mut db.connection().expect("conn"), &alive.id)
+            .expect_err("活跃笔记绝不能被彻底删除");
+        assert!(
+            matches!(error, DbError::NotFound { .. }),
+            "实际错误：{error:?}"
+        );
+        assert!(!is_gone(&db, &alive.id), "被拒绝后笔记必须完好无损");
+    }
+
+    #[test]
+    fn purge_one_on_missing_note_is_not_found() {
+        let (db, _notebook_id) = fixture();
+        let error = purge_one(&mut db.connection().expect("conn"), &Id::new())
+            .expect_err("不存在的笔记应报 NotFound");
+        assert!(matches!(error, DbError::NotFound { .. }));
     }
 }

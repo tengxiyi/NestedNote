@@ -23,6 +23,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:nested/app/app.dart';
+import 'package:nested/app/note_list_pane.dart';
+import 'package:nested/app/notebook_sidebar.dart';
 import 'package:nested/app/notes_page.dart';
 import 'package:nested/core/engine.dart';
 import 'package:nested/core/engine_providers.dart';

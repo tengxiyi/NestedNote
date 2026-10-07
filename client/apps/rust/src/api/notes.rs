@@ -724,6 +724,22 @@ pub fn trash_expired_count(now_ms: i64) -> i64 {
     }
 }
 
+/// **彻底删除**回收站中的一篇笔记（不可逆，需界面二次确认）。
+///
+/// 只对**已在回收站中**的笔记有效；活跃笔记会返回 `NOT_FOUND`
+/// （内核刻意如此，避免这个接口变成"删任何笔记"的通用入口）。
+#[must_use]
+pub fn notes_purge(id: &str) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.purge_note(&parsed)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
 /// 把一篇笔记移到另一个笔记本（`notebook_id` 为 `None` 时移出笔记本）。
 #[must_use]
 pub fn notes_move(id: &str, notebook_id: Option<String>, at_ms: i64) -> NoteResult {

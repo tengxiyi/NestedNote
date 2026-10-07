@@ -663,6 +663,23 @@ impl NestedCore {
         Ok(notes::count_purgeable(&connection, cutoff)?)
     }
 
+    /// **彻底删除**回收站中的一篇笔记（用户显式操作，不可逆）。
+    ///
+    /// ## 这是用户可达的唯一硬删除入口
+    ///
+    /// 界面上只有回收站菜单会调它，且必须二次确认。
+    /// 仓储层额外要求"该笔记已在回收站中"——活跃笔记即便 id 正确也删不掉，
+    /// 这样即使将来有人从别处误调用，也不会造成不可恢复的丢失。
+    ///
+    /// # Errors
+    ///
+    /// 笔记不存在或**不在回收站中** → [`CoreError::NotFound`]。
+    pub fn purge_note(&self, id: &Id) -> CoreResult<()> {
+        let mut connection = self.database.connection()?;
+        notes::purge_one(&mut connection, id)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ 统计
 
     /// 未删除笔记数量。
