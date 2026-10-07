@@ -505,7 +505,7 @@ class NotebookSidebar extends ConsumerWidget {
               onTap: () => Navigator.of(sheetContext).pop('child'),
             ),
             ListTile(
-              leading: const Icon(kRecycleBinItemIcon),
+              leading: const Icon(kRecycleBinIcon),
               title: const Text('移入回收站'),
               subtitle: const Text('其中的笔记不会被删除'),
               onTap: () => Navigator.of(sheetContext).pop('delete'),
@@ -804,7 +804,7 @@ class NoteListPane extends ConsumerWidget {
                 onTap: () => Navigator.of(sheetContext).pop('move'),
               ),
               ListTile(
-                leading: const Icon(kRecycleBinItemIcon),
+                leading: const Icon(kRecycleBinIcon),
                 title: const Text('移入回收站'),
                 onTap: () => Navigator.of(sheetContext).pop('delete'),
               ),
@@ -902,15 +902,17 @@ class _NoteRow extends StatelessWidget {
           children: <Widget>[
             Row(
               children: <Widget>[
-                if (note.deleted)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 4),
-                    child: Icon(
-                      kRecycleBinItemIcon,
-                      size: 14,
-                      color: theme.colorScheme.outline,
-                    ),
-                  ),
+                // 笔记图标：**任何位置都用 kNoteIcon**（规则 1）。
+                // 回收站里的笔记形状不变，只改颜色（规则 3）——
+                // 若改成垃圾桶图标，用户会以为"这是一条删除操作"而不是"一篇被删的笔记"。
+                Icon(
+                  kNoteIcon,
+                  size: 15,
+                  color: note.deleted
+                      ? theme.colorScheme.outline
+                      : theme.colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     note.title,
@@ -918,9 +920,24 @@ class _NoteRow extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.w600,
+                      color: note.deleted
+                          ? theme.colorScheme.onSurfaceVariant
+                          : null,
                     ),
                   ),
                 ),
+                if (note.deleted)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 4),
+                    child: Tooltip(
+                      message: '在回收站中',
+                      child: Icon(
+                        kInRecycleBinBadgeIcon,
+                        size: 14,
+                        color: theme.colorScheme.outline,
+                      ),
+                    ),
+                  ),
               ],
             ),
             const SizedBox(height: 3),
@@ -989,7 +1006,7 @@ class _EmptyNoteList extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
             Icon(
-              showDeleted ? kRecycleBinItemIcon : kEmptyNotesIcon,
+              showDeleted ? kRecycleBinIcon : kEmptyNotesIcon,
               size: 40,
               color: theme.colorScheme.outline,
             ),

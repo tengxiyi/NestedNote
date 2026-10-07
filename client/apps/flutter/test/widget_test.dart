@@ -476,12 +476,43 @@ void main() {
       );
     });
 
-    testWidgets('笔记在中栏与右栏用同一个图标', (WidgetTester tester) async {
-      // 一致性要求：同一概念在任何位置必须同形。
-      // 早期版本中栏用 description_outlined、右栏标题用 article_outlined，
-      // 同一个"笔记"在两个位置长得不一样。
-      expect(kNoteIcon, isNot(kEmptyReadingIcon), reason: '笔记与空态提示本就不同');
-      expect(kDeletedNoteIcon, kNoteIcon, reason: '回收站里的笔记只是改了颜色，形状不变');
+    testWidgets('中栏每行笔记都带笔记图标，且回收站中形状不变', (WidgetTester tester) async {
+      // 一致性要求必须落到**渲染结果**上，否则只是同义反复：
+      // 早期版本定义了 kNoteIcon 却从未使用（笔记行根本没有图标），
+      // 于是"同一概念同形"这条规则实际上没被验证过。
+      await tester.pumpWidget(
+        harness(
+          notes: <NoteItem>[
+            note(id: 'n1', title: '甲笔记'),
+            NoteItem(
+              id: 'n2',
+              title: '乙笔记',
+              summary: '',
+              updatedAtMs: DateTime(2026, 3, 16, 10, 0).millisecondsSinceEpoch,
+              version: 1,
+              deleted: true,
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 两行各有一个笔记图标（形状相同）
+      expect(find.byIcon(kNoteIcon), findsNWidgets(2));
+
+      // 已删除那行多一个"在回收站中"的标记，但笔记图标本身不变
+      expect(find.byIcon(kInRecycleBinBadgeIcon), findsOneWidget);
+      expect(
+        find.byIcon(kNoteIcon),
+        findsNWidgets(2),
+        reason: '回收站里的笔记不能换成垃圾桶图标——那会被读成"一个删除动作"',
+      );
+    });
+
+    test('同一概念在不同位置必须同形（纯不变量）', () {
+      expect(kDeletedNoteIcon, kNoteIcon, reason: '回收站里的笔记只改颜色，形状不变');
+      expect(kNoteIcon, isNot(kEmptyReadingIcon), reason: '笔记与空态提示本就是两回事');
+      expect(kNoteIcon, isNot(kAllNotesIcon), reason: '"一篇笔记"与"全部笔记"入口不是同一概念');
       expect(kRecycleBinIcon, isNot(kRecycleBinActiveIcon), reason: '开关两态需可区分');
     });
   });

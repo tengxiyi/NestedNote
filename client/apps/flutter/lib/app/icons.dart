@@ -7,10 +7,10 @@
 //!
 //! 1. **差异性**：不同概念用了相近的图标，用户分不清。
 //!    本项目实际发生过——所有层级的笔记本都用 `folder_outlined`，
-//!    于是第 3 层子文件夹和第 1 层顶层笔记本长得完全一样，"多层级"白做了。
+//!    于是第 5 层子文件夹和第 1 层顶层笔记本长得完全一样，"多层级"白做了。
 //! 2. **一致性**：同一概念在不同位置用了不同图标。
-//!    本项目实际发生过——笔记在中栏列表里是 `description_outlined`，
-//!    在右栏标题里却变成 `article_outlined`。
+//!    本项目实际发生过——笔记本树里的"全部笔记"用 `all_inbox`（实心收件箱），
+//!    而笔记列表里的每一行**根本没有图标**，两者谁代表"笔记"无从判断。
 //!
 //! 集中在一处之后，这两个性质可以被**测试**（见 `test/widget_test.dart`
 //! 的"图标体系"分组），而不是靠肉眼评审。
@@ -70,16 +70,23 @@ const IconData kNoteIcon = Icons.description_outlined;
 const IconData kDeletedNoteIcon = kNoteIcon;
 
 /// 回收站开关（未激活）。
+///
+/// 这就是"回收站"这个概念的唯一图标。不要为同一概念再取别名——
+/// 两个名字指向同一字形只会让人以为它们是两个东西。
 const IconData kRecycleBinIcon = Icons.delete_outline;
 
 /// 回收站开关（已激活/正在显示回收站）。
 ///
 /// 与 [kRecycleBinIcon] **同族但实心**：开关的"开/关"属于规则 2 的
-/// "同一概念的不同层级"——用同一套图标的变体表达，比换一个不相干的图标更好认。
+/// "同一概念的不同状态"——用同一套图标的变体表达，比换一个不相干的图标更好认。
 const IconData kRecycleBinActiveIcon = Icons.delete;
 
-/// 侧栏里"回收站"列表项（与开关区分：那里是条目，不是开关）。
-const IconData kRecycleBinItemIcon = Icons.delete_outline;
+/// 笔记行上的"在回收站中"标记。
+///
+/// 刻意与 [kRecycleBinIcon] 不同：那个是**回收站这个位置**的图标
+/// （出现在工具栏开关上），这里是**这篇笔记的状态**标记。
+/// 两者字形相同会导致"这一行是回收站入口"的误读。
+const IconData kInRecycleBinBadgeIcon = Icons.delete_sweep_outlined;
 
 /// 新建笔记。
 const IconData kNewNoteIcon = Icons.add;
