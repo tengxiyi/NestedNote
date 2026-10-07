@@ -72,6 +72,7 @@ NotebookNode node({
   required String name,
   int depth = 0,
   int noteCount = 0,
+  int? directNoteCount,
 }) {
   return NotebookNode(
     id: id,
@@ -79,6 +80,9 @@ NotebookNode node({
     parentId: depth == 0 ? null : 'parent',
     depth: depth,
     noteCount: noteCount,
+    // 默认与 noteCount 相同：多数测试不关心两者的区别，
+    // 只有专门验证"徽标用直属数"的测试才显式区分。
+    directNoteCount: directNoteCount ?? noteCount,
   );
 }
 

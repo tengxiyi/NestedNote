@@ -628,11 +628,23 @@ pub struct NotebookNode {
     /// 由 Rust 侧算好：让每个前端各写一遍"组装树 + 深度优先 + 处理孤儿节点"
     /// 是典型的业务规则漏到 UI 层（铁律 A2）。
     pub depth: u32,
-    /// 该笔记本**及其全部后代**中的笔记数量。
+    /// 该笔记本**及其全部后代**中的笔记数量（子树合计）。
     ///
-    /// 放在这里而不是让界面自己算：它需要递归统计，
-    /// 且"父级显示子孙总数"是产品语义而非展示细节。
+    /// 供"复制整棵子树""导出子树"这类需要合计的操作用。
+    ///
+    /// **不要用它做左栏的徽标**：徽标要的是 [direct_note_count]。
+    /// 用合计做徽标会让用户看到"父级 5 篇"，而点进去（只显示直属笔记）
+    /// 只有 1 篇，于是数字与列表对不上——这就是用户报的
+    /// "为什么点顶部目录可以看到多一个笔记"。
     pub note_count: i64,
+    /// 该笔记本**直属**的笔记数量（不含子笔记本）。
+    ///
+    /// 这个值专供界面徽标：**徽标 = 点进去看到的行数**。
+    ///
+    /// 两个字段并存而不是只留一个：它们回答的是不同问题
+    /// （"这个文件夹里有几篇" vs "这棵子树一共有几篇"），
+    /// 而界面和批量操作各需要其中一个。强行合并会让某一方用错口径。
+    pub direct_note_count: i64,
 }
 
 /// 列出笔记本树（深度优先，含每个节点及其子树的笔记数）。
@@ -653,7 +665,14 @@ pub fn notebooks_tree() -> NoteResult {
         let tree = core.list_notebook_tree()?;
         let mut nodes = Vec::with_capacity(tree.len());
         for (notebook, depth) in tree {
-            // 统计"该笔记本及其全部后代"的笔记数
+            // 直属数：只要这一个笔记本里的笔记
+            let direct_query = NoteQuery {
+                notebook_id: Some(&notebook.id),
+                ..NoteQuery::default()
+            };
+            let direct = i64::try_from(core.list_notes(&direct_query)?.len()).unwrap_or(0);
+
+            // 子树合计：该笔记本及其全部后代
             let mut total = 0_i64;
             for notebook_id in core.notebook_subtree_ids(&notebook.id)? {
                 let query = NoteQuery {
@@ -668,6 +687,7 @@ pub fn notebooks_tree() -> NoteResult {
                 parent_id: notebook.parent_id.map(|parent| parent.to_string()),
                 depth,
                 note_count: total,
+                direct_note_count: direct,
             });
         }
         Ok(nodes)
@@ -706,6 +726,7 @@ pub fn notebooks_create(name: &str, parent_id: Option<String>, at_ms: i64) -> No
                 // 真实深度由随后的 notebooks_tree() 给出；这里不重复计算
                 depth: 0,
                 note_count: 0,
+                direct_note_count: 0,
             }),
             ..NotePayload::default()
         }),
@@ -911,6 +932,7 @@ pub fn notebooks_duplicate(id: &str, at_ms: i64) -> NoteResult {
                 // 界面拿到 id 后会刷新树。
                 depth: 0,
                 note_count: 0,
+                direct_note_count: 0,
             }),
             ..NotePayload::default()
         }),

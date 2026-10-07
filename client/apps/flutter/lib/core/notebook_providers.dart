@@ -28,6 +28,7 @@ class NotebookNode {
     required this.parentId,
     required this.depth,
     required this.noteCount,
+    this.directNoteCount = 0,
   });
 
   /// 标识。
@@ -42,8 +43,18 @@ class NotebookNode {
   /// 层级深度（顶层为 0），用于缩进。
   final int depth;
 
-  /// 该笔记本**及其全部后代**中的笔记数量。
+  /// 该笔记本**及其全部后代**中的笔记数量（子树合计）。
+  ///
+  /// 供"复制整棵子树"这类需要合计的操作用。
+  ///
+  /// **不要用它做左栏徽标**：徽标要用 [directNoteCount]，否则会出现
+  /// "父级显示 5 篇、点进去只有 1 篇"的矛盾（用户报过这个）。
   final int noteCount;
+
+  /// 该笔记本**直属**的笔记数量（不含子笔记本）。
+  ///
+  /// 界面徽标用它，因为不变量是"**徽标 = 点进去看到的行数**"。
+  final int directNoteCount;
 
   /// 从生成类型转换。
   factory NotebookNode.fromRust(rust.NotebookNode source) {
@@ -53,6 +64,7 @@ class NotebookNode {
       parentId: source.parentId,
       depth: source.depth,
       noteCount: source.noteCount.toInt(),
+      directNoteCount: source.directNoteCount.toInt(),
     );
   }
 }

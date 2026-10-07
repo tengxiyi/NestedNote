@@ -28,7 +28,7 @@ Future<void> main() async {
   for (final n in tree) {
     stdout.writeln(
       '  ${'  ' * n.depth}${n.name}  '
-      'depth=${n.depth} count=${n.noteCount} parent=${n.parentId?.substring(0, 8) ?? "(null)"}',
+      'depth=${n.depth} 直属=${n.directNoteCount} 合计=${n.noteCount} parent=${n.parentId ?? "(null)"}',
     );
   }
 
