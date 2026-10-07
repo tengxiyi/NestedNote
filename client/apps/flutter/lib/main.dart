@@ -77,6 +77,23 @@ class _BootstrapState extends ConsumerState<_Bootstrap> {
   ///
   /// 这是唯一"用户没操作、数据却消失了"的路径。悄悄删是错的：
   /// 用户下次打开回收站发现东西少了，只会以为数据丢了。
+  /// 执行一次回收站到期清理，并把结果告知用户。
+  ///
+  /// ## 为什么必须告知
+  ///
+  /// 这是全项目唯一"用户没操作、数据却消失了"的路径。悄悄删是错的：
+  /// 用户下次打开回收站发现东西少了，只会以为数据丢了。
+  ///
+  /// ## 提示里要包含"保留期"与"可以更早手动删"
+  ///
+  /// 用户确认的语义是**两条路都通**：
+  ///
+  /// 1. 想立刻删 → 进回收站点「彻底删除」
+  /// 2. 什么都不做 → 到期自动删
+  ///
+  /// 因此提示若只说"已自动清理"，用户就不知道**期限是多少**，
+  /// 也不知道**自己本可以更早处理**。补上这两句，
+  /// 下次遇到类似情况他就知道该怎么办了。
   Future<void> _sweepTrash() async {
     TrashSweepResult? result;
     try {
@@ -95,10 +112,17 @@ class _BootstrapState extends ConsumerState<_Bootstrap> {
       if (result.notes > 0) '${result.notes} 篇笔记',
       if (result.notebooks > 0) '${result.notebooks} 个笔记本',
     ];
+    // 保留期从内核读，不在界面里另写常量——两处各写一份就会出现
+    // "提示说 15 天、实际按 7 天删"。
+    final int days = ref.read(trashRetentionDaysProvider).value ?? 0;
+    final String window = days > 0 ? '（超过 $days 天）' : '';
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
       SnackBar(
-        duration: const Duration(seconds: 8),
-        content: Text('回收站中超过保留期的 ${parts.join('、')}已被自动清理。'),
+        duration: const Duration(seconds: 10),
+        content: Text(
+          '回收站中 $window${parts.join('、')}已被自动彻底删除。\n'
+          '以后想提前删除，可在回收站里点「彻底删除」。',
+        ),
       ),
     );
   }

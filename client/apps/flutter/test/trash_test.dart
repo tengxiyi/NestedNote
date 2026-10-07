@@ -103,4 +103,44 @@ void main() {
       );
     });
   });
+
+  group('两条"彻底删除"路径都要存在', () {
+    // 用户确认的语义是**两条都通**：
+    //
+    //   1. 想立刻删 → 进回收站点「彻底删除」
+    //   2. 什么都不做 → 15 天后自动删
+    //
+    // 因此"到期自动清理"与"手动彻底删除"是**并存**的，不是二选一。
+    // 这一组把该语义钉住：若有人把保留期改成"永不自动删除"，
+    // 或把手动入口去掉，都会在这里失败。
+    test('保留期是有限值（说明确实会自动删除）', () {
+      // 界面上显示的倒计时依赖它。若改成 0 或负数，
+      // 语义会变成"立即删除"或"永不删除"，两者都不是用户要的。
+      expect(retention, greaterThan(0), reason: '保留期必须为正，否则自动清理的语义就变了');
+    });
+
+    test('到期判定的边界：正好到期算不算已过期', () {
+      // 内核用的是**严格小于**（remainingMs < 0 才算过期）。
+      // 界面必须一致，否则会出现"界面说已过期、内核还没删"
+      // 或反过来的"界面说还剩 1 天、实际已经删了"。
+      final TrashAge exactlyAtDeadline = trashAgeOf(
+        deletedAtMs: 0,
+        retentionDays: retention,
+        nowMs: retention * day,
+      );
+      expect(
+        exactlyAtDeadline.expired,
+        isFalse,
+        reason: '正好卡在到期时刻时还没过期（与内核的严格小于一致）',
+      );
+      expect(exactlyAtDeadline.remainingDays, 0);
+
+      final TrashAge justPast = trashAgeOf(
+        deletedAtMs: 0,
+        retentionDays: retention,
+        nowMs: retention * day + 1,
+      );
+      expect(justPast.expired, isTrue, reason: '过了到期时刻一刻就算过期，下次启动会被清理');
+    });
+  });
 }
