@@ -386,19 +386,114 @@ impl NestedCore {
 
     // ------------------------------------------------------------------ 笔记
 
-    /// 创建笔记（内容为空文档）。
+    /// 把一个"用户选中的笔记本"解析成**实际应当存放笔记的笔记本**。
+    ///
+    /// ## 规则：非最底层 → 归到排序第 1 的最底层子目录
+    ///
+    /// 参照印象笔记的做法：**笔记只住在最底层目录里**。
+    /// 用户在中间层目录点"新建笔记"时，笔记不会留在中间层，
+    /// 而是自动落到该层**排序第 1** 的子目录，再往下直到最底层。
+    ///
+    /// ## 为什么这样做
+    ///
+    /// 中间层目录是**分类节点**，不是存放点。允许笔记挂在中间层会带来两个问题：
+    ///
+    /// 1. **同一篇笔记有两个"看起来对"的位置**。用户点父目录看到 5 篇、
+    ///    点子目录看到 4 篇，就要问"为什么多一个"——这正是用户报过的问题。
+    ///    数字本身没错，错的是"中间层竟然能放笔记"这件事。
+    /// 2. **"这个文件夹里有几篇"没有确定答案**。直属数、子树合计、
+    ///    加上中间层那些笔记，三者互相纠缠，界面上怎么显示都有人困惑。
+    ///
+    /// 只要笔记一律住在最底层，"徽标 = 点进去看到的篇数"就自然成立，
+    /// 不需要任何额外解释。
+    ///
+    /// ## 已经挂在中间层的笔记不动
+    ///
+    /// 这个函数只影响**新建**。历史数据里那些挂在中间层的笔记保持原样——
+    /// 用户没要求搬家，擅自动他的数据比"看起来不一致"更糟（铁律 T1）。
+    /// 用户想整理可以自己拖。
+    ///
+    /// ## "排序第 1"指什么
+    ///
+    /// 子目录按**名称升序**取第一个，与左栏树的展示顺序一致
+    /// （`list_notebooks` 按名称排序）。取第一个而不是"最近用的那个"：
+    /// 后者会让同一操作在不同时刻落到不同目录，用户无法预测。
     ///
     /// # Errors
     ///
-    /// 标题超长 → [`CoreError::Validation`]。
+    /// 指定的笔记本不存在 → [`CoreError::NotFound`]。
+    pub fn resolve_note_notebook(&self, notebook_id: Option<Id>) -> CoreResult<Option<Id>> {
+        let Some(mut current) = notebook_id else {
+            // 没指定笔记本（"全部笔记"里新建）→ 保持未分类，不猜
+            return Ok(None);
+        };
+
+        let all = self.list_notebooks()?;
+        if !all.iter().any(|notebook| notebook.id == current) {
+            return Err(CoreError::NotFound { entity: "notebook" });
+        }
+
+        let mut children: std::collections::HashMap<Id, Vec<Id>> = std::collections::HashMap::new();
+        for notebook in &all {
+            if let Some(parent) = notebook.parent_id {
+                children.entry(parent).or_default().push(notebook.id);
+            }
+        }
+        // `list_notebooks` 返回的是 `ORDER BY name ASC`，因此每个 children
+        // 列表的插入顺序**已经**是按名称升序——`kids.first()` 就是左栏里
+        // 显示在最上面的那个子目录，不需要再排一次。
+        // （第一版在这里又多排了一遍，并把名称映射建在了循环内部，纯属浪费。）
+
+        // 往下走直到没有子目录。
+        //
+        // 用**已访问集合**而不是固定最大深度：损坏数据理论上可能形成环
+        //（`notebooks` 有自引用外键，但外键拦不住环），
+        // 有环时固定深度会静默截断，而访问集合能让循环立刻停下，
+        // 且行为可解释（停在环的入口）。
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current);
+        while let Some(first_child) = children
+            .get(&current)
+            .and_then(|kids| kids.first())
+            .copied()
+        {
+            if !visited.insert(first_child) {
+                // 撞到已经走过的节点：数据里有环。停下，不让它转圈。
+                tracing::warn!(
+                    notebook_id = %current,
+                    "笔记本层级里检测到环，停止下潜"
+                );
+                break;
+            }
+            current = first_child;
+        }
+
+        Ok(Some(current))
+    }
+
+    /// 创建笔记（内容为空文档）。
+    ///
+    /// ## 指定的笔记本不是最底层时会被自动下潜
+    ///
+    /// 见 [`Self::resolve_note_notebook`]：笔记只住在最底层目录里。
+    /// 因此 `create_note(Some(中间层目录), ...)` 实际会把笔记建在
+    /// 该层排序第 1 的最底层子目录下。
+    ///
+    /// 返回值里的 `notebook_id` 是**实际生效**的那一个，
+    /// 调用方应当用它（而不是自己传进来的）去刷新界面。
+    ///
+    /// # Errors
+    ///
+    /// 标题超长 → [`CoreError::Validation`]；笔记本不存在 → [`CoreError::NotFound`]。
     pub fn create_note(
         &self,
         notebook_id: Option<Id>,
         title: impl Into<String>,
         at_ms: i64,
     ) -> CoreResult<Note> {
+        let target = self.resolve_note_notebook(notebook_id)?;
         self.create_note_with_document(
-            notebook_id,
+            target,
             title,
             Document::empty(at_ms),
             UNKNOWN_DEVICE_ID,
@@ -2354,27 +2449,257 @@ mod tests {
 
     #[test]
     fn selecting_a_parent_notebook_lists_descendant_notes() {
-        // 端到端：建树 + 各层放笔记 → 按父级列表应看到全部子孙笔记
+        // 子树查询本身的能力：父级 + include_descendants 应看到全部子孙笔记
         let core = NestedCore::open_in_memory().expect("open");
-        let (root, mid, leaf) = notebook_tree(&core);
-        for (notebook, title) in [(root, "根笔记"), (mid, "中笔记"), (leaf, "叶笔记")] {
+        let (root, _mid, leaf) = notebook_tree(&core);
+        for (notebook, title) in [(root, "根笔记"), (leaf, "叶笔记")] {
             core.create_note(Some(notebook), title, NOW).expect("note");
         }
 
-        let query = NoteQuery {
-            notebook_id: Some(&root),
-            include_descendants: true,
-            ..NoteQuery::default()
-        };
-        let notes = core.list_notes(&query).expect("list");
-        assert_eq!(notes.len(), 3, "父级列表应包含三层笔记");
+        // 两篇都下潜到了叶（见 resolve_note_notebook），因此都在叶里
+        let at_leaf = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&leaf),
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(at_leaf.len(), 2, "两篇都应落在最底层的叶目录");
 
-        // 默认（不含子孙）只看本层
-        let direct = NoteQuery {
-            notebook_id: Some(&root),
-            ..NoteQuery::default()
+        // 从根看子树：也是 2 篇；直属 0 篇（根是分类节点，不该有笔记）
+        let subtree = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&root),
+                include_descendants: true,
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(subtree.len(), 2, "根的子树视图应看到叶子里的两篇");
+
+        let direct = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&root),
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(
+            direct.len(),
+            0,
+            "根是分类节点，直属视图应当为空——这正是用户报的那个细节"
+        );
+    }
+
+    // -------------------------------------------------- 笔记只住在最底层目录
+
+    #[test]
+    fn creating_a_note_in_a_parent_notebook_dives_to_the_deepest_child() {
+        // 用户报的细节：参照印象笔记，在非最底层目录新建笔记时，
+        // 笔记应被归到**排序第 1 的最底层子目录**，
+        // 而不是留在中间层（那会造成"父级 5 篇、子级 4 篇"的困惑）。
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+
+        for (notebook, label) in [(root, "根"), (mid, "中"), (leaf, "叶")] {
+            let note = core.create_note(Some(notebook), label, NOW).expect("note");
+            assert_eq!(
+                note.notebook_id,
+                Some(leaf),
+                "在「{label}」新建的笔记应当落到最底层的叶目录"
+            );
+        }
+
+        // 返回到父链上都看不到笔记
+        for parent in [root, mid] {
+            let direct = core
+                .list_notes(&NoteQuery {
+                    notebook_id: Some(&parent),
+                    ..NoteQuery::default()
+                })
+                .expect("list");
+            assert!(direct.is_empty(), "分类节点不该有直属笔记");
+        }
+        let at_leaf = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&leaf),
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(at_leaf.len(), 3);
+    }
+
+    #[test]
+    fn the_first_child_by_name_is_the_one_chosen() {
+        // "排序第 1"必须可预测：与左栏树的展示顺序**完全一致**。
+        // 取"最近用的那个"会让同一操作在不同时刻落到不同目录。
+        let core = NestedCore::open_in_memory().expect("open");
+        let parent = core.create_notebook("父", None, NOW).expect("parent");
+        // 故意乱序创建，验证选中的确实是排序最小的那个
+        core.create_notebook("丙", Some(parent.id), NOW).expect("b");
+        core.create_notebook("甲", Some(parent.id), NOW).expect("j");
+        core.create_notebook("乙", Some(parent.id), NOW).expect("y");
+
+        let note = core
+            .create_note(Some(parent.id), "笔记", NOW)
+            .expect("note");
+        let target = core
+            .get_notebook(&note.notebook_id.expect("has notebook"))
+            .expect("get");
+
+        // 用与左栏**相同的方式**判定"第 1 个"，而不是硬编码一个名称：
+        // 硬编码会把排序规则变成测试里的一组魔数，
+        // 而且第一版就硬编码错了（我以为是拼音序的"甲"）。
+        let tree = core.list_notebook_tree().expect("tree");
+        let first_child = tree
+            .iter()
+            .find(|(notebook, depth)| *depth == 1 && notebook.parent_id == Some(parent.id))
+            .map(|(notebook, _)| notebook.name.clone())
+            .expect("应当有子目录");
+        assert_eq!(
+            target.name, first_child,
+            "落点必须等于**左栏显示在最上面**的那个子目录"
+        );
+    }
+
+    #[test]
+    fn child_order_is_byte_order_not_pinyin() {
+        // 这条是**记录事实**，不是在肯定它：
+        //
+        // SQLite 默认的 BINARY 排序是**字节序**，因此中文名称按 Unicode
+        // 码点排（丙 U+4E19 < 乙 U+4E59 < 甲 U+7532），
+        // **不是拼音序**（拼音序应为 甲 jiǎ < 乙 yǐ < 丙 bǐng）。
+        //
+        // 后果：中文用户看到的顺序不是他预期的拼音序。
+        // 但**内洽性成立**——内核选的"第 1 个"与左栏显示的第 1 个是同一个，
+        // 因此"新建笔记会落到最上面那个子目录"这句话仍然可预测。
+        //
+        // 改成拼音序需要 ICU 排序规则或应用层排序，属独立课题（已记入技术债）。
+        // 这个测试把现状钉住，免得后来者以为它已经是拼音序了。
+        let core = NestedCore::open_in_memory().expect("open");
+        let parent = core.create_notebook("父", None, NOW).expect("parent");
+        for name in ["甲", "乙", "丙"] {
+            core.create_notebook(name, Some(parent.id), NOW)
+                .expect("child");
+        }
+        let tree = core.list_notebook_tree().expect("tree");
+        let order: Vec<String> = tree
+            .iter()
+            .filter(|(notebook, depth)| *depth == 1 && notebook.parent_id == Some(parent.id))
+            .map(|(notebook, _)| notebook.name.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["丙".to_owned(), "乙".to_owned(), "甲".to_owned()],
+            "现状是字节序。若将来改成拼音序，这里会失败——\
+             那时请连同 resolve_note_notebook 的文档一起更新"
+        );
+    }
+
+    #[test]
+    fn it_dives_all_the_way_down_not_just_one_level() {
+        // 五层：必须一路走到最底，而不是只下一层
+        let core = NestedCore::open_in_memory().expect("open");
+        let mut current = core.create_notebook("L0", None, NOW).expect("l0");
+        let mut deepest = current.id;
+        for level in 1..5 {
+            current = core
+                .create_notebook(format!("L{level}"), Some(current.id), NOW)
+                .expect("level");
+            deepest = current.id;
+        }
+
+        let note = core.create_note(Some(deepest), "笔记", NOW).expect("note");
+        assert_eq!(
+            note.notebook_id,
+            Some(deepest),
+            "叶目录本身就是最底层，不动"
+        );
+
+        // 从最顶层建：应当一路下潜到 L4
+        let from_top = {
+            let all = core.list_notebooks().expect("list");
+            all.iter()
+                .find(|notebook| notebook.name == "L0")
+                .expect("L0")
+                .id
         };
-        assert_eq!(core.list_notes(&direct).expect("list").len(), 1);
+        let from_root = core
+            .create_note(Some(from_top), "从顶层建", NOW)
+            .expect("note");
+        assert_eq!(
+            from_root.notebook_id,
+            Some(deepest),
+            "应当一路下潜到最底层，而不是只下一层"
+        );
+    }
+
+    #[test]
+    fn a_note_in_a_leaf_notebook_stays_there() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let leaf = core.create_notebook("只有我", None, NOW).expect("leaf");
+        let note = core.create_note(Some(leaf.id), "笔记", NOW).expect("note");
+        assert_eq!(note.notebook_id, Some(leaf.id));
+    }
+
+    #[test]
+    fn a_note_with_no_notebook_stays_unfiled() {
+        // "全部笔记"里新建 → 不猜归属，保持未分类。
+        // 猜一个目录比留空更糟：用户没表达意图，程序不该替他决定。
+        let core = NestedCore::open_in_memory().expect("open");
+        core.create_notebook("某目录", None, NOW).expect("book");
+        let note = core.create_note(None, "未分类", NOW).expect("note");
+        assert_eq!(note.notebook_id, None);
+    }
+
+    #[test]
+    fn existing_notes_in_middle_layers_are_not_relocated() {
+        // 只影响**新建**。历史数据里挂在中间层的笔记保持原样——
+        // 用户没要求搬家，擅自动他的数据比"看起来不一致"更糟（铁律 T1）。
+        let core = NestedCore::open_in_memory().expect("open");
+        let parent = core.create_notebook("父", None, NOW).expect("parent");
+        let child = core
+            .create_notebook("子", Some(parent.id), NOW)
+            .expect("child");
+
+        // 先用底层接口直接建一篇挂在父层（模拟历史数据）
+        let mid_note = core
+            .create_note_with_document(
+                Some(parent.id),
+                "历史遗留",
+                Document::empty(NOW),
+                UNKNOWN_DEVICE_ID,
+                NOW,
+            )
+            .expect("note");
+        assert_eq!(mid_note.notebook_id, Some(parent.id), "底层接口不重定向");
+
+        // 再走正常路径新建一篇 → 它会下潜到子目录
+        core.create_note(Some(parent.id), "新的", NOW)
+            .expect("note");
+
+        let at_parent = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&parent.id),
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(at_parent.len(), 1, "历史遗留那篇仍留在父层，没有被搬走");
+        assert_eq!(at_parent[0].title, "历史遗留");
+
+        let at_child = core
+            .list_notes(&NoteQuery {
+                notebook_id: Some(&child.id),
+                ..NoteQuery::default()
+            })
+            .expect("list");
+        assert_eq!(at_child.len(), 1, "新建那篇落在子目录");
+    }
+
+    #[test]
+    fn creating_a_note_in_a_missing_notebook_is_not_found() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let error = core
+            .create_note(Some(Id::new()), "笔记", NOW)
+            .expect_err("必须报 NotFound");
+        assert_eq!(error.code(), "NOT_FOUND");
     }
 
     #[test]

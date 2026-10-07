@@ -57,6 +57,16 @@ pub struct NoteSummary {
     pub version: i64,
     /// 是否在回收站。
     pub deleted: bool,
+    /// 所属笔记本；`None` 表示未分类。
+    ///
+    /// ## 为什么界面需要它
+    ///
+    /// 1. 在**非最底层**目录点"新建笔记"时，内核会把笔记下潜到最底层的
+    ///    子目录（见 `resolve_note_notebook`）。界面必须知道**实际落到了哪里**，
+    ///    才能把左栏选中项跟过去——否则用户点了"在这里新建"，
+    ///    新笔记却出现在别处，而界面毫无提示。
+    /// 2. 列表行能显示归属，排查"这篇到底在哪个目录"时不用再去翻数据库。
+    pub notebook_id: Option<String>,
 }
 
 /// 一次操作的结果。
@@ -373,6 +383,7 @@ fn summary_of(note: &Note) -> NoteSummary {
         updated_at_ms: note.updated_at_ms,
         version: note.version,
         deleted: note.deleted_at_ms.is_some(),
+        notebook_id: note.notebook_id.map(|id| id.to_string()),
     }
 }
 
@@ -497,8 +508,21 @@ pub fn notes_list(
 
 /// 创建一篇空笔记。
 ///
-/// `notebook_id` 给出时直接建在该笔记本下——这是"在某个笔记本里点新建"的
-/// 期望行为，否则新建的笔记会跑到"全部笔记"里，用户还得再手动移动一次。
+/// ## 指定的笔记本不是最底层时会被自动下潜
+///
+/// 内核的规则是"**笔记只住在最底层目录**"（参照印象笔记）：
+/// 用户在非最底层目录点新建时，笔记被归到该层**排序第 1 的最底层
+/// 子目录**，而不是留在中间层。
+///
+/// 留在中间层会制造"父级 5 篇、子级 4 篇"这种谁都说不清的状态——
+/// 数字本身没错，错的是"分类节点里竟然能放笔记"。
+///
+/// 因此这里必须走 `core.create_note()`，**不能**直接调
+/// `create_note_with_document()`：后者是底层原语，不做下潜。
+/// （第一版就是直接调了它，结果下潜逻辑形同虚设，核对脚本当场抓出来。）
+///
+/// 返回的 `note.notebook_id` 是**实际生效**的那一个，界面据此把左栏选中项
+/// 跟过去。
 #[must_use]
 pub fn notes_create(notebook_id: Option<String>, title: &str, at_ms: i64) -> NoteResult {
     let notebook = match notebook_id.as_deref().map(Id::parse) {
@@ -521,8 +545,11 @@ pub fn notes_create(notebook_id: Option<String>, title: &str, at_ms: i64) -> Not
     // 后一次读锁会永久等待 —— 表现为"点了新建笔记界面卡住"。
     // 因此 `with_core` 的闭包约定：**内部不得再调用 with_core**，要什么一次取完。
     match with_core(|core| {
-        let device = core.device_id()?;
-        core.create_note_with_document(notebook, title, Document::empty(at_ms), &device, at_ms)
+        // `create_note` 内部会做"下潜到最底层"（见函数文档）。
+        // 它用的设备标识是 UNKNOWN_DEVICE_ID —— 对"新建空笔记"这个动作
+        // 来说没有区别，修订记录的 device 字段在首次保存时才重要。
+        let _device = core.device_id()?;
+        core.create_note(notebook, title, at_ms)
     }) {
         Ok(note) => NoteResult::ok(NotePayload {
             note: Some(summary_of(&note)),

@@ -97,53 +97,90 @@ Future<void> main() async {
   }
   final childId = child.value!.notebook!.id;
 
+  stdout.writeln('=== 步骤 0：新建笔记是否自动下潜到最底层子目录 ===');
+  // 用户要求的细节（参照印象笔记）：在非最底层目录点新建时，
+  // 笔记被归到**排序第 1 的最底层子目录**，不存在"挂在中间层"的笔记。
+  final inParentEarly = await notesCreate(
+    notebookId: parentId,
+    title: '$kPrefix下潜检查',
+    atMs: now + 5,
+  );
+  check('在父目录新建成功', inParentEarly.ok, inParentEarly.hint ?? '');
+  final landed = inParentEarly.value!.note!.notebookId;
+  check(
+    '笔记没有留在父目录，而是下潜到了子目录',
+    landed == childId,
+    '落点=${landed == parentId
+        ? "父目录（错）"
+        : landed == childId
+        ? "子目录（对）"
+        : landed}',
+  );
+  await notesDelete(id: inParentEarly.value!.note!.id, atMs: now + 6);
+  await notesPurge(id: inParentEarly.value!.note!.id);
+
+  stdout.writeln('');
   stdout.writeln('=== 步骤 1：在**父**笔记本里新建笔记 ===');
   final inParent = await notesCreate(
     notebookId: parentId,
-    title: '$kPrefix父里的笔记',
+    title: '$kPrefix父里建的',
     atMs: now + 10,
   );
   check('新建成功', inParent.ok, inParent.hint ?? '');
-  final parentNoteId = inParent.value!.note!.id;
+  final fromParentId = inParent.value!.note!.id;
+  check('它下潜到了子目录（不留在父层）', inParent.value!.note!.notebookId == childId);
 
-  await notesSave(id: parentNoteId, title: null, text: '父里的内容', atMs: now + 11);
+  await notesSave(id: fromParentId, title: null, text: '内容', atMs: now + 11);
 
   stdout.writeln('');
   stdout.writeln('=== 步骤 2：立刻查两个视图 ===');
   final parentDirect = await _ids(notebookId: parentId);
   final childDirect = await _ids(notebookId: childId);
-  check('父的直属视图里有它', parentDirect.contains(parentNoteId));
-  check('**子**的直属视图里没有它（它不属于子）', !childDirect.contains(parentNoteId));
+  check(
+    '父的直属视图里**没有**它（笔记只住最底层）',
+    !parentDirect.contains(fromParentId),
+    '父直属 ${parentDirect.length} 篇',
+  );
+  check('子的直属视图里有它', childDirect.contains(fromParentId));
 
   stdout.writeln('');
-  stdout.writeln('=== 步骤 3：在**子**笔记本里新建笔记，再查 ===');
+  stdout.writeln('=== 步骤 3：在**子**笔记本里再建一篇，并核对两个视图 ===');
   final inChild = await notesCreate(
     notebookId: childId,
-    title: '$kPrefix子里的笔记',
+    title: '$kPrefix子里建的',
     atMs: now + 20,
   );
   check('新建成功', inChild.ok, inChild.hint ?? '');
   final childNoteId = inChild.value!.note!.id;
+  check('子目录本身是最底层，落点不变', inChild.value!.note!.notebookId == childId);
 
   final parentDirect2 = await _ids(notebookId: parentId);
   final childDirect2 = await _ids(notebookId: childId);
   final parentSubtree = await _ids(notebookId: parentId, descendants: true);
   final childSubtree = await _ids(notebookId: childId, descendants: true);
 
-  check('父的直属：只有父里那篇', !parentDirect2.contains(childNoteId));
-  check('子的直属：只有子里那篇', !childDirect2.contains(parentNoteId));
   check(
-    '父的子树：两篇都有',
-    parentSubtree.contains(parentNoteId) && parentSubtree.contains(childNoteId),
-    '${parentSubtree.length} 篇',
+    '父的直属仍为空（分类节点不存笔记）',
+    parentDirect2.isEmpty,
+    '父直属 ${parentDirect2.length} 篇',
   );
   check(
-    '子的子树：只有子里那篇',
-    !childSubtree.contains(parentNoteId),
-    '${childSubtree.length} 篇',
+    '子目录里有两篇',
+    childDirect2.contains(fromParentId) && childDirect2.contains(childNoteId),
+    '子直属 ${childDirect2.length} 篇',
   );
   check(
-    '父的子树 = 父直属 ∪ 子子树',
+    '**父的子树能看到两篇** —— 这是用户要求恢复的行为',
+    parentSubtree.contains(fromParentId) && parentSubtree.contains(childNoteId),
+    '父子树 ${parentSubtree.length} 篇',
+  );
+  check(
+    '子的子树与子的直属一致（叶子没有后代）',
+    childSubtree.length == childDirect2.length,
+    '子子树 ${childSubtree.length} / 子直属 ${childDirect2.length}',
+  );
+  check(
+    '父的子树 = 父直属 ∪ 子子树 —— 徽标数字与列表行数因此相等',
     parentSubtree.length == parentDirect2.union(childSubtree).length,
     '父子树 ${parentSubtree.length} / 并集 ${parentDirect2.union(childSubtree).length}',
   );
@@ -155,16 +192,16 @@ Future<void> main() async {
     final b = await _ids(notebookId: childId);
     final c = await _ids(notebookId: parentId, descendants: true);
     final ok =
-        a.contains(parentNoteId) &&
-        !a.contains(childNoteId) &&
+        a.isEmpty &&
+        b.contains(fromParentId) &&
         b.contains(childNoteId) &&
-        !b.contains(parentNoteId) &&
-        c.contains(parentNoteId) &&
-        c.contains(childNoteId);
+        c.contains(fromParentId) &&
+        c.contains(childNoteId) &&
+        c.length == b.length;
     check(
       '第 ${round + 1} 轮交替查询',
       ok,
-      '父=${a.length} 子=${b.length} 父子树=${c.length}',
+      '父直属=${a.length} 子=${b.length} 父子树=${c.length}',
     );
   }
 
@@ -177,15 +214,17 @@ Future<void> main() async {
   final a2 = await _ids(notebookId: parentId);
   final b2 = await _ids(notebookId: childId);
   final c2 = await _ids(notebookId: parentId, descendants: true);
+  check('重启后父的直属仍为空（分类节点不存笔记）', a2.isEmpty, '父直属 ${a2.length} 篇');
   check(
-    '重启后父的直属仍只有父里那篇',
-    a2.contains(parentNoteId) && !a2.contains(childNoteId),
+    '重启后两篇都在子目录里',
+    b2.contains(childNoteId) && b2.contains(fromParentId),
+    '子直属 ${b2.length} 篇',
   );
   check(
-    '重启后子的直属仍只有子里那篇',
-    b2.contains(childNoteId) && !b2.contains(parentNoteId),
+    '重启后父的子树仍是两篇（聚合是查询算出来的，不依赖进程内状态）',
+    c2.contains(fromParentId) && c2.contains(childNoteId),
+    '父子树 ${c2.length} 篇',
   );
-  check('重启后父的子树仍是两篇', c2.contains(parentNoteId) && c2.contains(childNoteId));
 
   // 逐篇核对归属字段与所在视图是否一致
   stdout.writeln('');

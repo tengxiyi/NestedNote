@@ -39,6 +39,7 @@ class NoteItem {
     required this.updatedAtMs,
     required this.version,
     required this.deleted,
+    this.notebookId,
   });
 
   /// 笔记标识。
@@ -59,6 +60,13 @@ class NoteItem {
   /// 是否在回收站。
   final bool deleted;
 
+  /// 所属笔记本；`null` 表示未分类。
+  ///
+  /// 界面用它做一件事：在**非最底层**目录点"新建笔记"时，内核会把笔记
+  /// 下潜到最底层的子目录，左栏选中项要**跟到实际落地的那个目录**去。
+  /// 否则用户点了"在这里新建"，新笔记出现在别处而界面毫无提示。
+  final String? notebookId;
+
   /// 从生成类型转换。
   factory NoteItem.fromRust(rust.NoteSummary source) {
     return NoteItem(
@@ -70,6 +78,7 @@ class NoteItem {
       updatedAtMs: source.updatedAtMs.toInt(),
       version: source.version.toInt(),
       deleted: source.deleted,
+      notebookId: source.notebookId,
     );
   }
 }
@@ -124,7 +133,7 @@ class NoteListQuery {
   /// 构造。
   const NoteListQuery({
     this.notebookId,
-    this.includeDescendants = false,
+    this.includeDescendants = true,
     this.includeDeleted = false,
   });
 
@@ -133,27 +142,32 @@ class NoteListQuery {
 
   /// 是否包含子笔记本里的笔记。
   ///
-  /// ## 默认 `false`：点哪个文件夹就只看它自己的笔记
+  /// ## 默认 `true`：点父级目录能看到它下面的所有笔记
   ///
-  /// 这个默认值**改过一次**，原因值得记下来。
+  /// 这个默认值**来回改过两次**，两次都有明确理由，记在这里免得再翻烧饼。
   ///
-  /// 最初是 `true`，理由是"否则每建一层子笔记本，父级看上去就变空了"。
-  /// 但那个理由站不住：子笔记**本来就在子笔记本里**，父级显示它们才是错位。
+  /// **最初**是 `true`，理由："否则每建一层子笔记本，父级看上去就变空了。"
   ///
-  /// 真实后果有两个，都是用户报上来的：
+  /// **中间改成 `false`**，因为当时出现了"父级徽标 5、点进去只有 1"的矛盾。
+  /// 但那时的真因不是聚合本身，而是**笔记可以挂在中间层**——
+  /// 分类节点里躺着笔记，于是"父级有几篇"永远说不清。
   ///
-  /// 1. **父文件夹看起来装满了不属于它的笔记**。用户点「工作1」
-  ///    看到 5 篇，但其中 4 篇其实在「工作/进行中1」里。
-  /// 2. **数字互相矛盾**。左侧徽标按某种口径算、中间栏表头按列表行数算，
-  ///    同一个界面出现两个不同的数字，用户自然要问"为什么多一个"。
+  /// **现在恢复 `true`**，同时内核加了"新建笔记自动下潜到最底层子目录"
+  /// （`NestedCore::resolve_note_notebook`）。两者合起来才成立：
   ///
-  /// 改成 `false` 之后三者一致：**徽标 = 该文件夹直属笔记数 =
-  /// 点进去看到的行数 = 表头数字**。
+  /// - 笔记只住在最底层 → 不存在"某个中间层藏着笔记"的歧义；
+  /// - 点父级看到整棵子树 → 与"父级徽标 = 子树合计"一致；
+  /// - 点叶目录看到的既是它自己、也是它的子树（叶子没有后代）。
   ///
-  /// 想看整棵子树的笔记用「全部笔记」；那是一个明确的全局视图，
-  /// 而不是伪装成"某个文件夹的内容"。
+  /// 于是不变量是：**徽标 = 点进这个目录能看到的行数**，
+  /// 对每一层都成立，不需要用户理解"直属/合计"的区别。
   ///
-  /// 需要合计的**内部**用途（复制笔记本、导出子树）仍然显式传 `true`。
+  /// ## 历史数据里的例外
+  ///
+  /// 内核只对**新建**做下潜，已挂在中间层的笔记不搬（铁律 T1：
+  /// 用户没要求搬家，擅自动他的数据更糟）。因此过渡期里，
+  /// 中间层目录的徽标会大于"它自己那几篇"——这是正确的，
+  /// 因为点进去确实能看到那么多。
   final bool includeDescendants;
 
   /// 是否包含回收站里的笔记。
@@ -354,6 +368,21 @@ class NoteSnapshot {
   final String text;
 }
 
+/// 新建笔记的结果。
+///
+/// 带上 [notebookId] 而不是只给笔记 id：内核可能把笔记下潜到别的目录
+/// （见 [NoteActions.create]），调用方需要知道**实际落点**。
+class CreatedNote {
+  /// 构造。
+  const CreatedNote({required this.id, required this.notebookId});
+
+  /// 笔记标识。
+  final String id;
+
+  /// **实际生效**的所属笔记本；`null` 表示未分类。
+  final String? notebookId;
+}
+
 /// 笔记数量（不含回收站）。
 final FutureProvider<int> noteCountProvider = FutureProvider<int>((
   Ref ref,
@@ -372,11 +401,25 @@ class NoteActions {
 
   final Ref _ref;
 
-  /// 创建空笔记，返回其标识。
+  /// 创建空笔记，返回**实际落地**的位置。
   ///
-  /// `notebookId` 给出时，笔记直接建在该笔记本下——这是"在某个笔记本里点新建"
-  /// 的期望行为（否则新建的笔记会跑到"全部笔记"里，用户还得再手动移动一次）。
-  Future<String> create({String title = '无标题笔记', String? notebookId}) async {
+  /// ## `notebookId` 只是"用户点在哪"，不一定是笔记最终在哪
+  ///
+  /// 内核的规则是"笔记只住在最底层目录"（`resolve_note_notebook`）：
+  /// 用户在**非最底层**目录点新建时，笔记会被自动归到该层
+  /// **排序第 1 的最底层子目录**。
+  ///
+  /// 因此返回 [CreatedNote]，让调用方拿到**实际生效的** `notebookId`
+  /// 并据此把左栏选中项跟过去。否则用户点了"在这里新建"，
+  /// 新笔记出现在别处，而界面毫无提示——那比"没反应"更让人困惑。
+  ///
+  /// 第一版只返回 `String`（笔记 id），调用方无从知道落点，
+  /// 于是它在父目录新建后仍选中父目录，看到的是整棵子树——
+  /// 新笔记混在中间，用户以为"没成功"。
+  Future<CreatedNote> create({
+    String title = '无标题笔记',
+    String? notebookId,
+  }) async {
     final result = await rust.notesCreate(
       notebookId: notebookId,
       title: title,
@@ -393,7 +436,7 @@ class NoteActions {
       throw const NoteFailure(code: 'EMPTY_PAYLOAD', hint: '内核未返回新建的笔记。');
     }
     _invalidateLists();
-    return item.id;
+    return CreatedNote(id: item.id, notebookId: item.notebookId);
   }
 
   /// 保存正文。

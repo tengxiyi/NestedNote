@@ -37,15 +37,21 @@ void main() {
       noteCount: count,
     );
 
-    test('默认查询**不**包含子笔记本（否则父子数字必然矛盾）', () {
-      // 这是本轮修复的核心。若有人把默认值改回 true，
-      // "父级 5 篇、子级 4 篇"的矛盾会立刻回来。
+    test('默认查询**包含**子笔记本（点父级能看到它下面的所有笔记）', () {
+      // ## 这个默认值来回改过两次，测试钉住的是**最终结论**
+      //
+      // 中间有一版把它改成 false，因为当时出现"父级徽标 5、点进去只有 1"
+      // 的矛盾。但那时的真因**不是聚合本身**，而是笔记可以挂在中间层——
+      // 分类节点里躺着笔记，于是"父级有几篇"永远说不清。
+      //
+      // 最终方案是两条一起：
+      //   1. 内核让新建的笔记自动下潜到最底层子目录（笔记只住在叶子里）
+      //   2. 点父级看到整棵子树
+      //
+      // 只要笔记只住在叶子里，聚合就没有歧义：
+      // 徽标（子树合计）= 点进这个目录能看到的行数，对每一层都成立。
       const NoteListQuery query = NoteListQuery(notebookId: '某个笔记本');
-      expect(
-        query.includeDescendants,
-        isFalse,
-        reason: '点哪个文件夹就只看它自己的笔记。包含子孙会让徽标、表头、行数三者互相矛盾',
-      );
+      expect(query.includeDescendants, isTrue, reason: '点父级目录要能看到它下面的所有笔记');
     });
 
     test('全部笔记视图不受影响', () {
@@ -53,42 +59,41 @@ void main() {
       // 它靠 notebookId == null 表达，与 includeDescendants 无关。
       const NoteListQuery all = NoteListQuery();
       expect(all.notebookId, isNull);
-      expect(all.includeDescendants, isFalse);
+      expect(all.includeDescendants, isTrue);
     });
 
-    test('徽标取自 noteCount（直属数），不是子树合计', () {
-      // 树里的 noteCount 必须是直属数：内核的 notebooks_tree 就是这么给的。
-      // 这里用一个两层结构把"直属 vs 合计"的差别摆出来。
+    test('徽标用 noteCount，它必须等于"点进去能看到的篇数"', () {
+      // 在"笔记只住最底层"的前提下，父级的 noteCount（子树合计）
+      // 就是点进去能看到的篇数，因此可以直接做徽标。
+      //
+      // 若将来有人去掉"自动下潜"，中间层又会藏笔记，
+      // 这个等式就会破——那时徽标必须改口径。见 widget 的注释。
       final List<NotebookNode> tree = <NotebookNode>[
-        node('a', '工作1', count: 1), // 直属 1
-        node('b', '工作1/进行中1', parent: 'a', count: 4), // 直属 4
+        node('a', '工作1', count: 5), // 子树合计 5（它自己 1 + 子 4，但那 1 不该存在）
+        node('b', '工作1/进行中1', parent: 'a', count: 4),
       ];
-      final NotebookNode parent = tree.first;
-      final int subtreeTotal = tree.fold(
-        0,
-        (int sum, NotebookNode n) => sum + n.noteCount,
-      );
-
-      expect(parent.noteCount, 1, reason: '徽标要显示 1（点进去能看到的篇数），而不是子树合计 5');
-      expect(subtreeTotal, 5, reason: '合计 5 仍然算得出来，只是不该出现在那个位置');
+      expect(tree.first.noteCount, 5, reason: '徽标显示 5，因为点进去确实能看到 5 行（含子目录的）');
+      expect(tree.last.noteCount, 4, reason: '子目录没有后代，它的合计就是它自己');
     });
 
-    test('每一层都显示计数（不再只显示最底层）', () {
-      // 第二版曾"只在最底层显示"。那会让中间层没有数字可对照，
-      // 而点进去又能看到笔记 → 用户仍会觉得对不上。
-      // 现在每层都显示直属数，因此每层都能自证一致。
+    test('每一层都显示计数', () {
+      // 中间层没有数字可对照时，用户仍会觉得"点进去的比看到的多"。
+      // 每层都显示，每层都能自证一致。
       final List<NotebookNode> tree = <NotebookNode>[
-        node('a', 'L0', count: 2),
-        node('b', 'L0/b', parent: 'a', count: 0),
+        node('a', 'L0', count: 9),
+        node('b', 'L0/b', parent: 'a', count: 7),
         node('c', 'L0/b/c', parent: 'b', count: 7),
       ];
       expect(
         tree.every((NotebookNode n) => n.noteCount >= 0),
         isTrue,
-        reason: '容器也有自己的直属数（可以是 0），照常显示',
+        reason: '每一层都有计数可显示',
       );
-      // 直属数与子树合计是两回事：a 的合计是 2+0+7=9，但徽标显示 2
-      expect(tree.first.noteCount, 2);
+      expect(
+        tree.first.noteCount,
+        greaterThanOrEqualTo(tree.last.noteCount),
+        reason: '父级的合计不会小于子级的合计',
+      );
     });
 
     test('叶子集合与容器集合互补（右键菜单分类仍需要它）', () {

@@ -143,10 +143,21 @@ class NoteListPane extends ConsumerWidget {
   ) async {
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     try {
-      final String id = await ref
+      final CreatedNote created = await ref
           .read(noteActionsProvider)
           .create(notebookId: notebookId);
-      onOpenNote(id);
+
+      // 左栏选中项**跟到笔记实际落地的目录**。
+      //
+      // 内核规定"笔记只住在最底层目录"：用户在非最底层目录点新建时，
+      // 笔记会被下潜到排序第 1 的最底层子目录。若不跟随，
+      // 用户会看到"我在这里点的，笔记却出现在别处"（实际是混在
+      // 整棵子树的列表里），比"没反应"更让人困惑。
+      final String? landed = created.notebookId;
+      if (landed != null && landed != notebookId) {
+        ref.read(selectedNotebookIdProvider.notifier).select(landed);
+      }
+      onOpenNote(created.id);
     } on NoteFailure catch (failure) {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }
