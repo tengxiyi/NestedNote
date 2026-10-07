@@ -180,7 +180,12 @@ impl NestedCore {
         notebooks::get(&connection, id)?.ok_or(CoreError::NotFound { entity: "notebook" })
     }
 
-    /// 列出全部未删除笔记本。
+    /// 列出全部未删除笔记本（**扁平列表**，层级由 `parent_id` 表达）。
+    ///
+    /// 之所以返回扁平列表而不是嵌套树：树形结构属于**展示问题**，
+    /// 由界面按 `parent_id` 组装即可（一次遍历），而扁平列表在跨 FFI 时
+    /// 映射更简单、也更方便按需排序。若将来需要"按树展开的顺序"，
+    /// 用 [`NestedCore::list_notebook_tree`]。
     ///
     /// # Errors
     ///
@@ -188,6 +193,91 @@ impl NestedCore {
     pub fn list_notebooks(&self) -> CoreResult<Vec<Notebook>> {
         let connection = self.database.connection()?;
         Ok(notebooks::list_all(&connection)?)
+    }
+
+    /// 列出笔记本树（**深度优先**顺序，带层级深度）。
+    ///
+    /// 返回值是 `(笔记本, 深度)`：深度 0 为顶层，1 为其子级，依此类推。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 界面的左栏是一棵可展开的树。若只给扁平列表，每个前端都要自己写一遍
+    /// "按 parent_id 组装 + 深度优先排序 + 处理孤儿节点"的逻辑——这是
+    /// 典型的**业务规则漏到 UI 层**（铁律 A2）。因此这里一次算好。
+    ///
+    /// ## 孤儿节点
+    ///
+    /// 若某个笔记本的 `parent_id` 指向一个已不存在（或已被物理移除）的节点，
+    /// 它会被当作**顶层**处理，从而保证任何笔记本都不会在界面上"消失"。
+    /// 数据层的外键本应阻止这种情况，但界面不该依赖"上游一定没错"。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn list_notebook_tree(&self) -> CoreResult<Vec<(Notebook, u32)>> {
+        let all = self.list_notebooks()?;
+
+        // parent_id → 子节点（保持 list_all 的名称排序）
+        let mut children: std::collections::HashMap<Option<Id>, Vec<&Notebook>> =
+            std::collections::HashMap::new();
+        let known: std::collections::HashSet<Id> = all.iter().map(|nb| nb.id).collect();
+        for notebook in &all {
+            // 父节点不存在时归到顶层（见上方"孤儿节点"）
+            let key = match notebook.parent_id {
+                Some(parent) if known.contains(&parent) => Some(parent),
+                _ => None,
+            };
+            children.entry(key).or_default().push(notebook);
+        }
+
+        let mut out = Vec::with_capacity(all.len());
+        // 显式栈做深度优先，避免递归（笔记本层级可能很深）
+        let mut stack: Vec<(&Notebook, u32)> = children
+            .get(&None)
+            .map(|roots| roots.iter().rev().map(|nb| (*nb, 0_u32)).collect())
+            .unwrap_or_default();
+
+        while let Some((notebook, depth)) = stack.pop() {
+            out.push((notebook.clone(), depth));
+            if let Some(kids) = children.get(&Some(notebook.id)) {
+                for child in kids.iter().rev() {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 一个笔记本及其**全部后代**的标识（含自身）。
+    ///
+    /// 用于"删除笔记本时统计影响范围"之类的场景，也便于界面显示
+    /// "该笔记本下共有 N 篇笔记"。
+    ///
+    /// # Errors
+    ///
+    /// 笔记本不存在 → [`CoreError::NotFound`]。
+    pub fn notebook_subtree_ids(&self, root: &Id) -> CoreResult<Vec<Id>> {
+        let all = self.list_notebooks()?;
+        if !all.iter().any(|notebook| notebook.id == *root) {
+            return Err(CoreError::NotFound { entity: "notebook" });
+        }
+
+        let mut children: std::collections::HashMap<Id, Vec<Id>> = std::collections::HashMap::new();
+        for notebook in &all {
+            if let Some(parent) = notebook.parent_id {
+                children.entry(parent).or_default().push(notebook.id);
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut stack = vec![*root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            if let Some(kids) = children.get(&id) {
+                stack.extend(kids.iter().copied());
+            }
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------------ 笔记
@@ -360,6 +450,57 @@ impl NestedCore {
         let device_id = self.device_id()?;
         let mut connection = self.database.connection()?;
         notes::restore(&mut connection, id, &device_id, at_ms)?;
+        Ok(())
+    }
+
+    /// 把笔记本移入回收站（软删除，铁律 T7）。
+    ///
+    /// ## **不**级联删除其下的笔记
+    ///
+    /// 级联删除是危险操作：用户删掉一个"看起来是空的"父笔记本，
+    /// 结果连带删掉了忘了放在里面的笔记——这类事故不可逆（即使有回收站，
+    /// 用户也未必想到去那里找）。
+    ///
+    /// 因此这里只删除笔记本自身。其下的笔记仍然存在，只是不再出现在
+    /// 任何笔记本的列表里；界面应当提示"该笔记本下还有 N 篇笔记"，
+    /// 由用户决定怎么处理。这与铁律 T1（数据不可丢）一致：
+    /// **宁可留下"孤儿笔记"让用户自己决定，也不要替他做破坏性选择。**
+    ///
+    /// # Errors
+    ///
+    /// 笔记本不存在或已在回收站 → [`CoreError::NotFound`]。
+    pub fn delete_notebook(&self, id: &Id, at_ms: i64) -> CoreResult<()> {
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notebooks::soft_delete(&mut connection, id, &device_id, at_ms)?;
+        Ok(())
+    }
+
+    /// 从回收站恢复笔记本。
+    ///
+    /// # Errors
+    ///
+    /// 笔记本不在回收站中 → [`CoreError::NotFound`]。
+    pub fn restore_notebook(&self, id: &Id, at_ms: i64) -> CoreResult<()> {
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notebooks::restore(&mut connection, id, &device_id, at_ms)?;
+        Ok(())
+    }
+
+    /// 重命名笔记本。
+    ///
+    /// # Errors
+    ///
+    /// 名称为空或超长 → [`CoreError::Validation`]；不存在 → [`CoreError::NotFound`]。
+    pub fn rename_notebook(&self, id: &Id, name: impl Into<String>, at_ms: i64) -> CoreResult<()> {
+        // 用 `Notebook::new` 复用名称的校验规则，避免两处各写一套（铁律 T4）。
+        // 构造出来的探针只用于校验，不写库。
+        let probe = Notebook::new(name, None, at_ms)?;
+
+        let device_id = self.device_id()?;
+        let mut connection = self.database.connection()?;
+        notebooks::rename(&mut connection, id, &probe.name, &device_id, at_ms)?;
         Ok(())
     }
 
@@ -917,6 +1058,165 @@ mod tests {
         core.create_tag("重要", NOW).expect("tag");
         assert_eq!(core.list_notebooks().expect("list").len(), 1);
         assert_eq!(core.list_tags().expect("list").len(), 1);
+    }
+
+    // ---------------------------------------------------------------- 笔记本树
+
+    /// 建一棵三层笔记本树：根 → 中 → 叶。
+    fn notebook_tree(core: &NestedCore) -> (Id, Id, Id) {
+        let root = core.create_notebook("根", None, NOW).expect("root");
+        let mid = core.create_notebook("中", Some(root.id), NOW).expect("mid");
+        let leaf = core.create_notebook("叶", Some(mid.id), NOW).expect("leaf");
+        (root.id, mid.id, leaf.id)
+    }
+
+    #[test]
+    fn notebook_tree_is_depth_first_with_depths() {
+        let core = NestedCore::open_in_memory().expect("open");
+        notebook_tree(&core);
+
+        let tree = core.list_notebook_tree().expect("tree");
+        let shape: Vec<(&str, u32)> = tree
+            .iter()
+            .map(|(notebook, depth)| (notebook.name.as_str(), *depth))
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec![("根", 0), ("中", 1), ("叶", 2)],
+            "应为深度优先且深度正确"
+        );
+    }
+
+    #[test]
+    fn siblings_of_the_same_parent_all_appear() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let root = core.create_notebook("根", None, NOW).expect("root");
+        core.create_notebook("甲", Some(root.id), NOW).expect("a");
+        core.create_notebook("乙", Some(root.id), NOW).expect("b");
+
+        let tree = core.list_notebook_tree().expect("tree");
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[0].1, 0, "根在深度 0");
+        assert!(
+            tree[1..].iter().all(|(_, depth)| *depth == 1),
+            "子级都在深度 1"
+        );
+    }
+
+    #[test]
+    fn orphan_notebook_is_treated_as_top_level_not_dropped() {
+        // 父节点不存在的笔记本不能从界面上消失。
+        //
+        // 注意：正常写入路径**造不出**这种数据——`notebooks.parent_id` 有外键，
+        // 指向不存在的父节点会直接报 787（本测试最初就那么失败了，
+        // 那反而证明约束在生效）。
+        //
+        // 但仍必须处理，因为它可能来自**本进程之外**：同步场景（P6）下
+        // 对端可能先发子节点、后发父节点；或数据库被外部工具改过。
+        // 因此这里绕过外键直接注入坏数据，验证界面不会因此丢节点。
+        let core = NestedCore::open_in_memory().expect("open");
+        let ghost_parent = Id::new();
+        let orphan = Notebook::new("孤儿", Some(ghost_parent), NOW).expect("valid");
+
+        {
+            let connection = core.database().connection().expect("conn");
+            connection
+                .execute_batch("PRAGMA foreign_keys = OFF")
+                .expect("disable fk for injection");
+            nested_db::repositories::notebooks::insert_in_transaction(&connection, &orphan)
+                .expect("inject orphan");
+            connection
+                .execute_batch("PRAGMA foreign_keys = ON")
+                .expect("re-enable fk");
+        }
+
+        let tree = core.list_notebook_tree().expect("tree");
+        assert_eq!(tree.len(), 1, "孤儿节点必须仍然出现");
+        assert_eq!(tree[0].0.id, orphan.id);
+        assert_eq!(tree[0].1, 0, "孤儿被当作顶层");
+    }
+
+    #[test]
+    fn subtree_ids_include_self_and_all_descendants() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+
+        let from_root = core.notebook_subtree_ids(&root).expect("subtree");
+        assert_eq!(from_root.len(), 3, "根 + 中 + 叶");
+        assert!(from_root.contains(&root));
+        assert!(from_root.contains(&mid));
+        assert!(from_root.contains(&leaf));
+
+        let from_mid = core.notebook_subtree_ids(&mid).expect("subtree");
+        assert_eq!(from_mid.len(), 2, "中 + 叶，不含根");
+        assert!(!from_mid.contains(&root));
+
+        let from_leaf = core.notebook_subtree_ids(&leaf).expect("subtree");
+        assert_eq!(from_leaf, vec![leaf], "叶子只有自己");
+    }
+
+    #[test]
+    fn subtree_ids_for_missing_notebook_is_not_found() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let error = core
+            .notebook_subtree_ids(&Id::new())
+            .expect_err("必须报 NotFound");
+        assert_eq!(error.code(), "NOT_FOUND");
+    }
+
+    #[test]
+    fn selecting_a_parent_notebook_lists_descendant_notes() {
+        // 端到端：建树 + 各层放笔记 → 按父级列表应看到全部子孙笔记
+        let core = NestedCore::open_in_memory().expect("open");
+        let (root, mid, leaf) = notebook_tree(&core);
+        for (notebook, title) in [(root, "根笔记"), (mid, "中笔记"), (leaf, "叶笔记")] {
+            core.create_note(Some(notebook), title, NOW).expect("note");
+        }
+
+        let query = NoteQuery {
+            notebook_id: Some(&root),
+            include_descendants: true,
+            ..NoteQuery::default()
+        };
+        let notes = core.list_notes(&query).expect("list");
+        assert_eq!(notes.len(), 3, "父级列表应包含三层笔记");
+
+        // 默认（不含子孙）只看本层
+        let direct = NoteQuery {
+            notebook_id: Some(&root),
+            ..NoteQuery::default()
+        };
+        assert_eq!(core.list_notes(&direct).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn notebook_hierarchy_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf_name = {
+            let core = NestedCore::open(dir.path()).expect("open");
+            let (_root, _mid, leaf) = notebook_tree(&core);
+            core.get_notebook(&leaf).expect("leaf").name
+        };
+        let core = NestedCore::open(dir.path()).expect("reopen");
+        let tree = core.list_notebook_tree().expect("tree");
+        assert_eq!(tree.len(), 3, "重启后层级结构必须保留");
+        assert_eq!(tree[2].0.name, leaf_name);
+        assert_eq!(tree[2].1, 2, "深度也要正确");
+    }
+
+    #[test]
+    fn creating_a_child_notebook_enqueues_sync_operation() {
+        let core = NestedCore::open_in_memory().expect("open");
+        let before = core.pending_sync_count().expect("count");
+        let root = core.create_notebook("根", None, NOW).expect("root");
+        core.create_notebook("子", Some(root.id), NOW)
+            .expect("child");
+        assert_eq!(
+            core.pending_sync_count().expect("count") - before,
+            2,
+            "每个笔记本创建都应入队"
+        );
     }
 
     #[test]

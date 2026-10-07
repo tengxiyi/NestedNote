@@ -175,7 +175,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(start_engine(&dir.path().to_string_lossy()).ready);
 
-        let created = crate::api::notes::notes_create("共享引擎", 1_700_000_000_000);
+        let created = crate::api::notes::notes_create(None, "共享引擎", 1_700_000_000_000);
         assert!(
             created.ok,
             "笔记应能在启动后的引擎上创建：{:?}",

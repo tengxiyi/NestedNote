@@ -23,17 +23,33 @@ Future<void> main() async {
   final count = await notesCount();
   stdout.writeln('notesCount = ${count.toInt()}');
 
-  final active = await notesList(includeDeleted: false, limit: 0);
-  stdout.writeln('notesList(includeDeleted: false) ok=${active.ok} '
-      'code=${active.code} hint=${active.hint}');
+  final active = await notesList(
+    notebookId: null,
+    includeDescendants: true,
+    includeDeleted: false,
+    limit: 0,
+  );
+  stdout.writeln(
+    'notesList(includeDeleted: false) ok=${active.ok} '
+    'code=${active.code} hint=${active.hint}',
+  );
   for (final n in active.value?.notes ?? const <NoteSummary>[]) {
-    stdout.writeln('  ${n.title}  v${n.version}  '
-        'updatedAt=${n.updatedAtMs}  deleted=${n.deleted}');
+    stdout.writeln(
+      '  ${n.title}  v${n.version}  '
+      'updatedAt=${n.updatedAtMs}  deleted=${n.deleted}',
+    );
   }
 
-  final all = await notesList(includeDeleted: true, limit: 0);
-  stdout.writeln('notesList(includeDeleted: true) ok=${all.ok} '
-      '数量=${all.value?.notes.length}');
+  final all = await notesList(
+    notebookId: null,
+    includeDescendants: true,
+    includeDeleted: true,
+    limit: 0,
+  );
+  stdout.writeln(
+    'notesList(includeDeleted: true) ok=${all.ok} '
+    '数量=${all.value?.notes.length}',
+  );
 
   await engineClose();
 }

@@ -23,7 +23,6 @@ import 'package:nested/src/rust/frb_generated.dart';
 
 import 'app_paths.dart';
 
-
 int _failed = 0;
 
 void check(String label, bool condition, [String? detail]) {
@@ -57,39 +56,65 @@ Future<void> main() async {
   stdout.writeln('');
 
   // --- 2. 记录初始状态（不干扰用户既有数据）---
-  final before = await notesList(includeDeleted: false, limit: 0);
+  final before = await notesList(
+    notebookId: null,
+    includeDescendants: true,
+    includeDeleted: false,
+    limit: 0,
+  );
   final int beforeCount = before.value?.notes.length ?? 0;
   stdout.writeln('现有笔记：$beforeCount 篇');
   stdout.writeln('');
 
   // --- 3. 完整闭环 ---
   final now = DateTime.now().millisecondsSinceEpoch;
-  final created = await notesCreate(title: '[验证] 拾光笔记', atMs: now);
+  final created = await notesCreate(
+    notebookId: null,
+    title: '[验证] 拾光笔记',
+    atMs: now,
+  );
   check('创建笔记', created.ok, created.hint ?? '');
   final id = created.value!.note!.id;
 
   const text = '第一行：写入成功\n第二行：块模型按行存储\n第三行：可以读回';
   final saved = await notesSave(id: id, text: text, atMs: now + 1000);
   check('保存正文', saved.ok, saved.hint ?? '');
-  check('修订号递增', saved.value!.note!.version.toInt() == 2,
-      'v${saved.value!.note!.version}');
-  check('摘要取首行', saved.value!.note!.summary == '第一行：写入成功',
-      saved.value!.note!.summary);
+  check(
+    '修订号递增',
+    saved.value!.note!.version.toInt() == 2,
+    'v${saved.value!.note!.version}',
+  );
+  check(
+    '摘要取首行',
+    saved.value!.note!.summary == '第一行：写入成功',
+    saved.value!.note!.summary,
+  );
 
   final read = await notesRead(id: id);
   check('读回内容一致', read.value?.text == text, read.value?.text ?? '(null)');
 
-  final after = await notesList(includeDeleted: false, limit: 0);
-  check('出现在列表中', (after.value?.notes.length ?? 0) == beforeCount + 1,
-      '现在 ${after.value?.notes.length ?? 0} 篇');
+  final after = await notesList(
+    notebookId: null,
+    includeDescendants: true,
+    includeDeleted: false,
+    limit: 0,
+  );
+  check(
+    '出现在列表中',
+    (after.value?.notes.length ?? 0) == beforeCount + 1,
+    '现在 ${after.value?.notes.length ?? 0} 篇',
+  );
 
   // --- 4. 关闭再打开：验证持久化 ---
   check('关闭引擎（释放文件锁）', await engineClose());
   final reopened = await engineStart(dataDir: dir.path);
   check('重新启动引擎', reopened.ready, reopened.message ?? '');
   final afterRestart = await notesRead(id: id);
-  check('重启后内容仍在', afterRestart.value?.text == text,
-      afterRestart.value?.text ?? '(null)');
+  check(
+    '重启后内容仍在',
+    afterRestart.value?.text == text,
+    afterRestart.value?.text ?? '(null)',
+  );
 
   // --- 5. 清理：软删除验证笔记（可从回收站恢复，不物理删除）---
   final deleted = await notesDelete(id: id, atMs: now + 2000);

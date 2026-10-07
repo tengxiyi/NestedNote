@@ -70,6 +70,13 @@ pub struct NoteResult {
     pub code: Option<String>,
     /// 面向用户的一句话提示（不含内部细节）。
     pub hint: Option<String>,
+    /// **仅诊断用**的内部错误详情。
+    ///
+    /// 默认恒为 `None`：铁律 E2 禁止把内部细节给界面。
+    /// 只有设置了环境变量 `NESTED_DEBUG_ERRORS=1` 时才填充——
+    /// 用于"用户看到一句泛化提示、开发需要知道到底哪里错了"的场合
+    /// （本项目在排查三栏界面的列表查询失败时就靠它）。
+    pub debug_detail: Option<String>,
     /// 成功时的载荷。
     pub value: Option<NotePayload>,
 }
@@ -83,6 +90,10 @@ pub struct NotePayload {
     pub notes: Vec<NoteSummary>,
     /// 纯文本内容（读取时返回，行内标记已展平）。
     pub text: Option<String>,
+    /// 笔记本（创建笔记本时返回）。
+    pub notebook: Option<NotebookNode>,
+    /// 笔记本树（树查询返回，已按展开顺序排列）。
+    pub notebooks: Vec<NotebookNode>,
 }
 
 impl NoteResult {
@@ -93,6 +104,7 @@ impl NoteResult {
             ok: true,
             code: None,
             hint: None,
+            debug_detail: None,
             value: Some(value),
         }
     }
@@ -101,12 +113,15 @@ impl NoteResult {
     ///
     /// **注意**：这里用 `code()` 与 `user_hint()`，绝不把 `Display` 输出
     /// （可能含路径或 SQL 片段）直接交给界面（铁律 E2）。
+    /// 唯一的例外是 `NESTED_DEBUG_ERRORS=1` 时的 `debug_detail`——那是
+    /// 开发期诊断开关，默认关闭，且真机上不会有人设它。
     #[must_use]
     fn failed(error: CoreError) -> Self {
         Self {
             ok: false,
             code: Some(error.code().to_owned()),
             hint: Some(error.user_hint().to_owned()),
+            debug_detail: debug_detail_of(&error),
             value: None,
         }
     }
@@ -118,9 +133,22 @@ impl NoteResult {
             ok: false,
             code: Some("ENGINE_NOT_STARTED".to_owned()),
             hint: Some("笔记引擎尚未就绪，请先重启应用。".to_owned()),
+            debug_detail: None,
             value: None,
         }
     }
+}
+
+/// 在 `NESTED_DEBUG_ERRORS=1` 时给出内部错误详情，否则 `None`。
+///
+/// 为什么需要这个开关：用户看到的提示必须是"一句话、无内部细节"（铁律 E2），
+/// 但开发排查"到底哪里错了"时又需要 `Display` 输出。
+/// 用一个显式环境变量把两者分开，而不是把细节永远带在返回值里。
+fn debug_detail_of(error: &CoreError) -> Option<String> {
+    if std::env::var("NESTED_DEBUG_ERRORS").ok().as_deref() != Some("1") {
+        return None;
+    }
+    Some(format!("{error:?}"))
 }
 
 /// 进程级引擎句柄。
@@ -212,6 +240,7 @@ fn with_core<T>(f: impl FnOnce(&NestedCore) -> Result<T, CoreError>) -> Result<T
         ok: false,
         code: Some("ENGINE_LOCK_FAILED".to_owned()),
         hint: Some("内核状态异常，请重启应用。".to_owned()),
+        debug_detail: None,
         value: None,
     })?;
     let core = guard.as_ref().ok_or_else(NoteResult::not_started)?;
@@ -305,16 +334,47 @@ fn parse_id(id: &str) -> Result<Id, NoteResult> {
         ok: false,
         code: Some("INVALID_ID".to_owned()),
         hint: Some("笔记标识无效。".to_owned()),
+        debug_detail: None,
         value: None,
     })
 }
 
-/// 列出未删除的笔记，按最近修改倒序。
+/// 列出笔记，按最近修改倒序。
 ///
-/// `limit = 0` 时使用默认值 50（服务端仓储层还有 500 的硬上限）。
+/// ## 参数
+///
+/// - `notebook_id`：限定笔记本；`None` 表示"全部笔记"（不按笔记本过滤）
+/// - `include_descendants`：是否把**子笔记本**里的笔记也算进来。
+///   仅在给了 `notebook_id` 时有意义。界面默认打开它——用户点选父笔记本时
+///   期望看到它以及所有后代的笔记，否则每建一层子笔记本父级就变空了。
+/// - `include_deleted`：是否包含回收站（铁律 T7）
+/// - `limit`：`0` 表示用默认值 50（仓储层另有 500 的硬上限）
 #[must_use]
-pub fn notes_list(include_deleted: bool, limit: u32) -> NoteResult {
+pub fn notes_list(
+    notebook_id: Option<String>,
+    include_descendants: bool,
+    include_deleted: bool,
+    limit: u32,
+) -> NoteResult {
+    // 先解析 id：无效时明确报错，而不是静默退化成"全部笔记"
+    // （静默退化会让用户以为"这个笔记本里就是有这些笔记"，极具误导性）
+    let notebook = match notebook_id.as_deref().map(Id::parse) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => {
+            return NoteResult {
+                ok: false,
+                code: Some("INVALID_ID".to_owned()),
+                hint: Some("笔记本标识无效。".to_owned()),
+                debug_detail: None,
+                value: None,
+            };
+        }
+        None => None,
+    };
+
     let query = NoteQuery {
+        notebook_id: notebook.as_ref(),
+        include_descendants,
         include_deleted,
         limit,
         ..NoteQuery::default()
@@ -334,8 +394,25 @@ pub fn notes_list(include_deleted: bool, limit: u32) -> NoteResult {
 }
 
 /// 创建一篇空笔记。
+///
+/// `notebook_id` 给出时直接建在该笔记本下——这是"在某个笔记本里点新建"的
+/// 期望行为，否则新建的笔记会跑到"全部笔记"里，用户还得再手动移动一次。
 #[must_use]
-pub fn notes_create(title: &str, at_ms: i64) -> NoteResult {
+pub fn notes_create(notebook_id: Option<String>, title: &str, at_ms: i64) -> NoteResult {
+    let notebook = match notebook_id.as_deref().map(Id::parse) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => {
+            return NoteResult {
+                ok: false,
+                code: Some("INVALID_ID".to_owned()),
+                hint: Some("笔记本标识无效。".to_owned()),
+                debug_detail: None,
+                value: None,
+            };
+        }
+        None => None,
+    };
+
     // 设备标识与写入**必须在同一次加锁内**完成。
     // 反例（曾写成这样，会死锁）：先 with_core(device_id) 取设备标识，再 with_core(create)。
     // 两次调用都要读同一把 RwLock；同一线程嵌套获取读锁时，若有写者在排队，
@@ -343,7 +420,7 @@ pub fn notes_create(title: &str, at_ms: i64) -> NoteResult {
     // 因此 `with_core` 的闭包约定：**内部不得再调用 with_core**，要什么一次取完。
     match with_core(|core| {
         let device = core.device_id()?;
-        core.create_note_with_document(None, title, Document::empty(at_ms), &device, at_ms)
+        core.create_note_with_document(notebook, title, Document::empty(at_ms), &device, at_ms)
     }) {
         Ok(note) => NoteResult::ok(NotePayload {
             note: Some(summary_of(&note)),
@@ -368,7 +445,7 @@ pub fn notes_read(id: &str) -> NoteResult {
         Ok((note, document)) => NoteResult::ok(NotePayload {
             note: Some(summary_of(&note)),
             text: Some(document_to_text(&document)),
-            notes: Vec::new(),
+            ..NotePayload::default()
         }),
         Err(failure) => failure,
     }
@@ -440,6 +517,173 @@ pub fn notes_count() -> i64 {
     match with_core(|core| core.note_count()) {
         Ok(count) => count,
         Err(_) => -1,
+    }
+}
+
+// ============================================================ 笔记本（树形）
+
+/// 一个笔记本在界面上的表示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotebookNode {
+    /// 笔记本标识。
+    pub id: String,
+    /// 名称。
+    pub name: String,
+    /// 父笔记本标识（顶层为 `None`）。
+    pub parent_id: Option<String>,
+    /// 在树中的层级深度（顶层为 0）。
+    ///
+    /// 由 Rust 侧算好：让每个前端各写一遍"组装树 + 深度优先 + 处理孤儿节点"
+    /// 是典型的业务规则漏到 UI 层（铁律 A2）。
+    pub depth: u32,
+    /// 该笔记本**及其全部后代**中的笔记数量。
+    ///
+    /// 放在这里而不是让界面自己算：它需要递归统计，
+    /// 且"父级显示子孙总数"是产品语义而非展示细节。
+    pub note_count: i64,
+}
+
+/// 列出笔记本树（深度优先，含每个节点及其子树的笔记数）。
+///
+/// 返回值已按树形展开顺序排列，界面直接顺序渲染并按键值缩进即可。
+///
+/// ## 为什么返回 [`NoteResult`] 而不是裸 `Vec`
+///
+/// 第一版签名是 `-> Vec<NotebookNode>`，失败时返回空列表。
+/// 那是个错误设计：**"查询失败"与"确实没有笔记本"变成了同一个结果**，
+/// 界面显示"还没有笔记本"，而真实原因可能是数据库出错——
+/// 用户会以为数据丢了（本项目就因此白排查了一轮）。
+///
+/// 现在失败会带上错误码与提示，界面能如实告知"读取失败"而不是"没有数据"。
+#[must_use]
+pub fn notebooks_tree() -> NoteResult {
+    match with_core(|core| {
+        let tree = core.list_notebook_tree()?;
+        let mut nodes = Vec::with_capacity(tree.len());
+        for (notebook, depth) in tree {
+            // 统计"该笔记本及其全部后代"的笔记数
+            let mut total = 0_i64;
+            for notebook_id in core.notebook_subtree_ids(&notebook.id)? {
+                let query = NoteQuery {
+                    notebook_id: Some(&notebook_id),
+                    ..NoteQuery::default()
+                };
+                total += i64::try_from(core.list_notes(&query)?.len()).unwrap_or(0);
+            }
+            nodes.push(NotebookNode {
+                id: notebook.id.to_string(),
+                name: notebook.name,
+                parent_id: notebook.parent_id.map(|parent| parent.to_string()),
+                depth,
+                note_count: total,
+            });
+        }
+        Ok(nodes)
+    }) {
+        Ok(nodes) => NoteResult::ok(NotePayload {
+            notebooks: nodes,
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 创建笔记本。`parent_id` 为 `None` 时创建顶层笔记本。
+#[must_use]
+pub fn notebooks_create(name: &str, parent_id: Option<String>, at_ms: i64) -> NoteResult {
+    let parent = match parent_id.as_deref().map(Id::parse) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => {
+            return NoteResult {
+                ok: false,
+                code: Some("INVALID_ID".to_owned()),
+                hint: Some("父笔记本标识无效。".to_owned()),
+                debug_detail: None,
+                value: None,
+            };
+        }
+        None => None,
+    };
+
+    match with_core(|core| core.create_notebook(name, parent, at_ms)) {
+        Ok(notebook) => NoteResult::ok(NotePayload {
+            notebook: Some(NotebookNode {
+                id: notebook.id.to_string(),
+                name: notebook.name,
+                parent_id: notebook.parent_id.map(|id| id.to_string()),
+                // 真实深度由随后的 notebooks_tree() 给出；这里不重复计算
+                depth: 0,
+                note_count: 0,
+            }),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 把笔记本移入回收站（软删除，铁律 T7）。**不**级联删除其下笔记。
+#[must_use]
+pub fn notebooks_delete(id: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.delete_notebook(&parsed, at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// 从回收站恢复笔记本。
+#[must_use]
+pub fn notebooks_restore(id: &str, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.restore_notebook(&parsed, at_ms)) {
+        Ok(()) => NoteResult::ok(NotePayload::default()),
+        Err(failure) => failure,
+    }
+}
+
+/// 把一篇笔记移到另一个笔记本（`notebook_id` 为 `None` 时移出笔记本）。
+#[must_use]
+pub fn notes_move(id: &str, notebook_id: Option<String>, at_ms: i64) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    let target = match notebook_id.as_deref().map(Id::parse) {
+        Some(Ok(target)) => Some(target),
+        Some(Err(_)) => {
+            return NoteResult {
+                ok: false,
+                code: Some("INVALID_ID".to_owned()),
+                hint: Some("目标笔记本标识无效。".to_owned()),
+                debug_detail: None,
+                value: None,
+            };
+        }
+        None => None,
+    };
+    // 同 notes_create：设备标识与操作必须在同一次加锁内取得
+    let device = match with_core(|core| core.device_id()) {
+        Ok(device) => device,
+        Err(failure) => return failure,
+    };
+
+    match with_core(|core| {
+        let mut note = core.get_note(&parsed)?;
+        note.set_notebook(target)?;
+        let document = core.get_note_document(&parsed)?;
+        core.save_note(note, document, &device, at_ms)
+    }) {
+        Ok(note) => NoteResult::ok(NotePayload {
+            note: Some(summary_of(&note)),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
     }
 }
 
@@ -526,7 +770,7 @@ mod tests {
     fn note_lifecycle_round_trips_through_text() {
         let (_dir, _guard) = fresh_engine();
 
-        let created = notes_create("第一篇", NOW);
+        let created = notes_create(None, "第一篇", NOW);
         assert!(created.ok, "创建失败：{:?}", created.hint);
         let note = created.value.expect("payload").note.expect("note");
         assert_eq!(note.title, "第一篇");
@@ -567,11 +811,11 @@ mod tests {
     fn delete_moves_note_out_of_default_list_and_restore_brings_it_back() {
         let (_dir, _guard) = fresh_engine();
 
-        let created = notes_create("待删除", NOW);
+        let created = notes_create(None, "待删除", NOW);
         assert!(created.ok, "创建失败：{:?}", created.hint);
         let note = created.value.expect("payload").note.expect("note");
 
-        let listed = notes_list(false, 0);
+        let listed = notes_list(None, true, false, 0);
         let ids: Vec<String> = listed
             .value
             .expect("payload")
@@ -582,7 +826,7 @@ mod tests {
         assert!(ids.contains(&note.id), "新建笔记应出现在列表中");
 
         assert!(notes_delete(&note.id, NOW + 1).ok);
-        let after_delete = notes_list(false, 0);
+        let after_delete = notes_list(None, true, false, 0);
         let ids_after: Vec<String> = after_delete
             .value
             .expect("payload")
@@ -596,7 +840,7 @@ mod tests {
         );
 
         // 但带 include_deleted 时仍能看到（软删除，铁律 T7）
-        let with_deleted = notes_list(true, 0);
+        let with_deleted = notes_list(None, true, true, 0);
         let ids_all: Vec<String> = with_deleted
             .value
             .expect("payload")
@@ -614,7 +858,7 @@ mod tests {
     fn title_too_long_is_a_validation_error() {
         let (_dir, _guard) = fresh_engine();
         let long = "汉".repeat(nested_model::MAX_TITLE_CHARS + 1);
-        let failure = notes_create(&long, NOW);
+        let failure = notes_create(None, &long, NOW);
         assert!(!failure.ok);
         assert_eq!(failure.code.as_deref(), Some("VALIDATION_ERROR"));
     }
@@ -622,7 +866,7 @@ mod tests {
     #[test]
     fn empty_text_saves_as_empty_document() {
         let (_dir, _guard) = fresh_engine();
-        let created = notes_create("空内容", NOW);
+        let created = notes_create(None, "空内容", NOW);
         assert!(created.ok, "创建失败：{:?}", created.hint);
         let note = created.value.expect("payload").note.expect("note");
 
@@ -643,7 +887,7 @@ mod tests {
         let path = dir.path().to_string_lossy().to_string();
 
         assert!(engine_start(&path).ready);
-        let created = notes_create("持久化", NOW);
+        let created = notes_create(None, "持久化", NOW);
         let note = created.value.expect("payload").note.expect("note");
         assert!(notes_save(&note.id, "重启前的正文", NOW + 1).ok);
 

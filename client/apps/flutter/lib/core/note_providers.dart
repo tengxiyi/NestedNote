@@ -24,6 +24,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../src/rust/api/notes.dart' as rust;
 import 'engine_providers.dart';
+import 'notebook_providers.dart';
 
 /// 一篇笔记在界面上的表示。
 ///
@@ -96,7 +97,10 @@ class NoteFailure implements Exception {
 int _nowMs() => DateTime.now().millisecondsSinceEpoch;
 
 /// 把 Rust 的结构化结果转成"值或异常"。
-T _unwrap<T>(rust.NoteResult result, T Function(rust.NotePayload payload) read) {
+T _unwrap<T>(
+  rust.NoteResult result,
+  T Function(rust.NotePayload payload) read,
+) {
   if (!result.ok) {
     throw NoteFailure(
       code: result.code ?? 'UNKNOWN',
@@ -111,32 +115,82 @@ T _unwrap<T>(rust.NoteResult result, T Function(rust.NotePayload payload) read) 
   return read(payload);
 }
 
-/// 笔记列表（未删除，按最近修改倒序）。
+/// 笔记列表的查询参数。
 ///
-/// `includeDeleted = true` 时包含回收站内容（铁律 T7：软删除的笔记仍可查询）。
+/// 用不可变值对象而不是多个 `family` 参数：Riverpod 的 family 参数需要
+/// 可比较的相等性，值对象能自然支持 `==` / `hashCode`；
+/// 且以后加过滤条件（标签、时间范围）时不必改所有调用点。
+class NoteListQuery {
+  /// 构造。
+  const NoteListQuery({
+    this.notebookId,
+    this.includeDescendants = true,
+    this.includeDeleted = false,
+  });
+
+  /// 限定笔记本；`null` 表示不限（"全部笔记"）。
+  final String? notebookId;
+
+  /// 是否包含子笔记本里的笔记。
+  ///
+  /// 默认为 `true`：用户点选一个父笔记本时，期望看到**它以及所有后代**的笔记，
+  /// 否则每建一层子笔记本，父级看上去就变空了。
+  final bool includeDescendants;
+
+  /// 是否包含回收站里的笔记。
+  final bool includeDeleted;
+
+  @override
+  bool operator ==(Object other) {
+    return other is NoteListQuery &&
+        other.notebookId == notebookId &&
+        other.includeDescendants == includeDescendants &&
+        other.includeDeleted == includeDeleted;
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(notebookId, includeDescendants, includeDeleted);
+
+  @override
+  String toString() =>
+      'NoteListQuery(notebook: $notebookId, '
+      'descendants: $includeDescendants, deleted: $includeDeleted)';
+}
+
+/// 笔记列表（按最近修改倒序）。
+///
+/// 过滤条件由 [NoteListQuery] 描述。
 ///
 /// ## 为什么用 `final` 而不写显式类型
 ///
 /// Riverpod 3 把 `FutureProviderFamily` 收窄为包内实现细节（未从 `riverpod`
 /// 或 `flutter_riverpod` 导出），因此写不出这个类型名。用类型推断即可——
-/// 调用侧 `ref.watch(noteListProvider(true))` 仍然是强类型的。
-final noteListProvider =
-    FutureProvider.family<List<NoteItem>, bool>((
-      Ref ref,
-      bool includeDeleted,
-    ) async {
-      // 确保内核已经启动（首次进入时 engineProvider 会完成启动并在 FFI 侧
-      // 把内核装进进程级单例，笔记操作依赖它）。
-      await ref.watch(engineProvider.future);
+/// 调用侧 `ref.watch(noteListProvider(query))` 仍然是强类型的。
+final noteListProvider = FutureProvider.family<List<NoteItem>, NoteListQuery>((
+  Ref ref,
+  NoteListQuery query,
+) async {
+  // 确保内核已经启动（首次进入时 engineProvider 会完成启动并在 FFI 侧
+  // 把内核装进进程级单例，笔记操作依赖它）。
+  await ref.watch(engineProvider.future);
 
-      final result = await rust.notesList(
-        includeDeleted: includeDeleted,
-        limit: 0,
-      );
-      return _unwrap(result, (rust.NotePayload payload) {
-        return payload.notes.map(NoteItem.fromRust).toList(growable: false);
-      });
-    });
+  final result = await rust.notesList(
+    notebookId: query.notebookId,
+    includeDescendants: query.includeDescendants,
+    includeDeleted: query.includeDeleted,
+    limit: 0,
+  );
+  return _unwrap(result, (rust.NotePayload payload) {
+    return payload.notes.map(NoteItem.fromRust).toList(growable: false);
+  });
+});
+
+/// "全部笔记"的查询（不按笔记本过滤，不含回收站）。
+const NoteListQuery kAllNotes = NoteListQuery();
+
+/// 回收站查询（不限笔记本，含已删除）。
+const NoteListQuery kDeletedNotes = NoteListQuery(includeDeleted: true);
 
 /// 单篇笔记的正文（纯文本，块已展平）。
 final noteTextProvider = FutureProvider.family<String, String>((
@@ -166,21 +220,24 @@ class NoteActions {
   final Ref _ref;
 
   /// 创建空笔记，返回其标识。
-  Future<String> create({String title = '无标题笔记'}) async {
-    final result = await rust.notesCreate(title: title, atMs: _nowMs());
+  ///
+  /// `notebookId` 给出时，笔记直接建在该笔记本下——这是"在某个笔记本里点新建"
+  /// 的期望行为（否则新建的笔记会跑到"全部笔记"里，用户还得再手动移动一次）。
+  Future<String> create({String title = '无标题笔记', String? notebookId}) async {
+    final result = await rust.notesCreate(
+      notebookId: notebookId,
+      title: title,
+      atMs: _nowMs(),
+    );
     final NoteItem? item = _unwrap(
       result,
-      (rust.NotePayload payload) => payload.note == null
-          ? null
-          : NoteItem.fromRust(payload.note!),
+      (rust.NotePayload payload) =>
+          payload.note == null ? null : NoteItem.fromRust(payload.note!),
     );
     if (item == null) {
       // Rust 侧契约要求创建成功必须返回笔记；缺失说明契约被破坏，
       // 此时报错比返回空 id 更容易定位。
-      throw const NoteFailure(
-        code: 'EMPTY_PAYLOAD',
-        hint: '内核未返回新建的笔记。',
-      );
+      throw const NoteFailure(code: 'EMPTY_PAYLOAD', hint: '内核未返回新建的笔记。');
     }
     _invalidateLists();
     return item.id;
@@ -208,9 +265,11 @@ class NoteActions {
   }
 
   void _invalidateLists() {
-    _ref.invalidate(noteListProvider(false));
-    _ref.invalidate(noteListProvider(true));
+    // 按**值**失效：传一个新的等值对象即可命中同一个 provider
+    // （NoteListQuery 实现了 == / hashCode，因此 new 一个也能匹配）。
+    _ref.invalidate(noteListProvider);
     _ref.invalidate(noteCountProvider);
+    _ref.invalidate(notebooksTreeProvider);
   }
 }
 

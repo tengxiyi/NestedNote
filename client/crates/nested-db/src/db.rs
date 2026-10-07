@@ -40,6 +40,15 @@ pub const MAX_PAGE_SIZE: u32 = 500;
 pub struct NoteQuery<'a> {
     /// 限定笔记本。
     pub notebook_id: Option<&'a nested_model::Id>,
+    /// 是否把**子笔记本**里的笔记也算进来（默认否）。
+    ///
+    /// 笔记本是一棵树。用户在树里点选一个父笔记本时，期望看到它**以及所有后代**
+    /// 的笔记——否则每建一层子笔记本，父级看上去就变空了。
+    /// 默认关闭是为了保持"按笔记本过滤"的朴素语义，需要树形聚合时由调用方显式打开。
+    ///
+    /// 仅在 [`NoteQuery::notebook_id`] 为 `Some` 时有意义；
+    /// 实现见 `repositories::notes::list_sql`（用递归 CTE 一次查完）。
+    pub include_descendants: bool,
     /// 是否包含回收站中的笔记（默认不包含）。
     pub include_deleted: bool,
     /// 仅返回已归档（`Some(true)`）或未归档（`Some(false)`）；`None` 表示不限。

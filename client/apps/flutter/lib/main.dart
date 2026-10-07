@@ -21,7 +21,30 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app/app.dart';
+import 'core/ui_diagnostics.dart';
 
 void main() {
-  runApp(const ProviderScope(child: NestedNoteApp()));
+  runApp(const ProviderScope(child: _Bootstrap(child: NestedNoteApp())));
+}
+
+/// 应用启动引导：在渲染界面之前装好横切关注点。
+///
+/// 目前只有一项：**界面状态诊断**（见 `core/ui_diagnostics.dart`）。
+/// 放在这里而不是放进某个页面，是因为诊断应当覆盖所有页面，
+/// 且它属于数据层而非展示层的职责。
+///
+/// 为什么不直接在 `main()` 里做：诊断需要 Riverpod 容器，
+/// 而容器由 `ProviderScope` 提供——因此必须有一个 `ConsumerWidget`
+/// 位于 `ProviderScope` 之内才能拿到 `ref`。
+class _Bootstrap extends ConsumerWidget {
+  const _Bootstrap({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // watch 一次即可：Provider 只创建一次实例，其内部订阅随之只装一次
+    ref.watch(uiDiagnosticsProvider);
+    return child;
+  }
 }

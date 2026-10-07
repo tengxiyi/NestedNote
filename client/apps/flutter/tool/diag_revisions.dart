@@ -8,9 +8,11 @@ import 'package:nested/src/rust/frb_generated.dart';
 void dump(String label, List<RevisionEntry> list) {
   stdout.writeln('--- $label: ${list.length} 条 ---');
   for (final r in list) {
-    stdout.writeln('   v${r.version} op=${r.operation} '
-        'parent=${r.parentId?.substring(0, 8) ?? "(null)"} '
-        'id=${r.id.substring(0, 8)} device=${r.deviceId}');
+    stdout.writeln(
+      '   v${r.version} op=${r.operation} '
+      'parent=${r.parentId?.substring(0, 8) ?? "(null)"} '
+      'id=${r.id.substring(0, 8)} device=${r.deviceId}',
+    );
   }
 }
 

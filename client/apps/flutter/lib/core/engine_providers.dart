@@ -15,14 +15,13 @@
 //!         → nested-core → nested-db → SQLite
 //! ```
 
-import 'dart:io';
-
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../src/rust/api/branding.dart' as rust;
 import '../src/rust/frb_generated.dart';
 import 'engine.dart';
+import 'ui_diagnostics.dart';
 
 /// 引擎状态提供者。
 final FutureProvider<EngineStatus> engineProvider =
@@ -113,30 +112,9 @@ Future<EngineStatus> startEngineInDirectory(String dataDir) async {
   return status;
 }
 
-/// 把 UI 侧的诊断信息追加写入临时目录。
-///
-/// ## 为什么需要这个
-///
-/// "应用到底看到了什么"必须能被外部核实。界面观察依赖人眼、自动化截屏又可能
-/// 受远程桌面/虚拟化环境限制（本项目实测过：截屏返回的画面始终是同一帧，
-/// 无法用来判断界面渲染结果）。因此把关键状态落到一个文件里，
-/// 让验证脚本可以断言——这比"截图看起来对"可靠得多。
-///
-/// P1 引入结构化日志（铁律 E5）后，这段应替换为正式的日志通道。
-Future<void> writeUiDiagnostics(List<String> lines) async {
-  try {
-    final stamp = DateTime.now().toIso8601String();
-    final file = File('${Directory.systemTemp.path}/nested-ui-diagnostics.txt');
-    await file.writeAsString(
-      '[$stamp]\n${lines.join('\n')}\n\n',
-      mode: FileMode.append,
-    );
-  } catch (_) {
-    // 诊断写入失败绝不能影响正常流程
-  }
-}
-
 /// 把一次自检的结果写入临时目录，便于排查"界面只显示一句提示"的现场问题。
+///
+/// 文件名与格式由 `ui_diagnostics.dart` 统一管理（那里也负责界面快照）。
 Future<void> _writeDiagnostics(String dataDir, EngineStatus status) async {
   await writeUiDiagnostics(<String>[
     'kind=engine-status',

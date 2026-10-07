@@ -123,7 +123,11 @@ void main() {
     final now = DateTime.now().millisecondsSinceEpoch;
 
     // 创建
-    final created = await notesCreate(title: '集成测试笔记', atMs: now);
+    final created = await notesCreate(
+      notebookId: null,
+      title: '集成测试笔记',
+      atMs: now,
+    );
     expect(created.ok, isTrue, reason: '创建失败：${created.hint}');
     final note = created.value!.note!;
     expect(note.title, '集成测试笔记');
@@ -144,7 +148,12 @@ void main() {
     expect(read.value!.text, '第一段\n第二段');
 
     // 出现在列表里
-    final listed = await notesList(includeDeleted: false, limit: 0);
+    final listed = await notesList(
+      notebookId: null,
+      includeDescendants: true,
+      includeDeleted: false,
+      limit: 0,
+    );
     expect(listed.ok, isTrue);
     expect(
       listed.value!.notes.map((n) => n.id),
@@ -156,10 +165,20 @@ void main() {
     final deleted = await notesDelete(id: note.id, atMs: now + 2000);
     expect(deleted.ok, isTrue);
 
-    final afterDelete = await notesList(includeDeleted: false, limit: 0);
+    final afterDelete = await notesList(
+      notebookId: null,
+      includeDescendants: true,
+      includeDeleted: false,
+      limit: 0,
+    );
     expect(afterDelete.value!.notes.map((n) => n.id), isNot(contains(note.id)));
 
-    final withDeleted = await notesList(includeDeleted: true, limit: 0);
+    final withDeleted = await notesList(
+      notebookId: null,
+      includeDescendants: true,
+      includeDeleted: true,
+      limit: 0,
+    );
     expect(
       withDeleted.value!.notes.map((n) => n.id),
       contains(note.id),
@@ -182,7 +201,11 @@ void main() {
     expect((await engineStart(dataDir: tempDir.path)).ready, isTrue);
 
     final now = DateTime.now().millisecondsSinceEpoch;
-    final created = await notesCreate(title: '保存语义', atMs: now);
+    final created = await notesCreate(
+      notebookId: null,
+      title: '保存语义',
+      atMs: now,
+    );
     final id = created.value!.note!.id;
 
     // 第一次保存：内容真的变了
@@ -196,18 +219,10 @@ void main() {
     // 第二次保存：内容**完全相同**
     final second = await notesSave(id: id, text: '内容 A', atMs: now + 2000);
     expect(second.ok, isTrue);
-    expect(
-      second.value!.note!.version.toInt(),
-      2,
-      reason: '内容未变时版本不得前进',
-    );
+    expect(second.value!.note!.version.toInt(), 2, reason: '内容未变时版本不得前进');
 
     final afterSecond = await notesRevisionHistory(id: id, limit: 0);
-    expect(
-      afterSecond.length,
-      2,
-      reason: '内容未变时不得追加修订记录',
-    );
+    expect(afterSecond.length, 2, reason: '内容未变时不得追加修订记录');
 
     // 第三次保存：内容又变了
     final third = await notesSave(id: id, text: '内容 B', atMs: now + 3000);

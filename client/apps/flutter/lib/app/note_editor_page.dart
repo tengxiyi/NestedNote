@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! 笔记编辑页。
+//! 笔记编辑面板 —— 三栏布局的**右栏**。
+//!
+//! ## 两种形态
+//!
+//! | 组件 | 形态 | 用途 |
+//! |---|---|---|
+//! | [`NoteEditorPane`] | 栏内面板（无 Scaffold / AppBar） | 主界面的右栏 |
+//! | [`NoteEditorPage`] | 整页（带 AppBar 与返回） | 需要独立路由时（例如从搜索结果直接打开） |
+//!
+//! 两者共用同一套编辑状态机（[NoteEditorPane]），页面形态只是给它套了个壳。
+//! 这样"自动保存""未保存提示"这些行为不会出现两份实现。
 //!
 //! ## 为什么是"纯文本 + 块模型"两段式
 //!
@@ -18,8 +28,8 @@
 //!
 //! 1. **无变更保存不产生修订**（技术债 #11 已修）——否则每次自动保存都会
 //!    写一条修订记录并入队一条同步操作，等于把历史记录变成噪声；
-//! 2. **序列化写入必须在写入前完成**——自动保存是"最后一次输入为准"，
-//!    不能并发发出多个保存请求，因此用 [kAutoSaveDelay] 去抖 + 单飞标志。
+//! 2. **同一时刻只有一个保存请求在飞**（`_saving` 标志）——
+//!    自动保存是"最后一次输入为准"，不能并发发出多个请求。
 //!
 //! 手动保存按钮仍在：它给用户一个明确的"现在立刻存"的出口。
 
@@ -33,22 +43,22 @@ import '../core/note_providers.dart';
 /// 停止输入多久之后自动保存。
 ///
 /// 1.2 秒是取舍：太短会在连续输入时频繁触发（虽然内容未变时会跳过，
-/// 但每次仍要走一次 FFI），太长则用户关掉窗口时更容易丢失内容。
+/// 但每次仍要走一次 FFI），太长则用户切走时更容易丢失内容。
 const Duration kAutoSaveDelay = Duration(milliseconds: 1200);
 
-/// 笔记编辑页。
-class NoteEditorPage extends ConsumerStatefulWidget {
+/// 笔记编辑面板（三栏布局的右栏）。
+class NoteEditorPane extends ConsumerStatefulWidget {
   /// 构造。
-  const NoteEditorPage({required this.noteId, super.key});
+  const NoteEditorPane({required this.noteId, super.key});
 
   /// 要编辑的笔记标识。
   final String noteId;
 
   @override
-  ConsumerState<NoteEditorPage> createState() => _NoteEditorPageState();
+  ConsumerState<NoteEditorPane> createState() => _NoteEditorPaneState();
 }
 
-class _NoteEditorPageState extends ConsumerState<NoteEditorPage> {
+class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   final TextEditingController _controller = TextEditingController();
 
   /// 已落盘的内容，用于判断"是否有未保存改动"。
@@ -77,8 +87,8 @@ class _NoteEditorPageState extends ConsumerState<NoteEditorPage> {
 
   @override
   void dispose() {
-    // 离开前尽力保存一次（不等结果：dispose 不能异步）。
-    // 真正的保障是 PopScope 里的离开确认，这里只是兜底。
+    // 离开前取消计时器（不等保存结果：dispose 不能异步）。
+    // 真正的保障是离开前的确认流程，这里只是兜底。
     _autoSaveTimer?.cancel();
     _controller.dispose();
     super.dispose();
@@ -86,7 +96,9 @@ class _NoteEditorPageState extends ConsumerState<NoteEditorPage> {
 
   Future<void> _load() async {
     try {
-      final String text = await ref.read(noteTextProvider(widget.noteId).future);
+      final String text = await ref.read(
+        noteTextProvider(widget.noteId).future,
+      );
       if (!mounted) {
         return;
       }
@@ -116,7 +128,10 @@ class _NoteEditorPageState extends ConsumerState<NoteEditorPage> {
       // 内容改回原样（例如全部删掉又重新输入相同文字）：不需要保存
       return;
     }
-    _autoSaveTimer = Timer(kAutoSaveDelay, () => unawaited(_save(automatic: true)));
+    _autoSaveTimer = Timer(
+      kAutoSaveDelay,
+      () => unawaited(_save(automatic: true)),
+    );
   }
 
   /// 保存。
@@ -164,180 +179,108 @@ class _NoteEditorPageState extends ConsumerState<NoteEditorPage> {
     }
   }
 
-  /// 离开前确认未保存的改动。
-  Future<bool> _confirmLeave() async {
-    if (!_dirty) {
-      return true;
-    }
-    // 先尝试自动保存一次：多数情况下"未保存"只是去抖窗口还没到
-    final bool saved = await _save(automatic: true);
-    if (saved) {
-      return true;
-    }
-    if (!mounted) {
-      return false;
-    }
-
-    final NavigatorState navigator = Navigator.of(context);
-    final bool? leave = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext dialogContext) => AlertDialog(
-        title: const Text('还有未保存的改动'),
-        content: const Text('自动保存未能成功。离开将丢失这些改动。'),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('继续编辑'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('放弃改动'),
-          ),
-          FilledButton(
-            onPressed: () async {
-              final NavigatorState dialogNavigator = Navigator.of(dialogContext);
-              final bool ok = await _save();
-              dialogNavigator.pop(ok);
-            },
-            child: const Text('重试保存'),
-          ),
-        ],
-      ),
-    );
-    if (leave == true) {
-      navigator.pop();
-    }
-    return leave ?? false;
-  }
-
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
 
-    return PopScope(
-      canPop: !_dirty,
-      onPopInvokedWithResult: (bool didPop, Object? result) async {
-        if (didPop) {
-          return;
-        }
-        await _confirmLeave();
-      },
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('编辑笔记'),
-          actions: <Widget>[
-            if (_saving)
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 16),
-                child: Center(
-                  child: SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ),
-              )
-            else
-              IconButton(
-                tooltip: '保存',
-                onPressed: _dirty ? _save : null,
-                icon: const Icon(Icons.save_outlined),
-              ),
-          ],
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_loadError != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(_loadError!, textAlign: TextAlign.center),
         ),
-        body: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _loadError != null
-            ? Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Text(_loadError!, textAlign: TextAlign.center),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        // 面板内的工具条：保存按钮 + 保存状态。
+        // 三栏布局下没有整页 AppBar，因此这些控件必须有自己的位置。
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
+          child: Row(
+            children: <Widget>[
+              if (_saving)
+                const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                Icon(
+                  Icons.cloud_done_outlined,
+                  size: 16,
+                  color: theme.colorScheme.outline,
                 ),
-              )
-            : Column(
-                children: <Widget>[
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: TextField(
-                        controller: _controller,
-                        autofocus: true,
-                        maxLines: null,
-                        expands: true,
-                        textAlignVertical: TextAlignVertical.top,
-                        keyboardType: TextInputType.multiline,
-                        style: theme.textTheme.bodyLarge,
-                        decoration: const InputDecoration(
-                          border: InputBorder.none,
-                          hintText: '开始写点什么…\n\n（P1 编辑器为纯文本：每行会保存为一个段落块。'
-                              '停止输入后会自动保存。）',
-                        ),
-                        onChanged: _onChanged,
-                      ),
-                    ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  _saving
+                      ? '正在保存…'
+                      : (_autoSaveFailed
+                            ? '自动保存失败'
+                            : (_dirty ? '有未保存的改动' : '已保存')),
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: _autoSaveFailed ? theme.colorScheme.error : null,
                   ),
-                  _StatusBar(
-                    dirty: _dirty,
-                    autoSaveFailed: _autoSaveFailed,
-                    theme: theme,
-                  ),
-                ],
+                ),
               ),
-      ),
+              IconButton(
+                tooltip: '立即保存',
+                visualDensity: VisualDensity.compact,
+                onPressed: _dirty ? _save : null,
+                icon: const Icon(Icons.save_outlined, size: 20),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+            child: TextField(
+              controller: _controller,
+              autofocus: true,
+              maxLines: null,
+              expands: true,
+              textAlignVertical: TextAlignVertical.top,
+              keyboardType: TextInputType.multiline,
+              style: theme.textTheme.bodyLarge,
+              decoration: const InputDecoration(
+                border: InputBorder.none,
+                hintText:
+                    '开始写点什么…\n\n'
+                    '（P1 编辑器为纯文本：每行会保存为一个段落块。停止输入后会自动保存。）',
+              ),
+              onChanged: _onChanged,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
 
-/// 底部状态条：显示保存状态。
+/// 笔记编辑页（整页形态）。
 ///
-/// 比"有没有改动"更有用的是**"改动有没有落盘"**，因此这里区分三种状态：
-/// 已保存 / 待自动保存 / 自动保存失败。
-class _StatusBar extends StatelessWidget {
-  const _StatusBar({
-    required this.dirty,
-    required this.autoSaveFailed,
-    required this.theme,
-  });
+/// 用于需要独立路由的场景（例如将来从搜索结果直接打开一篇笔记）。
+/// 主界面的右栏请用 [NoteEditorPane]。
+class NoteEditorPage extends StatelessWidget {
+  /// 构造。
+  const NoteEditorPage({required this.noteId, super.key});
 
-  final bool dirty;
-  final bool autoSaveFailed;
-  final ThemeData theme;
+  /// 要编辑的笔记标识。
+  final String noteId;
 
   @override
   Widget build(BuildContext context) {
-    final (Color background, IconData icon, String label) = switch ((
-      dirty,
-      autoSaveFailed,
-    )) {
-      (false, _) => (
-        theme.colorScheme.surfaceContainerHighest,
-        Icons.cloud_done_outlined,
-        '已保存',
-      ),
-      (true, true) => (
-        theme.colorScheme.errorContainer,
-        Icons.cloud_off_outlined,
-        '自动保存失败，请点右上角手动保存',
-      ),
-      (true, false) => (
-        theme.colorScheme.secondaryContainer,
-        Icons.cloud_upload_outlined,
-        '正在自动保存…',
-      ),
-    };
-
-    return Container(
-      width: double.infinity,
-      color: background,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: Row(
-        children: <Widget>[
-          Icon(icon, size: 16),
-          const SizedBox(width: 8),
-          Text(label, style: theme.textTheme.bodySmall),
-        ],
-      ),
+    return Scaffold(
+      appBar: AppBar(title: const Text('编辑笔记')),
+      body: NoteEditorPane(noteId: noteId),
     );
   }
 }
-

@@ -131,15 +131,7 @@ pub fn get(connection: &Connection, id: &Id) -> Result<Option<Note>, DbError> {
 /// 查询失败时返回 [`DbError::Sqlite`]。
 pub fn list(connection: &Connection, query: &NoteQuery<'_>) -> Result<Vec<Note>, DbError> {
     // 排序键与过滤字段都是白名单枚举展开，不含用户输入拼接（铁律 Q4）
-    let sql = format!(
-        "SELECT {COLUMNS} FROM notes
-         WHERE (?1 IS NULL OR notebook_id = ?1)
-           AND (?2 = 1 OR deleted_at_ms IS NULL)
-           AND (?3 IS NULL OR is_archived = ?3)
-         ORDER BY is_pinned DESC, updated_at_ms DESC
-         LIMIT ?4 OFFSET ?5"
-    );
-    let mut statement = connection.prepare(&sql)?;
+    let mut statement = connection.prepare(&list_sql(query))?;
     let rows = statement.query_map(
         params![
             query.notebook_id.map(|id| id.as_bytes().to_vec()),
@@ -151,6 +143,47 @@ pub fn list(connection: &Connection, query: &NoteQuery<'_>) -> Result<Vec<Note>,
         map_row,
     )?;
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+}
+
+/// 构造笔记列表的 SQL。
+///
+/// ## 为什么"包含子笔记本"需要递归 CTE
+///
+/// 笔记本是一棵树（`notebooks.parent_id` 自引用）。用户点选父笔记本时，
+/// 期望看到**它以及所有后代**里的笔记——否则每建一层子笔记本，父级就变空了。
+///
+/// SQLite 支持 `WITH RECURSIVE`，因此这里用一条查询解决问题，
+/// 而不是在 Rust 侧先取子树再拼 `IN (...)`：
+///
+/// - **不必把 id 列表拼进 SQL**：拼接大量 id 既慢又容易踩注入（铁律 Q4）；
+/// - **一次查询**：避免"取子树 + 查笔记"两次往返带来的不一致窗口。
+///
+/// 两种形态都是编译期常量 SQL，只有是否递归这一处差异。
+fn list_sql(query: &NoteQuery<'_>) -> String {
+    if query.include_descendants && query.notebook_id.is_some() {
+        format!(
+            "WITH RECURSIVE subtree(id) AS (
+                 SELECT id FROM notebooks WHERE id = ?1
+                 UNION
+                 SELECT n.id FROM notebooks n JOIN subtree s ON n.parent_id = s.id
+             )
+             SELECT {COLUMNS} FROM notes
+              WHERE notebook_id IN (SELECT id FROM subtree)
+                AND (?2 = 1 OR deleted_at_ms IS NULL)
+                AND (?3 IS NULL OR is_archived = ?3)
+              ORDER BY is_pinned DESC, updated_at_ms DESC
+              LIMIT ?4 OFFSET ?5"
+        )
+    } else {
+        format!(
+            "SELECT {COLUMNS} FROM notes
+              WHERE (?1 IS NULL OR notebook_id = ?1)
+                AND (?2 = 1 OR deleted_at_ms IS NULL)
+                AND (?3 IS NULL OR is_archived = ?3)
+              ORDER BY is_pinned DESC, updated_at_ms DESC
+              LIMIT ?4 OFFSET ?5"
+        )
+    }
 }
 
 /// 统计符合条件的笔记数量。
@@ -643,6 +676,120 @@ mod tests {
         let guard = db.connection().expect("conn");
         let document = get_document(&guard, &Id::new()).expect("no error");
         assert!(document.blocks.is_empty());
+    }
+
+    // ---------------------------------------------------------------- 笔记本树过滤
+
+    /// 建一棵三层笔记本树：root → mid → leaf，并各放一篇笔记。
+    fn tree_fixture() -> (Database, Id, Id, Id) {
+        let db = Database::open_in_memory().expect("open");
+        let root = Notebook::new("根", None, NOW).expect("valid");
+        let mid = Notebook::new("中", Some(root.id), NOW).expect("valid");
+        let leaf = Notebook::new("叶", Some(mid.id), NOW).expect("valid");
+        {
+            let mut guard = db.connection().expect("conn");
+            crate::repositories::notebooks::insert(&mut guard, &root, DEVICE).expect("root");
+            crate::repositories::notebooks::insert(&mut guard, &mid, DEVICE).expect("mid");
+            crate::repositories::notebooks::insert(&mut guard, &leaf, DEVICE).expect("leaf");
+            for (notebook, title) in [(&root, "根笔记"), (&mid, "中笔记"), (&leaf, "叶笔记")]
+            {
+                let note = sample_note(Some(notebook.id), title);
+                create_with_document(&mut guard, &note, &Document::empty(NOW), DEVICE)
+                    .expect("note");
+            }
+        }
+        (db, root.id, mid.id, leaf.id)
+    }
+
+    #[test]
+    fn selecting_a_parent_notebook_includes_descendants() {
+        // 这是"笔记本是树"的核心语义：点父级要看得到子孙的笔记。
+        // 若不做递归，每建一层子笔记本父级就会显得是空的。
+        let (db, root, _mid, _leaf) = tree_fixture();
+        let guard = db.connection().expect("conn");
+
+        let query = NoteQuery {
+            notebook_id: Some(&root),
+            include_descendants: true,
+            ..NoteQuery::default()
+        };
+        let notes = list(&guard, &query).expect("list");
+        assert_eq!(notes.len(), 3, "应包含根、中、叶三层的笔记");
+
+        let titles: Vec<&str> = notes.iter().map(|note| note.title.as_str()).collect();
+        assert!(titles.contains(&"根笔记"));
+        assert!(titles.contains(&"中笔记"));
+        assert!(titles.contains(&"叶笔记"));
+    }
+
+    #[test]
+    fn without_descendants_only_direct_notes_are_returned() {
+        // 默认（include_descendants = false）保持朴素语义：只看本层
+        let (db, root, _mid, _leaf) = tree_fixture();
+        let guard = db.connection().expect("conn");
+
+        let query = NoteQuery {
+            notebook_id: Some(&root),
+            ..NoteQuery::default()
+        };
+        let notes = list(&guard, &query).expect("list");
+        assert_eq!(notes.len(), 1, "默认只返回本层笔记");
+        assert_eq!(notes[0].title, "根笔记");
+    }
+
+    #[test]
+    fn descendants_filter_from_a_middle_node_skips_the_parent() {
+        // 从中层往下看，不应包含父层的笔记
+        let (db, _root, mid, _leaf) = tree_fixture();
+        let guard = db.connection().expect("conn");
+
+        let query = NoteQuery {
+            notebook_id: Some(&mid),
+            include_descendants: true,
+            ..NoteQuery::default()
+        };
+        let notes = list(&guard, &query).expect("list");
+        assert_eq!(notes.len(), 2, "中 + 叶两层");
+        let titles: Vec<&str> = notes.iter().map(|note| note.title.as_str()).collect();
+        assert!(!titles.contains(&"根笔记"), "不应包含父层笔记");
+    }
+
+    #[test]
+    fn descendants_filter_on_a_leaf_returns_only_itself() {
+        let (db, _root, _mid, leaf) = tree_fixture();
+        let guard = db.connection().expect("conn");
+
+        let query = NoteQuery {
+            notebook_id: Some(&leaf),
+            include_descendants: true,
+            ..NoteQuery::default()
+        };
+        assert_eq!(list(&guard, &query).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn descendants_filter_ignores_soft_deleted_child_notebooks_notes() {
+        // 软删的子笔记本不应把它的笔记带进父级列表
+        let (db, root, mid, _leaf) = tree_fixture();
+        let mut guard = db.connection().expect("conn");
+        // 先删掉中层子笔记本里的笔记（软删），再验证父级列表
+        let mid_notes = {
+            let query = NoteQuery {
+                notebook_id: Some(&mid),
+                ..NoteQuery::default()
+            };
+            list(&guard, &query).expect("list")
+        };
+        assert_eq!(mid_notes.len(), 1);
+        soft_delete(&mut guard, &mid_notes[0].id, DEVICE, NOW + 100).expect("delete");
+
+        let query = NoteQuery {
+            notebook_id: Some(&root),
+            include_descendants: true,
+            ..NoteQuery::default()
+        };
+        let notes = list(&guard, &query).expect("list");
+        assert_eq!(notes.len(), 2, "被软删的笔记不应出现（根 + 叶）");
     }
 
     #[test]

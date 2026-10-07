@@ -151,6 +151,21 @@ impl Note {
         Ok(())
     }
 
+    /// 把笔记移到另一个笔记本（`None` 表示移出笔记本，成为"未分类"）。
+    ///
+    /// ## 为什么不做"目标笔记本必须存在"的校验
+    ///
+    /// 领域模型是**纯数据**，不持有数据库句柄，因此无法验证目标是否存在。
+    /// 这项校验由数据库的外键（`notes.notebook_id REFERENCES notebooks (id)`）
+    /// 与仓储层共同保证——写不进去就会报错，不会产生悬空引用。
+    ///
+    /// 把它放在模型里而不是直接改公开字段，是为了让"移动笔记本"这件事
+    /// 有唯一入口（铁律 T4：业务规则收敛在一处）。
+    pub fn set_notebook(&mut self, notebook_id: Option<Id>) -> Result<()> {
+        self.notebook_id = notebook_id;
+        Ok(())
+    }
+
     /// 标记为已修改：刷新时间并递增修订号。
     pub fn touch(&mut self, at_ms: i64) {
         self.updated_at_ms = at_ms;

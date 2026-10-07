@@ -7,6 +7,81 @@
 
 ## [Unreleased]
 
+### 新增（三栏主界面 + 多层级笔记本）
+
+**三栏布局（`lib/app/notes_page.dart` 重写）**
+
+```text
+┌────────────┬──────────────────┬──────────────────────────┐
+│ 左栏        │ 中栏              │ 右栏                      │
+│ 笔记本树     │ 笔记列表           │ 阅读 / 编辑区              │
+└────────────┴──────────────────┴──────────────────────────┘
+```
+
+- **左栏**：多层级笔记本树（按深度缩进）、每个节点显示**子树笔记总数**、
+  长按可新建子笔记本 / 移入回收站、可折叠给内容让位
+- **中栏**：当前笔记本的笔记列表（标题 / 摘要 / 时间 / 修订号），
+  在此新建笔记（直接建在当前笔记本下）、长按可移动或删除
+- **右栏**：占位提示或编辑区（复用 `NoteEditorPane`）
+
+**笔记本层级：数据层早就支持，这次补上三处缺口**
+
+| 已有（P0） | 本次补齐 |
+|---|---|
+| `parent_id` 自引用外键 + `idx_notebooks_parent` | — |
+| `list_children(parent_id)` | `list_notebook_tree()`（深度优先 + 深度 + 孤儿兜底） |
+| `NoteQuery.notebook_id` | `NoteQuery.include_descendants`（递归 CTE 一次查完） |
+| — | `rename_notebook` / `delete_notebook` / `restore_notebook` |
+| — | FFI：`notebooks_tree` / `notebooks_create` / `notebooks_delete` / `notebooks_restore` / `notes_move` |
+
+**"父级包含子孙笔记"的实现取舍**
+
+用 `WITH RECURSIVE` 一条查询解决，而不是"先取子树再拼 `IN (...)`"：
+拼接大量 id 既慢又容易踩注入（铁律 Q4），且两次往返会带来不一致窗口。
+附 5 个测试覆盖：多层级、中间层、叶子层、软删子笔记、孤儿节点。
+
+**孤儿节点不丢**
+
+若某笔记本的 `parent_id` 指向不存在的节点（同步场景下对端可能先发子节点），
+它在树里被当作**顶层**处理而不是消失。测试通过绕过外键注入坏数据来验证
+——注意正常写入路径造不出这种数据（外键会直接拦下，这本身也值得记一笔）。
+
+### 修复（本轮踩到并修掉的三个问题）
+
+**1. `notebooks_tree` 把失败静默转成空列表 —— 我自己制造的错误设计**
+
+第一版 FFI 签名是 `-> Vec<NotebookNode>`，失败时返回空 `Vec`。
+于是"查询失败"与"确实没有笔记本"在界面上**长得一模一样**，
+界面显示"还没有笔记本"，而用户会以为数据丢了。
+改成返回 `NoteResult`（与其它 API 一致）后，问题立刻可见并被修掉。
+
+**2. `notes_list` 没接笔记本过滤参数**：FFI 只透传 `include_deleted`，
+面板按笔记本过滤时参数被静默忽略。已补 `notebook_id` / `include_descendants`。
+
+**3. 界面诊断钩子挂错了生命周期**：最初用
+`WidgetsBinding.addPostFrameCallback`，而它只在"页面重建"后排队——
+`NotesPage.build` 当时只 watch 了 `engineProvider`，数据变化不触发重建，
+于是**诊断永远不写**。表面现象是"诊断文件里没有三栏快照"，
+我一度据此以为数据没加载出来；实际数据是好的、**只是观测手段没被触发**。
+现改为 `ref.listen` 直接挂在 provider 上（见 `core/ui_diagnostics.dart`）。
+
+### 变更
+- 新增 `lib/core/notebook_providers.dart`（笔记本树 + 选中状态 + 写操作）
+- 新增 `lib/core/ui_diagnostics.dart`：把"界面看到了什么"落盘为可断言的文件。
+  放在 `core/` 而非页面里，因为①页面是展示层，不该为了可观测多知道一层数据细节；
+  ②诊断要读 `lib/src/rust/**` 的类型，放页面会违反门禁 A-LAYERING
+- `NoteListQuery` 取代原来的 `bool` 作为列表 provider 的参数（值对象，支持多条件）
+- `StateProvider` → `NotifierProvider`（Riverpod 3 已移除前者的导出）
+- `NoteEditorPage` 拆成"栏内面板 `NoteEditorPane` + 整页包装 `NoteEditorPage`"
+- `seed_demo_notes.dart` 改为造**带层级的示例数据**（3 层笔记本 + 7 篇笔记）
+- 新增 `tool/diag_notebooks.dart`（打印树与按笔记本过滤的结果）
+
+### 测试
+- Rust 263 个（+13：树形过滤 5 个、笔记本树 8 个）
+- Flutter 15 个（+8：三栏部件、折叠、缩进、回收站切换、时间格式）
+- Widget 测试改为**注入假数据**：直接 pump 只能测到"加载中"，
+  注入后才能确定性地验证渲染结果，且不依赖文件系统与平台通道
+
 ### 修复（三项高危技术债 #8 / #10 / #12）
 
 **#8 连接锁死锁陷阱 —— 现在会报错而不是静默挂起**
