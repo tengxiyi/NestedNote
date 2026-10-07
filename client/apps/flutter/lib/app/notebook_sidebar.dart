@@ -126,9 +126,65 @@ class _NotebookSidebarState extends ConsumerState<NotebookSidebar> {
         Expanded(
           child: switch (tree) {
             AsyncLoading() => const Center(child: CircularProgressIndicator()),
+            // 查询失败时**必须给重试入口**，而且要说清"这不是没有数据"。
+            //
+            // ## 为什么这里单独处理
+            //
+            // 用户报告的症状是"目录树不显示了"，而当时界面上只有一句
+            // "请尝试重启应用；若问题持续，请从备份恢复数据"——
+            // 那句话会让用户**以为目录被删光了**，于是去翻回收站、
+            // 甚至真的去找备份。而实际情况往往只是**这一次查询失败**。
+            //
+            // 三件事必须同时做到：
+            // 1. 说清"是读取失败，不是目录没了"；
+            // 2. 给一个「重试」按钮（多数失败重试一次就好）；
+            // 3. 显示**错误码**而不是把 hint 当成事实——排查时
+            //    这一行能直接定位是数据库、权限还是别的问题（铁律 E3）。
             AsyncError(:final Object error) => Padding(
               padding: const EdgeInsets.all(12),
-              child: Text('$error', style: theme.textTheme.bodySmall),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      Icon(
+                        Icons.error_outline,
+                        size: 15,
+                        color: theme.colorScheme.error,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '目录列表读取失败',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: theme.colorScheme.error,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    // 先澄清最容易被误解的那件事
+                    '这不代表你的目录丢了——只是这次没读出来。',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '$error',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.outline,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => ref.invalidate(notebooksTreeProvider),
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: const Text('重试'),
+                  ),
+                ],
+              ),
             ),
             AsyncData(:final List<NotebookNode> value) when value.isEmpty =>
               Padding(

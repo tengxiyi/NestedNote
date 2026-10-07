@@ -57,15 +57,23 @@ pub struct NoteSummary {
     pub version: i64,
     /// 是否在回收站。
     pub deleted: bool,
+    /// 删除时间（UTC 毫秒）；未删除时为 `None`。
+    ///
+    /// ## 为什么必须与 `updated_at_ms` 分开
+    ///
+    /// 回收站的排序依据是**删除时间**（"我最近删了什么"），
+    /// 而不是"内容什么时候改的"。这两个值在删除那一刻之后就不再同步：
+    /// 一篇三天前写、今天删的笔记，`updated_at_ms` 是三天前。
+    ///
+    /// 本项目的真实症状是：
+    ///
+    /// - 回收站按 `updated_at_ms` 排 → 顺序看起来是乱的；
+    /// - 保留期倒计时**借用了 `updated_at_ms`** → 显示的"还剩 N 天"
+    ///   是按"最后修改时间"算的，与被删时间无关，**数字是错的**。
+    ///
+    /// 补上这个字段之后，倒计时与排序才都指向同一件事。
+    pub deleted_at_ms: Option<i64>,
     /// 所属笔记本；`None` 表示未分类。
-    ///
-    /// ## 为什么界面需要它
-    ///
-    /// 1. 在**非最底层**目录点"新建笔记"时，内核会把笔记下潜到最底层的
-    ///    子目录（见 `resolve_note_notebook`）。界面必须知道**实际落到了哪里**，
-    ///    才能把左栏选中项跟过去——否则用户点了"在这里新建"，
-    ///    新笔记却出现在别处，而界面毫无提示。
-    /// 2. 列表行能显示归属，排查"这篇到底在哪个目录"时不用再去翻数据库。
     pub notebook_id: Option<String>,
 }
 
@@ -387,6 +395,7 @@ fn summary_of(note: &Note) -> NoteSummary {
         updated_at_ms: note.updated_at_ms,
         version: note.version,
         deleted: note.deleted_at_ms.is_some(),
+        deleted_at_ms: note.deleted_at_ms,
         notebook_id: note.notebook_id.map(|id| id.to_string()),
     }
 }

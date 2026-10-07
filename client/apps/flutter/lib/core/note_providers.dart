@@ -39,6 +39,7 @@ class NoteItem {
     required this.updatedAtMs,
     required this.version,
     required this.deleted,
+    this.deletedAtMs,
     this.notebookId,
   });
 
@@ -60,6 +61,14 @@ class NoteItem {
   /// 是否在回收站。
   final bool deleted;
 
+  /// 删除时间（UTC 毫秒）；未删除时为 `null`。
+  ///
+  /// 回收站的排序与保留期倒计时都基于它，**不能用 `updatedAtMs` 代替**：
+  /// 一篇三天前写、今天删的笔记，`updatedAtMs` 是三天前——
+  /// 拿它算倒计时会给出一个与被删时间无关的**错数字**。
+  /// （这正是加入这个字段之前的真实缺陷。）
+  final int? deletedAtMs;
+
   /// 所属笔记本；`null` 表示未分类。
   ///
   /// 界面用它做一件事：在**非最底层**目录点"新建笔记"时，内核会把笔记
@@ -78,6 +87,7 @@ class NoteItem {
       updatedAtMs: source.updatedAtMs.toInt(),
       version: source.version.toInt(),
       deleted: source.deleted,
+      deletedAtMs: source.deletedAtMs?.toInt(),
       notebookId: source.notebookId,
     );
   }

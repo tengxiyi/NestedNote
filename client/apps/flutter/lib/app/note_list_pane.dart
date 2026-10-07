@@ -99,55 +99,88 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
         else
           _header(context, notes, notebookName, notebookId, theme),
         const Divider(height: 1),
-        // 回收站视图额外列出"已删除的目录"。目录曾经完全没有恢复入口，
-        // 用户删掉后就再也找不回来（见 trashedNotebooksProvider 的说明）。
-        if (widget.showDeleted) const _TrashedNotebooksSection(),
         Expanded(
-          child: switch (notes) {
-            AsyncLoading() => const Center(child: CircularProgressIndicator()),
-            AsyncError(:final Object error) => Padding(
-              padding: const EdgeInsets.all(14),
-              child: Text('$error', style: theme.textTheme.bodySmall),
-            ),
-            AsyncData(:final List<NoteItem> value) when value.isEmpty =>
-              _EmptyNoteList(showDeleted: widget.showDeleted),
-            AsyncData(:final List<NoteItem> value) => ListView.builder(
-              itemCount: value.length,
-              itemBuilder: (BuildContext context, int index) {
-                final NoteItem note = value[index];
-                return _NoteRow(
-                  note: note,
-                  selected: note.id == widget.openNoteId,
-                  retentionDays: widget.showDeleted ? retention : null,
-                  // 多选模式下显示勾选框，点击即勾选（而不是打开笔记）
-                  selectable: widget.showDeleted && _selecting,
-                  checked: _selected.contains(note.id),
-                  onTap: () {
-                    if (widget.showDeleted && _selecting) {
-                      _toggle(note.id);
-                    } else {
-                      widget.onOpenNote(note.id);
-                    }
-                  },
-                  onLongPress: () {
-                    if (widget.showDeleted) {
-                      // 长按进入多选并勾上这一条——这是移动端与桌面端
-                      // 都通行的"批量选择"起手式，比先找一个"选择"按钮快
-                      setState(() {
-                        _selecting = true;
-                        _selected.add(note.id);
-                      });
-                    } else {
-                      _noteMenu(context, note, retention);
-                    }
-                  },
-                );
-              },
-            ),
-          },
+          // ## 回收站是一条**按删除时间排的混合列表**
+          //
+          // 目录曾经被单独钉在顶部。用户指出这不合理：
+          //
+          //   > 回收站里面，目录级别的为什么要给它置顶？这个设定不合理
+          //
+          // 他是对的。用户找东西的依据是**时间**（"我刚删的那个在哪"），
+          // 不是**类型**。按类型分组把一条时间线切成两段，于是"刚删的笔记"
+          // 可能排在一小时前删的目录下面。
+          //
+          // 现在笔记与目录混在同一条时间线上，删除时间新的在上——
+          // 也就是"最近删的在最上面"，与用户的心智一致。
+          //
+          // 多选模式下只列**笔记**：目录的彻底删除有自己的依赖顺序
+          //（自底向上，见 `purge_notebook` 的说明），不能和笔记一起批删。
+          child: widget.showDeleted && !_selecting
+              ? _TimelineView(
+                  notes: notes,
+                  openNoteId: widget.openNoteId,
+                  retentionDays: retention,
+                  onOpenNote: widget.onOpenNote,
+                  onEnterSelection: (String id) => setState(() {
+                    _selecting = true;
+                    _selected.add(id);
+                  }),
+                )
+              : _plainList(context, notes, retention, theme),
         ),
       ],
     );
+  }
+
+  /// 普通列表（非回收站，或回收站的多选模式）。
+  Widget _plainList(
+    BuildContext context,
+    AsyncValue<List<NoteItem>> notes,
+    int retention,
+    ThemeData theme,
+  ) {
+    return switch (notes) {
+      AsyncLoading() => const Center(child: CircularProgressIndicator()),
+      AsyncError(:final Object error) => Padding(
+        padding: const EdgeInsets.all(14),
+        child: Text('$error', style: theme.textTheme.bodySmall),
+      ),
+      AsyncData(:final List<NoteItem> value) when value.isEmpty =>
+        _EmptyNoteList(showDeleted: widget.showDeleted),
+      AsyncData(:final List<NoteItem> value) => ListView.builder(
+        itemCount: value.length,
+        itemBuilder: (BuildContext context, int index) {
+          final NoteItem note = value[index];
+          return _NoteRow(
+            note: note,
+            selected: note.id == widget.openNoteId,
+            retentionDays: widget.showDeleted ? retention : null,
+            // 多选模式下显示勾选框，点击即勾选（而不是打开笔记）
+            selectable: widget.showDeleted && _selecting,
+            checked: _selected.contains(note.id),
+            onTap: () {
+              if (widget.showDeleted && _selecting) {
+                _toggle(note.id);
+              } else {
+                widget.onOpenNote(note.id);
+              }
+            },
+            onLongPress: () {
+              if (widget.showDeleted) {
+                // 长按进入多选并勾上这一条——这是移动端与桌面端
+                // 都通行的"批量选择"起手式，比先找一个"选择"按钮快
+                setState(() {
+                  _selecting = true;
+                  _selected.add(note.id);
+                });
+              } else {
+                _noteMenu(context, note, retention);
+              }
+            },
+          );
+        },
+      ),
+    };
   }
 
   void _toggle(String id) {
@@ -570,6 +603,105 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
   }
 }
 
+/// 回收站的**时间线视图**：笔记与目录按**删除时间**混排。
+///
+/// ## 为什么不再按类型分组
+///
+/// 最初目录被单独钉在列表顶部，用户指出这不合理：
+///
+/// > 回收站里面，目录级别的为什么要给它置顶？这个设定不合理
+///
+/// 他是对的。用户找东西的依据是**时间**（"我刚删的那个在哪"），
+/// 不是**类型**。按类型分组把一条时间线切成两段，于是"刚删的笔记"
+/// 可能排在一小时前删的目录下面。
+///
+/// 现在混排，删除时间新的在上——正好对应"最近删的在最上面"。
+///
+/// ## 排序键用 `deletedAtMs` 而不是 `updatedAtMs`
+///
+/// 这两个值在删除之后就不同步了（一篇三天前写、今天删的笔记，
+/// `updatedAtMs` 是三天前）。用错会让"最近删的"沉到列表中间。
+class _TimelineView extends ConsumerWidget {
+  const _TimelineView({
+    required this.notes,
+    required this.openNoteId,
+    required this.retentionDays,
+    required this.onOpenNote,
+    required this.onEnterSelection,
+  });
+
+  final AsyncValue<List<NoteItem>> notes;
+  final String? openNoteId;
+  final int retentionDays;
+  final ValueChanged<String?> onOpenNote;
+  final ValueChanged<String> onEnterSelection;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final AsyncValue<List<TrashedNotebookItem>> trashed = ref.watch(
+      trashedNotebooksProvider,
+    );
+    final ThemeData theme = Theme.of(context);
+
+    if (notes case AsyncError(:final Object error)) {
+      return Padding(
+        padding: const EdgeInsets.all(14),
+        child: Text('$error', style: theme.textTheme.bodySmall),
+      );
+    }
+    if (notes is AsyncLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final List<NoteItem> noteList = notes.value ?? const <NoteItem>[];
+    final List<TrashedNotebookItem> bookList =
+        trashed.value ?? const <TrashedNotebookItem>[];
+
+    // 合并成一条时间线。用记录类型而不是新建一个类：这里只需要
+    // "按时间排好序、渲染时能分辨两种"这两件事，加一个类反而要维护
+    // 一份与两个真实类型重复的字段清单。
+    final List<({int at, NoteItem? note, TrashedNotebookItem? book})> items =
+        <({int at, NoteItem? note, TrashedNotebookItem? book})>[
+          for (final NoteItem n in noteList)
+            // 未删除的笔记不该出现在这里；真出现了用它自己的时间兜底，
+            // 而不是丢掉它（丢掉就是"列表里少了一条"）。
+            (at: n.deletedAtMs ?? n.updatedAtMs, note: n, book: null),
+          for (final TrashedNotebookItem b in bookList)
+            (at: b.deletedAtMs, note: null, book: b),
+        ]..sort(
+          (
+            ({int at, NoteItem? note, TrashedNotebookItem? book}) a,
+            ({int at, NoteItem? note, TrashedNotebookItem? book}) b,
+          ) => b.at.compareTo(a.at),
+        );
+
+    if (items.isEmpty) {
+      return const _EmptyNoteList(showDeleted: true);
+    }
+
+    return ListView.builder(
+      itemCount: items.length,
+      itemBuilder: (BuildContext context, int index) {
+        final ({int at, NoteItem? note, TrashedNotebookItem? book}) item =
+            items[index];
+        final TrashedNotebookItem? book = item.book;
+        if (book != null) {
+          return _TrashedNotebookRow(item: book, retentionDays: retentionDays);
+        }
+        final NoteItem note = item.note!;
+        return _NoteRow(
+          note: note,
+          selected: note.id == openNoteId,
+          retentionDays: retentionDays,
+          onTap: () => onOpenNote(note.id),
+          // 长按进入多选（与网格列表一致的手势）
+          onLongPress: () => onEnterSelection(note.id),
+        );
+      },
+    );
+  }
+}
+
 /// 属性对话框里的一行。
 Widget _propertyRow(String label, String value) => Padding(
   padding: const EdgeInsets.symmetric(vertical: 3),
@@ -750,70 +882,6 @@ class _NoteRow extends StatelessWidget {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// 回收站里"已删除的目录"区块。
-///
-/// ## 为什么必须有它（一条真实的数据丢失路径）
-///
-/// 目录（笔记本）能被删除，但回收站**只列笔记**，于是目录没有任何
-/// 恢复入口。用户把目录删掉后，它就从左栏永久消失了——连带它下面的
-/// 整棵子树（子目录与笔记都还在库里，只是看不见）。
-///
-/// 用户报的原话是"会导致笔记的目录树丢失"。
-///
-/// ## 为什么每行是一个扁平的 Chip 列表
-///
-/// 已删除的目录之间**父指针可能指向另一个已删除的目录**，
-/// 拼成一棵树要处理"父节点也删了/父节点还活着"等一堆情况，
-/// 而且用户在回收站里关心的是"哪个目录被我删了"，
-/// 不是"它们的层级关系"。扁平列出更直接，也更容易逐条恢复。
-class _TrashedNotebooksSection extends ConsumerWidget {
-  const _TrashedNotebooksSection();
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final AsyncValue<List<TrashedNotebookItem>> trashed = ref.watch(
-      trashedNotebooksProvider,
-    );
-    final ThemeData theme = Theme.of(context);
-
-    // 加载中与出错都**不占位**：这一块是附加信息，
-    // 为它显示骨架屏或错误条会干扰下面真正的主体（笔记列表）。
-    // 出错时确实少了信息，但静默降级比在中栏顶部插一条红色错误更不打扰。
-    final List<TrashedNotebookItem> items =
-        trashed.value ?? const <TrashedNotebookItem>[];
-    if (items.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    final int retention = ref.watch(trashRetentionDaysProvider).value ?? 0;
-
-    return Container(
-      color: theme.colorScheme.surfaceContainerHighest,
-      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              const Icon(kRecycleBinIcon, size: 15),
-              const SizedBox(width: 6),
-              Text(
-                '已删除的目录（${items.length}）',
-                style: theme.textTheme.labelMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          for (final TrashedNotebookItem item in items)
-            _TrashedNotebookRow(item: item, retentionDays: retention),
-        ],
       ),
     );
   }
