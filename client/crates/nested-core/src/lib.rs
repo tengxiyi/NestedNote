@@ -36,10 +36,12 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod attachments;
 pub mod branding;
 pub mod error;
 
 pub use api::{NestedCore, UNKNOWN_DEVICE_ID};
+pub use attachments::{AttachmentService, GcReport};
 pub use error::{CoreError, CoreResult};
 
 // 重新导出上层必需的模型与查询类型，使 Flutter 只需依赖本 crate。

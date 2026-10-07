@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use nested_db::NoteQuery;
 use nested_db::repositories::{notebooks, notes, revisions, tags};
 use nested_db::{Database, DbError};
-use nested_model::{Document, Id, Note, Notebook, Tag};
+use nested_model::{Attachment, Block, Document, Id, Note, Notebook, Tag};
 
 use crate::error::{CoreError, CoreResult};
 
@@ -30,6 +30,12 @@ pub const DEVICE_ID_SETTING_KEY: &str = "device.id";
 #[derive(Debug)]
 pub struct NestedCore {
     database: Database,
+    /// 附件存储与元数据的协调者。
+    ///
+    /// `None` 表示内存库：附件必须落在真实目录里，而内存库没有数据目录。
+    /// 此时附件相关操作返回 [`CoreError::Config`] 并说明原因，
+    /// 而不是悄悄写到一个临时位置（那会让测试与真实行为不一致）。
+    attachments: Option<crate::attachments::AttachmentService>,
     /// 本设备标识的缓存。
     ///
     /// ## 为什么需要它
@@ -46,7 +52,7 @@ pub struct NestedCore {
 impl NestedCore {
     /// 在指定数据目录下打开（或创建）内核。
     ///
-    /// 数据目录内会创建 `nested.db`；附件目录由后续阶段引入。
+    /// 数据目录内会创建 `nested.db` 与 `attachments/`（内容寻址存储）。
     ///
     /// # Errors
     ///
@@ -60,11 +66,15 @@ impl NestedCore {
         let database = Database::open(&path)?;
         Ok(Self {
             database,
+            attachments: Some(crate::attachments::AttachmentService::new(data_dir)),
             device_id_cache: Mutex::new(None),
         })
     }
 
     /// 在内存中打开内核（测试与 CLI 快速验证用）。
+    ///
+    /// 附件功能在此模式下不可用（没有数据目录），调用会返回 [`CoreError::Config`]。
+    /// 需要测附件时请用 [`NestedCore::open`] 配合临时目录。
     ///
     /// # Errors
     ///
@@ -72,6 +82,7 @@ impl NestedCore {
     pub fn open_in_memory() -> CoreResult<Self> {
         Ok(Self {
             database: Database::open_in_memory()?,
+            attachments: None,
             device_id_cache: Mutex::new(None),
         })
     }
@@ -445,6 +456,188 @@ impl NestedCore {
         let effective = if limit == 0 { 50 } else { limit };
         Ok(revisions::list_for_note(&connection, note_id, effective)?)
     }
+
+    // ---------------------------------------------------------------- 附件
+
+    /// 附件存储根目录（内存库模式下为 `None`）。
+    #[must_use]
+    pub fn attachments_dir(&self) -> Option<PathBuf> {
+        self.attachments
+            .as_ref()
+            .map(|service| service.root().to_path_buf())
+    }
+
+    /// 附件服务（未启用时报错并说明原因）。
+    fn attachment_service(&self) -> CoreResult<&crate::attachments::AttachmentService> {
+        self.attachments.as_ref().ok_or_else(|| {
+            CoreError::Config("当前内核以内存库模式运行，没有数据目录，无法存储附件".to_owned())
+        })
+    }
+
+    /// 存储一段字节为附件，并把它**挂到某篇笔记上**（一次完成）。
+    ///
+    /// ## 为什么"存储"与"挂到笔记"是同一个操作
+    ///
+    /// 附件若只写进库、却没有出现在任何笔记的内容里，它就是不可见的孤儿：
+    /// 用户看不到它，同步也带不上它。因此对外只暴露这一个方法——
+    /// **一次性完成"落盘 + 登记 + 关联 + 保存笔记"**，不提供"只存不挂"的路径。
+    ///
+    /// ## 顺序（见 `crate::attachments` 模块文档）
+    ///
+    /// 1. 写文件（原子：临时文件 → fsync → rename → 回读校验）；
+    /// 2. 一个事务内完成：附件元数据 upsert + 笔记内容更新 + 附件关联 + 修订 + 入队。
+    ///
+    /// 若第 2 步失败，文件残留为**孤儿**——安全（可被 GC 回收），
+    /// 而不是"有记录没文件"的断链。
+    ///
+    /// ## 文档中的表示
+    ///
+    /// 附件会在文档末尾追加一个 `Block::Attachment`，其 `attachment_id` 指向刚登记的附件。
+    /// 这是"文档引用附件"的唯一方式——关系表 `note_attachments` 由
+    /// `sync_note_links` 从文档推导，不手工维护。
+    ///
+    /// # Errors
+    ///
+    /// - 内核运行在内存库模式 → [`CoreError::Config`]
+    /// - 标题/摘要非法 → [`CoreError::Validation`]
+    /// - 笔记不存在 → [`CoreError::NotFound`]
+    /// - 文件或数据库写入失败 → [`CoreError::Config`] / [`CoreError::Database`]
+    pub fn attach_bytes_to_note(
+        &self,
+        note_id: &Id,
+        bytes: &[u8],
+        mime_type: &str,
+        filename: &str,
+        device_id: &str,
+        at_ms: i64,
+    ) -> CoreResult<Attachment> {
+        let service = self.attachment_service()?;
+        let attachment = service.store_bytes(self, bytes, mime_type, filename, at_ms)?;
+        self.link_attachment(note_id, &attachment, device_id, at_ms)?;
+        Ok(attachment)
+    }
+
+    /// 从文件存储附件并挂到笔记上（流式，大文件不整读进内存）。
+    ///
+    /// 语义与 [`NestedCore::attach_bytes_to_note`] 相同，只是数据来源是文件。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`NestedCore::attach_bytes_to_note`]；源文件不可读时返回 [`CoreError::Config`]。
+    pub fn attach_file_to_note(
+        &self,
+        note_id: &Id,
+        source: &Path,
+        mime_type: &str,
+        filename: &str,
+        device_id: &str,
+        at_ms: i64,
+    ) -> CoreResult<Attachment> {
+        let service = self.attachment_service()?;
+        let attachment = service.store_file(self, source, mime_type, filename, at_ms)?;
+        self.link_attachment(note_id, &attachment, device_id, at_ms)?;
+        Ok(attachment)
+    }
+
+    /// 把已登记的附件挂到笔记上（把 id 写进文档并保存）。
+    fn link_attachment(
+        &self,
+        note_id: &Id,
+        attachment: &Attachment,
+        device_id: &str,
+        at_ms: i64,
+    ) -> CoreResult<()> {
+        let note = self.get_note(note_id)?;
+        let mut document = self.get_note_document(note_id)?;
+
+        // 幂等：同一附件重复挂到同一笔记时不再追加块
+        // （这也让"重复粘贴同一张图"不会产生多个块）
+        if !document.attachment_ids().contains(&attachment.id) {
+            document.blocks.push(block_for_attachment(attachment));
+        }
+
+        // 只改文档，元数据保持库中的值；save_note 只在确有变化时写盘
+        // （因此"重复挂同一附件"不会产生多余修订——技术债 #11 的语义在此生效）
+        self.save_note(note, document, device_id, at_ms)?;
+        Ok(())
+    }
+
+    /// 读取附件内容（**读取时校验哈希**，铁律 D4）。
+    ///
+    /// # Errors
+    ///
+    /// - 内存库模式 → [`CoreError::Config`]
+    /// - 内容缺失（断链） → [`CoreError::NotFound`]
+    /// - 内容与哈希不符 → [`CoreError::Config`]
+    pub fn read_attachment(&self, sha256: &str) -> CoreResult<Vec<u8>> {
+        self.attachment_service()?.read(sha256)
+    }
+
+    /// 按标识读取附件元数据。
+    ///
+    /// # Errors
+    ///
+    /// 不存在 → [`CoreError::NotFound`]。
+    pub fn get_attachment(&self, id: &Id) -> CoreResult<Attachment> {
+        let connection = self.database.connection()?;
+        nested_db::repositories::attachments::get(&connection, id)?.ok_or(CoreError::NotFound {
+            entity: "attachment",
+        })
+    }
+
+    /// 列出某篇笔记引用的附件。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn list_attachments_for_note(&self, note_id: &Id) -> CoreResult<Vec<Attachment>> {
+        let connection = self.database.connection()?;
+        Ok(nested_db::repositories::attachments::list_for_note(
+            &connection,
+            note_id,
+        )?)
+    }
+
+    /// 校验某附件的文件与哈希是否一致（备份前体检用）。
+    ///
+    /// # Errors
+    ///
+    /// 缺失 → [`CoreError::NotFound`]；不符 → [`CoreError::Config`]。
+    pub fn verify_attachment(&self, sha256: &str) -> CoreResult<()> {
+        self.attachment_service()?.verify(sha256)
+    }
+
+    /// 回收孤儿附件文件（语义见 [`crate::attachments::AttachmentService::gc`]）。
+    ///
+    /// # Errors
+    ///
+    /// 内存库模式 → [`CoreError::Config`]；遍历或查询失败 → 相应错误。
+    pub fn gc_attachments(&self, now_ms: i64) -> CoreResult<crate::attachments::GcReport> {
+        self.attachment_service()?.gc(self, now_ms)
+    }
+}
+
+/// 为附件选择文档中的块类型。
+///
+/// 块模型里没有"通用附件块"：图片用 [`Block::Image`]（可带替代文本与尺寸），
+/// 其余一律用 [`Block::File`]（带展示用文件名）。
+///
+/// 依据是 **MIME 类型**而不是文件扩展名——扩展名是用户可控的字符串，
+/// 而 MIME 由导入路径根据真实内容判断（铁律 S6：不信任文件名）。
+fn block_for_attachment(attachment: &Attachment) -> Block {
+    if attachment.mime_type.starts_with("image/") {
+        Block::Image {
+            attachment_id: attachment.id,
+            alt: None,
+            width: None,
+            height: None,
+        }
+    } else {
+        Block::File {
+            attachment_id: attachment.id,
+            filename: attachment.filename.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -736,5 +929,345 @@ mod tests {
         };
         let core = NestedCore::open(dir.path()).expect("reopen");
         assert_eq!(core.get_note(&note_id).expect("get").title, "持久化");
+    }
+
+    // ---------------------------------------------------------------- 附件
+    //
+    // 这一组的核心是**不变量**：每一条 attachments 记录，其内容一定已完整落盘。
+    // 换句话说"有记录没文件"（断链）绝不允许出现；反过来"有文件没记录"
+    // （孤儿）是允许的，因为写入顺序保证了它可被 GC 回收。
+
+    /// 建一个有数据目录的内核 + 一篇笔记。
+    fn core_with_note() -> (tempfile::TempDir, NestedCore, Id) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = NestedCore::open(dir.path()).expect("open");
+        let note = core.create_note(None, "带附件", NOW).expect("create");
+        (dir, core, note.id)
+    }
+
+    #[test]
+    fn attaching_bytes_writes_file_and_metadata_and_link() {
+        let (_dir, core, note_id) = core_with_note();
+        let content = b"binary payload";
+
+        let attachment = core
+            .attach_bytes_to_note(
+                &note_id,
+                content,
+                "application/pdf",
+                "报告.pdf",
+                "device-a",
+                NOW + 1,
+            )
+            .expect("attach");
+
+        // 内容可原样读回（读取时校验哈希）
+        assert_eq!(
+            core.read_attachment(&attachment.sha256).expect("read"),
+            content
+        );
+        assert_eq!(attachment.size_bytes, content.len() as u64);
+        assert_eq!(attachment.filename, "报告.pdf");
+
+        // 元数据已登记
+        let stored = core.get_attachment(&attachment.id).expect("get");
+        assert_eq!(stored.sha256, attachment.sha256);
+
+        // 笔记里出现了引用
+        let document = core.get_note_document(&note_id).expect("doc");
+        assert!(
+            document.attachment_ids().contains(&attachment.id),
+            "文档必须引用该附件"
+        );
+
+        // 关系表也已同步（关系由文档推导，不手工维护）
+        let linked = core.list_attachments_for_note(&note_id).expect("list");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, attachment.id);
+    }
+
+    #[test]
+    fn image_mime_creates_image_block_and_other_mime_creates_file_block() {
+        let (_dir, core, note_id) = core_with_note();
+
+        core.attach_bytes_to_note(&note_id, b"png-bytes", "image/png", "图.png", "d", NOW + 1)
+            .expect("attach image");
+        core.attach_bytes_to_note(
+            &note_id,
+            b"zip-bytes",
+            "application/zip",
+            "归档.zip",
+            "d",
+            NOW + 2,
+        )
+        .expect("attach file");
+
+        let blocks = core.get_note_document(&note_id).expect("doc").blocks;
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Image { .. })),
+            "image/* 应产生图片块"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::File { .. })),
+            "其它 MIME 应产生文件块"
+        );
+    }
+
+    #[test]
+    fn same_content_is_deduplicated_across_notes() {
+        // 内容寻址的核心收益：同一份内容在多篇笔记里只占一份磁盘
+        let (_dir, core, first_note) = core_with_note();
+        let second_note = core.create_note(None, "第二篇", NOW).expect("create").id;
+        let content = b"identical bytes";
+
+        let a = core
+            .attach_bytes_to_note(&first_note, content, "text/plain", "a.txt", "d", NOW + 1)
+            .expect("a");
+        let b = core
+            .attach_bytes_to_note(&second_note, content, "text/plain", "b.txt", "d", NOW + 2)
+            .expect("b");
+
+        assert_eq!(a.sha256, b.sha256, "相同内容必须有相同哈希");
+        assert_eq!(a.id, b.id, "元数据也应复用同一条记录（SHA-256 唯一索引）");
+
+        // 两篇笔记各自引用它，因此删除其中一篇不会让内容消失
+        let (_, core2, _) = core_with_note(); // 独立内核，避免相互影响
+        drop(core2);
+        assert_eq!(
+            core.list_attachments_for_note(&first_note)
+                .expect("l1")
+                .len(),
+            1
+        );
+        assert_eq!(
+            core.list_attachments_for_note(&second_note)
+                .expect("l2")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn attaching_the_same_content_twice_to_one_note_is_idempotent() {
+        // 用户重复粘贴同一张图：不应产生第二个块，也不应产生多余修订
+        let (_dir, core, note_id) = core_with_note();
+        let content = b"same image";
+
+        core.attach_bytes_to_note(&note_id, content, "image/png", "x.png", "d", NOW + 1)
+            .expect("first");
+        let version_after_first = core.get_note(&note_id).expect("note").version;
+
+        core.attach_bytes_to_note(&note_id, content, "image/png", "x.png", "d", NOW + 2)
+            .expect("second");
+
+        let document = core.get_note_document(&note_id).expect("doc");
+        assert_eq!(document.attachment_ids().len(), 1, "同一附件不应被追加两次");
+        assert_eq!(
+            core.get_note(&note_id).expect("note").version,
+            version_after_first,
+            "无实际变化时不应递增版本（技术债 #11 的语义）"
+        );
+    }
+
+    #[test]
+    fn every_metadata_row_has_its_file_on_disk() {
+        // 这是本模块最重要的不变量：**有记录必有文件**。
+        // 它是"写入顺序不可颠倒"（先文件后库）的直接推论。
+        let (_dir, core, note_id) = core_with_note();
+
+        for index in 0..5 {
+            let content = format!("payload-{index}");
+            core.attach_bytes_to_note(
+                &note_id,
+                content.as_bytes(),
+                "text/plain",
+                &format!("f{index}.txt"),
+                "d",
+                NOW + index,
+            )
+            .expect("attach");
+        }
+
+        let attachments = core.list_attachments_for_note(&note_id).expect("list");
+        assert_eq!(attachments.len(), 5);
+        for attachment in &attachments {
+            assert!(
+                core.verify_attachment(&attachment.sha256).is_ok(),
+                "每条元数据都必须有完整落盘的文件：{}",
+                attachment.filename
+            );
+        }
+    }
+
+    #[test]
+    fn gc_reports_no_broken_links_after_normal_writes() {
+        let (_dir, core, note_id) = core_with_note();
+        core.attach_bytes_to_note(&note_id, b"x", "text/plain", "x.txt", "d", NOW + 1)
+            .expect("attach");
+
+        let report = core.gc_attachments(NOW + 2).expect("gc");
+        assert_eq!(report.broken_links, 0, "正常写入后不应有断链");
+        assert_eq!(report.removed_files, 0, "被引用的文件不该被删除");
+    }
+
+    #[test]
+    fn gc_removes_only_orphans_beyond_grace_period() {
+        // ⚠️ 本测试必须用**真实系统时间**，不能用固定的 `NOW` 常量。
+        //
+        // 踩过的坑（本次真实发生）：第一版用 `NOW + GC_GRACE_PERIOD_MS * 10` 当"很久以后"，
+        // 但 `NOW` 是 2023-11-14，而文件 mtime 来自真实的系统时钟。
+        // 于是 `now_ms - mtime` 是**负数**，`saturating_sub` 归零 →
+        // 所有文件都被判为"刚写入、在宽限期内"，GC 一个都没删。
+        // 这与踩坑备忘 §5.7 是同一类错误：**把固定测试时间与真实时间混用**。
+        let real_now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_millis(),
+        )
+        .expect("fits in i64");
+
+        let (_dir, core, note_id) = core_with_note();
+        let service_root = core.attachments_dir().expect("has data dir");
+        let store = nested_attachment::ContentStore::new(service_root);
+
+        // 造两个孤儿文件（没有任何元数据引用它们）
+        let recent = store.put_bytes(b"recent orphan").expect("put recent");
+        let old = store.put_bytes(b"old orphan").expect("put old");
+        assert!(old.path.exists() && recent.path.exists());
+
+        // 1) 以"现在"为基准：两个都在宽限期内，什么都不该删
+        let report1 = core.gc_attachments(real_now).expect("gc1");
+        assert_eq!(report1.removed_files, 0, "宽限期内不得删除");
+        assert_eq!(report1.kept_recent, 2, "两个孤儿都还在宽限期内");
+
+        // 2) 把基准时间推到宽限期之后：两个都该被回收
+        let later = real_now + crate::attachments::GC_GRACE_PERIOD_MS * 2;
+        let report2 = core.gc_attachments(later).expect("gc2");
+        assert_eq!(report2.removed_files, 2, "越过宽限期的孤儿应被回收");
+        assert!(report2.freed_bytes > 0, "应统计释放的字节数");
+        assert!(
+            !old.path.exists() && !recent.path.exists(),
+            "孤儿文件应已被删除"
+        );
+
+        // 这篇笔记本身没有附件，因此上面的删除不影响任何被引用的内容
+        assert!(
+            core.list_attachments_for_note(&note_id)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn gc_never_removes_files_referenced_by_deleted_notes() {
+        // 软删除的笔记仍引用附件（可从回收站恢复），因此其文件不能被回收。
+        // 这是"回收孤儿"最容易写错的地方：按 ref_count 判断会误删。
+        let (_dir, core, note_id) = core_with_note();
+        let attachment = core
+            .attach_bytes_to_note(&note_id, b"keep me", "text/plain", "k.txt", "d", NOW + 1)
+            .expect("attach");
+
+        core.delete_note(&note_id, NOW + 2).expect("delete note");
+
+        let far_future = NOW + crate::attachments::GC_GRACE_PERIOD_MS * 10;
+        let report = core.gc_attachments(far_future).expect("gc");
+        assert_eq!(
+            report.removed_files, 0,
+            "已删除笔记引用的附件仍须保留（否则恢复笔记后附件就丢了）"
+        );
+        assert!(core.read_attachment(&attachment.sha256).is_ok());
+    }
+
+    #[test]
+    fn in_memory_core_rejects_attachment_operations_with_clear_error() {
+        // 内存库没有数据目录，附件无法落盘。此时必须**明确报错**，
+        // 而不是悄悄写到一个临时位置（那会让测试与真实行为不一致）。
+        let core = NestedCore::open_in_memory().expect("open");
+        let note = core.create_note(None, "内存", NOW).expect("create");
+
+        let error = core
+            .attach_bytes_to_note(&note.id, b"x", "text/plain", "x.txt", "d", NOW + 1)
+            .expect_err("必须报错");
+        assert_eq!(error.code(), "CONFIG_ERROR");
+        assert!(core.attachments_dir().is_none());
+    }
+
+    #[test]
+    fn attaching_from_file_streams_and_links() {
+        let (_dir, core, note_id) = core_with_note();
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let source = source_dir.path().join("源文件.bin");
+        let content = vec![7_u8; 300_000];
+        std::fs::write(&source, &content).expect("write source");
+
+        let attachment = core
+            .attach_file_to_note(
+                &note_id,
+                &source,
+                "application/octet-stream",
+                "源文件.bin",
+                "d",
+                NOW + 1,
+            )
+            .expect("attach file");
+
+        assert_eq!(attachment.size_bytes, content.len() as u64);
+        assert_eq!(
+            core.read_attachment(&attachment.sha256).expect("read"),
+            content
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_is_enqueued_for_sync() {
+        // 技术债 #22：附件元数据此前完全不入队，其它设备会缺附件
+        let (_dir, core, note_id) = core_with_note();
+        let before = core.pending_sync_count().expect("count");
+
+        core.attach_bytes_to_note(&note_id, b"sync me", "text/plain", "s.txt", "d", NOW + 1)
+            .expect("attach");
+
+        let after = core.pending_sync_count().expect("count");
+        assert!(
+            after > before,
+            "附件元数据必须入队（before={before} after={after}）"
+        );
+    }
+
+    #[test]
+    fn attachments_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (note_id, sha256) = {
+            let core = NestedCore::open(dir.path()).expect("open");
+            let note = core.create_note(None, "持久化附件", NOW).expect("create");
+            let attachment = core
+                .attach_bytes_to_note(&note.id, b"durable", "text/plain", "d.txt", "d", NOW + 1)
+                .expect("attach");
+            (note.id, attachment.sha256)
+        };
+
+        let core = NestedCore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            core.read_attachment(&sha256).expect("read"),
+            b"durable",
+            "重启后附件内容必须仍在（铁律 T1）"
+        );
+        let document = core.get_note_document(&note_id).expect("doc");
+        assert_eq!(document.attachment_ids().len(), 1, "引用关系也必须保留");
+    }
+
+    #[test]
+    fn missing_attachment_reports_not_found_not_panic() {
+        let (_dir, core, _note) = core_with_note();
+        // 一个合法但从未存储过的哈希
+        let error = core
+            .read_attachment(&"a".repeat(64))
+            .expect_err("必须报 NotFound");
+        assert_eq!(error.code(), "NOT_FOUND");
     }
 }

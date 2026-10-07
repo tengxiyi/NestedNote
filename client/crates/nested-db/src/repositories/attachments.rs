@@ -169,6 +169,40 @@ pub fn sync_note_links(
     Ok(())
 }
 
+/// 给"附件元数据变更"补上同步入队（技术债 #22）。
+///
+/// ## 为什么附件也需要入队
+///
+/// 铁律 T3 要求**任何**本地写操作都入队。附件元数据（文件名、MIME、大小、
+/// 内容哈希）是笔记的一部分：如果它不同步，其它设备上的笔记就会缺附件。
+///
+/// 字节本体**不走**这条队列——它由内容寻址存储负责，
+/// 同步时按哈希拉取即可（这也是内容寻址的收益之一）。
+///
+/// ## 与 `notes` 入队的关系
+///
+/// `sync_note_links` 建立笔记 ↔ 附件的关联时，关联本身会随笔记内容一起同步
+/// （文档里记录了附件 id）。因此这里**只**为附件元数据自身的创建/变更入队，
+/// 不重复为关联入队。
+///
+/// # Errors
+///
+/// 写入失败时返回 [`DbError`]。
+pub fn enqueue_sync(
+    connection: &Connection,
+    attachment_id: &Id,
+    device_id: &str,
+    at_ms: i64,
+) -> Result<(), DbError> {
+    crate::repositories::sync_operations::enqueue(
+        connection,
+        attachment_id,
+        device_id,
+        "attachment.create",
+        at_ms,
+    )
+}
+
 /// 列出没有任何引用的附件（GC 候选，**不**在此物理删除，铁律 D2）。
 ///
 /// # Errors
