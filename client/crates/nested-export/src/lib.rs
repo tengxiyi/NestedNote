@@ -11,6 +11,9 @@
 
 #![forbid(unsafe_code)]
 
+mod html;
+mod markdown;
+
 /// 导出格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -109,3 +112,6 @@ pub enum ExportError {
 
 /// 导出结果别名。
 pub type ExportResult<T> = std::result::Result<T, ExportError>;
+
+pub use html::{base64_encode, document_to_html, escape_html};
+pub use markdown::document_to_markdown;

@@ -607,6 +607,7 @@ dependencies = [
  "protocol",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "time",

@@ -1227,6 +1227,111 @@ impl NestedCore {
         Ok(report)
     }
 
+    /// 导出一篇笔记为 Markdown。
+    ///
+    /// 渲染在 `nested-export`：附件渲染为**人类可读占位**（内容寻址 id
+    /// 出了应用无意义），与编辑器投影（要保 id 往返）刻意不同。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn export_note_markdown(&self, id: &Id) -> CoreResult<String> {
+        let document = self.get_note_document(id)?;
+        Ok(nested_export::document_to_markdown(&document))
+    }
+
+    /// 导出一篇笔记为自包含 HTML（图片内联 base64）。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn export_note_html(&self, id: &Id) -> CoreResult<String> {
+        let document = self.get_note_document(id)?;
+        // 预解析图片字节：导出渲染器是纯函数，不做 IO。
+        // 缺失/读取失败的图片由渲染器降级为占位（诚实显示，不静默丢图）。
+        let mut images = std::collections::HashMap::new();
+        for block in &document.blocks {
+            if let nested_model::Block::Image { attachment_id, .. } = block {
+                if images.contains_key(attachment_id) {
+                    continue;
+                }
+                if let Ok(attachment) = self.get_attachment(attachment_id) {
+                    if let Ok(bytes) = self.read_attachment(&attachment.sha256) {
+                        images.insert(*attachment_id, bytes);
+                    }
+                }
+            }
+        }
+        let resolve = |id: &nested_model::Id| images.get(id).cloned();
+        Ok(nested_export::document_to_html(&document, &resolve))
+    }
+
+    /// 导出整库为 JSON（备份语义）。
+    ///
+    /// ## 范围
+    ///
+    /// 目录（含回收站）、笔记（含回收站，含每篇的完整块文档）、
+    /// 标签及笔记↔标签关联、库结构版本与导出时间。
+    /// **不含附件二进制内容**（内容寻址存储目录需随备份一并拷贝），
+    /// 这一限制由调用方在界面上明示，不在 JSON 里伪装"完整"。
+    ///
+    /// # Errors
+    ///
+    /// 查询或序列化失败 → [`CoreError`]。
+    pub fn export_database_json(&self) -> CoreResult<String> {
+        let connection = self
+            .database
+            .connection()
+            .map_err(|e| CoreError::Config(format!("step connection: {e}")))?;
+        let notebooks = notebooks::list_all_including_deleted(&connection)
+            .map_err(|e| CoreError::Config(format!("step notebooks: {e}")))?;
+        let notes = notes::list(
+            &connection,
+            &NoteQuery {
+                include_deleted: true,
+                limit: 0,
+                ..NoteQuery::default()
+            },
+        )
+        .map_err(|e| CoreError::Config(format!("step notes: {e}")))?;
+        let mut note_payloads = Vec::with_capacity(notes.len());
+        for note in &notes {
+            // 全程用**同一个连接**：内核连接有重入保护（已借用时再获取
+            // 会拒绝，防死锁），循环里改走 self.get_note_document()
+            // 必然撞上。所有查询都走本连接的仓储函数。
+            let document = notes::get_document(&connection, &note.id)
+                .map_err(|e| CoreError::Config(format!("step doc {}: {e}", note.id)))?;
+            let tags = tags::list_for_note(&connection, &note.id).unwrap_or_default();
+            note_payloads.push(serde_json::json!({
+                "id": note.id.to_string(),
+                "title": note.title,
+                "notebook_id": note.notebook_id.map(|n| n.to_string()),
+                "created_at_ms": note.created_at_ms,
+                "updated_at_ms": note.updated_at_ms,
+                "version": note.version,
+                "deleted": note.deleted_at_ms.is_some(),
+                "tags": tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                "document": document,
+            }));
+        }
+        let payload = serde_json::json!({
+            "format": "nestednote-backup",
+            "schema_version": nested_db::migrations::current_version(&connection)
+                .map_err(|e| CoreError::Config(format!("step schema: {e}")))?,
+            "exported_at_ms": nested_model::now_ms(),
+            "counts": {
+                "notebooks": notebooks.len(),
+                "notes": notes.len(),
+            },
+            "notebooks": notebooks,
+            "notes": note_payloads,
+            "tags": tags::list_all(&connection)
+                .map_err(|e| CoreError::Config(format!("step tags: {e}")))?,
+        });
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| CoreError::Config(format!("备份序列化失败：{error}")))
+    }
+
     /// 追加一条活动记录（**尽力而为**）。
     ///
     /// ## 为什么失败不向上传播
