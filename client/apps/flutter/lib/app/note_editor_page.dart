@@ -144,6 +144,9 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   /// 格式套用的登记处（同样要提前取好）。
   EditorTextChannel? _textChannel;
 
+  /// 重载通道（恢复修订后由它让编辑器重新读内核；见通道文档）。
+  EditorReloadChannel? _reloadChannel;
+
   @override
   void initState() {
     super.initState();
@@ -151,6 +154,7 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     _actionsForFlush = ref.read(noteActionsProvider);
     _saveChannel = ref.read(editorSaveChannelProvider.notifier);
     _textChannel = ref.read(editorTextChannelProvider.notifier);
+    _reloadChannel = ref.read(editorReloadChannelProvider.notifier);
     // 把"立即保存"与"套用格式"登记出去，菜单才能触发它们。
     //
     // 这两个动作依赖的是**编辑器当前的编辑状态**（两个输入框的内容、
@@ -167,18 +171,23 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     // 用户不可能察觉。而"编辑器构建失败"是灾难性的。
     _savingCallback = _saveNow;
     _formatCallback = _applyBlockFormat;
+    _reloadCallback = _load;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) {
         return;
       }
       _saveChannel?.register(_savingCallback);
       _textChannel?.register(_formatCallback);
+      _reloadChannel?.register(_reloadCallback);
     });
     unawaited(_load());
   }
 
   /// 登记给菜单用的"套用块格式"方法。
   late final Future<void> Function(String) _formatCallback;
+
+  /// 登记给重载通道用的方法（存成字段是为了注销时的同一性校验）。
+  late final Future<void> Function() _reloadCallback;
 
   /// 把块格式套用到**正文**（不作用于标题输入框）。
   ///
@@ -277,6 +286,8 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     // 好在 `unregister` 内部有同一性校验（`state == save` 才清空），
     // 因此即便顺序颠倒也不会误伤——这里只是把顺序理正。
     _saveChannel?.unregister(_savingCallback);
+    _textChannel?.unregister(_formatCallback);
+    _reloadChannel?.unregister(_reloadCallback);
     // **补一次保存**：用户可能在去抖窗口内就切走了。
     //
     // 这是"输入后切走就丢"的直接修法。注意：

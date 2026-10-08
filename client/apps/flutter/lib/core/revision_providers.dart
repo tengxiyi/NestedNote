@@ -247,3 +247,27 @@ final revisionDiffProvider =
             .toList(growable: false),
       );
     });
+
+/// 读取一次修订的内容快照（已投影为纯文本），供"恢复到这一版"使用。
+///
+/// 返回 `null` 表示该修订**没有内容快照**（启用快照之前的修订）——
+/// 此时不可恢复。`null` 与空字符串是两种状态：空字符串是"那一版
+/// 本来就是空的"，可以恢复（结果是清空正文，这必须让用户在确认框里
+/// 看见，而不是静默拒绝）；`null` 是"根本没有内容可恢复"。
+///
+/// 其它失败（数据库等）抛 [NoteFailure]。
+Future<String?> fetchRevisionSnapshot(String revisionId) async {
+  final rust.NoteResult result = await rust.notesRevisionSnapshot(
+    revisionId: revisionId,
+  );
+  if (result.ok) {
+    return result.value?.text ?? '';
+  }
+  if (result.code == 'SNAPSHOT_MISSING') {
+    return null;
+  }
+  throw NoteFailure(
+    code: result.code ?? 'UNKNOWN',
+    hint: result.hint ?? '读取快照失败。',
+  );
+}

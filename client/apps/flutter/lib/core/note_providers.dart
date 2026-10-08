@@ -731,3 +731,49 @@ final editorTextChannelProvider =
     NotifierProvider<EditorTextChannel, Future<void> Function(String)?>(
       EditorTextChannel.new,
     );
+
+// ------------------------------------------------------------ 编辑器重载通道
+
+/// 「让编辑器重新读一遍当前笔记」的通道。
+///
+/// ## 为什么恢复修订后必须重载编辑器
+///
+/// 恢复改的是**内核里的文档**，而编辑器手里的还是旧内容。若不重载，
+/// 编辑器的"已保存基准"仍是恢复前的文本——下一次自动保存会把
+/// **旧内容再写回去**，恢复等于白做。这是数据安全，不是刷新偏好。
+///
+/// 与 [`EditorSaveChannel`] 同一个模式（登记/注销/同一性校验），
+/// 因为要解决同一组生命周期问题：`initState` 不能改 provider、
+/// `dispose` 不能用 `ref`、快速替换时旧实例的注销不能抹掉新实例
+/// 的登记——这三个坑在 M1/M2 各踩过一次，见对应文档。
+class EditorReloadChannel extends Notifier<Future<void> Function()?> {
+  @override
+  Future<void> Function()? build() => null;
+
+  /// 编辑器挂载（下一帧）时登记自己的重载方法。
+  void register(Future<void> Function() reload) => state = reload;
+
+  /// 编辑器卸载时注销（同一性校验，理由见 `EditorSaveChannel`）。
+  void unregister(Future<void> Function() reload) {
+    if (state == reload) {
+      state = null;
+    }
+  }
+
+  /// 触发一次重载。返回 `false` 表示当前没有编辑器
+  ///（例如"只看列表"模式下——此时没有东西需要刷新）。
+  Future<bool> reloadNow() async {
+    final Future<void> Function()? reload = state;
+    if (reload == null) {
+      return false;
+    }
+    await reload();
+    return true;
+  }
+}
+
+/// 编辑器重载通道。
+final editorReloadChannelProvider =
+    NotifierProvider<EditorReloadChannel, Future<void> Function()?>(
+      EditorReloadChannel.new,
+    );

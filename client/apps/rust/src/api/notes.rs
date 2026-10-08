@@ -1503,6 +1503,47 @@ pub fn notes_revision_snapshot_count(id: &str) -> i64 {
     }
 }
 
+/// 读取一次修订的内容快照（已投影为纯文本）。
+///
+/// ## 这个函数为"恢复"而生
+///
+/// 恢复的语义是**用那一版的内容保存一次新修订**，而不是回滚历史
+///（铁律 T6：回滚会让"发生过什么"无法审计——当前版本仍留在链上，
+/// 随时可以再恢复回来）。因此恢复需要的是那一版的**内容**，
+/// 拿去走一遍既有的保存路径。
+///
+/// 这条路在 M2 之后才成立：文本/块投影做到无损往返，快照（块）→
+/// 文本 → 保存 → 反解回块，内容不变。在此之前的投影会拍平块类型，
+/// 恢复一篇带格式的笔记就会丢格式——那时做这个功能是危险的。
+///
+/// `SNAPSHOT_MISSING`：该修订没有内容快照（启用快照之前的修订），
+/// **不可恢复**。界面必须如实说明，而不是静默当成"空内容"恢复——
+/// 那会把用户的笔记清空。
+///
+/// 只收 `revision_id`：内核按修订标识取快照，不需要笔记标识；
+/// 收两个参数却只验一个，会让人误以为这里校验了归属关系。
+#[must_use]
+pub fn notes_revision_snapshot(revision_id: &str) -> NoteResult {
+    let revision = match parse_id(revision_id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| core.revision_snapshot(&revision)) {
+        Ok(Some(document)) => NoteResult::ok(NotePayload {
+            text: Some(document_to_text(&document)),
+            ..NotePayload::default()
+        }),
+        Ok(None) => NoteResult {
+            ok: false,
+            code: Some("SNAPSHOT_MISSING".to_owned()),
+            hint: Some("这一版没有内容快照（可能是启用快照之前的修订），无法恢复。".to_owned()),
+            debug_detail: None,
+            value: None,
+        },
+        Err(failure) => failure,
+    }
+}
+
 #[cfg(test)]
 mod limit_tests {
     use nested_core::{MAX_PAGE_SIZE, NestedCore, NoteQuery};
@@ -1624,6 +1665,65 @@ mod tests {
         assert_eq!(text, "第一行\n第二行", "内容必须能原样读回");
 
         assert!(notes_count() >= 1);
+    }
+
+    #[test]
+    fn revision_snapshot_returns_projected_text_for_restore() {
+        // ## 这条测试是"恢复"功能的地基
+        //
+        // 恢复 = 取旧快照的文本 → 走一遍保存。若快照投影出来的文本
+        // 与当年保存的不一致（块被拍平、空行丢失），恢复就会悄悄
+        // 改掉用户的历史内容——比不提供恢复更糟。
+        let (_dir, _guard) = fresh_engine();
+
+        let created = notes_create(None, "带历史的笔记", NOW);
+        assert!(created.ok, "创建失败：{:?}", created.hint);
+        let note = created.value.expect("payload").note.expect("note");
+
+        assert!(notes_save(&note.id, None, "第一版内容", NOW + 1).ok);
+        assert!(notes_save(&note.id, None, "第二版内容\n\n带空行", NOW + 2).ok);
+
+        let history = notes_revision_history(&note.id, 10);
+        assert!(history.ok, "历史读取失败：{:?}", history.hint);
+        let revisions = history.value.expect("payload").revisions;
+        // 创建即第 1 版（空内容），两次保存是第 2、3 版——
+        // 第一次写这个测试时误以为"第一次保存是第 1 版"，快照给出
+        // 空文本才发现。这也顺带验证了"创建会留快照"这件事。
+        assert!(revisions.len() >= 3, "创建 + 两次保存至少三条修订");
+
+        let second = revisions
+            .iter()
+            .find(|r| r.version == 2)
+            .expect("必须能找到第 2 版");
+        let snapshot = notes_revision_snapshot(&second.id);
+        assert!(snapshot.ok, "快照读取失败：{:?}", snapshot.hint);
+        assert_eq!(
+            snapshot.value.expect("payload").text.expect("text"),
+            "第一版内容",
+            "快照投影的文本必须与当年保存的一致（恢复的地基）"
+        );
+
+        // 空行也必须原样保留——这是 M2 修掉的投影缺陷的回归防线
+        let third = revisions
+            .iter()
+            .find(|r| r.version == 3)
+            .expect("必须能找到第 3 版");
+        let third_snap = notes_revision_snapshot(&third.id);
+        assert_eq!(
+            third_snap.value.expect("payload").text.expect("text"),
+            "第二版内容\n\n带空行",
+            "快照里的空行不能丢"
+        );
+    }
+
+    #[test]
+    fn revision_snapshot_reports_missing_snapshot_not_empty_text() {
+        // 不存在的修订 → NOT_FOUND（与"有修订但没快照"区分开）。
+        // 若把"没快照"静默处理成空文本，恢复会把用户的笔记清空。
+        let (_dir, _guard) = fresh_engine();
+        let failure = notes_revision_snapshot(&Id::new().to_string());
+        assert!(!failure.ok);
+        assert_eq!(failure.code.as_deref(), Some("NOT_FOUND"));
     }
 
     #[test]
