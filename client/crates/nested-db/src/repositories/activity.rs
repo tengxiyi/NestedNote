@@ -72,7 +72,7 @@ pub fn list_recent(connection: &Connection, limit: u32) -> Result<Vec<ActivityEv
         .map_err(DbError::from)?;
     let map = |row: &Row<'_>| -> rusqlite::Result<ActivityEvent> {
         Ok(ActivityEvent {
-            event_id: id_at(row, 0, "activity_event").map_err(rusqlite::Error::from)?,
+            event_id: id_at(row, 0, "activity_event")?,
             at_ms: timestamp_at(row, 1)?.as_millis(),
             kind: row.get(2)?,
             detail: row.get(3)?,
