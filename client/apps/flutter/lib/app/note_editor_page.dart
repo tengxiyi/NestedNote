@@ -39,8 +39,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/layout_providers.dart';
+import '../core/blocks.dart';
 import '../core/note_providers.dart';
 import 'attachments_dialog.dart';
+import 'document_view.dart';
 import 'block_format.dart';
 import 'icons.dart';
 import 'typography.dart';
@@ -147,6 +149,12 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   /// 重载通道（恢复修订后由它让编辑器重新读内核；见通道文档）。
   EditorReloadChannel? _reloadChannel;
 
+  /// 是否处于**预览态**（R1 富显示，见 09 方案）。
+  bool _previewing = false;
+
+  /// 预览的加载_future（进入预览时创建一次，重建不重取）。
+  Future<List<UiBlock>>? _previewFuture;
+
   @override
   void initState() {
     super.initState();
@@ -203,6 +211,10 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     if (_loading || _loadError != null) {
       return;
     }
+    // 预览态下套用格式用户看不见效果——先切回编辑再套
+    if (_previewing) {
+      setState(() => _previewing = false);
+    }
     final BlockFormat? format = BlockFormats.byId(formatId);
     final TextEditingController controller = _controller;
     final TextSelection selection = controller.selection;
@@ -231,6 +243,24 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     // 让"已修改"状态与自动保存都跟上（用户点菜单也是一次编辑）
     _onChanged('');
     await _save();
+  }
+
+  /// 切换预览/编辑。
+  ///
+  /// 进入预览前**先保存当前编辑**：预览读的是内核里的文档，
+  /// 不先保存的话看到的是旧内容——那是在向用户展示错误的事实。
+  Future<void> _togglePreview() async {
+    final bool turningOn = !_previewing;
+    if (turningOn && _dirty) {
+      await _save();
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _previewing = turningOn;
+      _previewFuture = turningOn ? fetchNoteBlocks(widget.noteId) : null;
+    });
   }
 
   /// 附加一个文件到当前笔记。
@@ -438,109 +468,140 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
         // 三栏布局下没有整页 AppBar，因此这些控件必须有自己的位置。
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
-          child: Row(
-            children: <Widget>[
-              if (_saving)
-                const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              else
-                Icon(kSavedIcon, size: 16, color: theme.colorScheme.outline),
-              const SizedBox(width: 8),
-              // 字数与阅读时长。放在保存状态**旁边**而不是角落：
-              // 写作时它就在视线里，但又不抢保存状态的戏。
-              //
-              // 用 `Flexible` 而不是裸 `Text`：三栏布局下编辑器可能只有
-              // 二百多逻辑像素宽，这行会**溢出**——那是渲染异常，
-              // 测试抓出来的。可收缩 + 省略号是唯一两全的办法。
-              Flexible(
-                child: Text(
-                  countWords(_controller.text).summary,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: theme.colorScheme.outline,
+          child: LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              // 窄面板（三栏布局挤压编辑器）时隐藏字数：
+              // 横向滚动容器里的 Expanded/Flexible 会失去边界直接报错，
+              // 所以"塞进滚动条"不是解法——按宽度降级才是。
+              final bool compact = constraints.maxWidth < 430;
+              return Row(
+                children: <Widget>[
+                  if (_saving)
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  else
+                    Icon(
+                      kSavedIcon,
+                      size: 16,
+                      color: theme.colorScheme.outline,
+                    ),
+                  const SizedBox(width: 8),
+                  // 字数与阅读时长。放在保存状态**旁边**而不是角落：
+                  // 写作时它就在视线里，但又不抢保存状态的戏。
+                  //
+                  // 用 `Flexible` 而不是裸 `Text`：三栏布局下编辑器可能只有
+                  // 二百多逻辑像素宽，这行会**溢出**——那是渲染异常，
+                  // 测试抓出来的。可收缩 + 省略号是唯一两全的办法。
+                  // 窄面板（compact）整块隐藏：按钮组比字数更不能少。
+                  if (!compact)
+                    Flexible(
+                      child: Text(
+                        countWords(_controller.text).summary,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: theme.colorScheme.outline,
+                        ),
+                      ),
+                    ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _saving
+                          ? '正在保存…'
+                          : (_autoSaveFailed
+                                ? '自动保存失败'
+                                : (_dirty ? '有未保存的改动' : '已保存')),
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: _autoSaveFailed ? theme.colorScheme.error : null,
+                      ),
+                    ),
                   ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  _saving
-                      ? '正在保存…'
-                      : (_autoSaveFailed
-                            ? '自动保存失败'
-                            : (_dirty ? '有未保存的改动' : '已保存')),
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: _autoSaveFailed ? theme.colorScheme.error : null,
+                  if (!compact)
+                    IconButton(
+                      tooltip: '标签',
+                      visualDensity: VisualDensity.compact,
+                      // 与"修订历史"同样的理由：先保存再改标签，
+                      // 避免用户以为标签没生效。
+                      onPressed: () {
+                        if (_dirty) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('请先保存，再编辑标签。')),
+                          );
+                          return;
+                        }
+                        showTagEditor(
+                          context,
+                          noteId: widget.noteId,
+                          noteTitle: _noteTitle(ref),
+                        );
+                      },
+                      icon: const Icon(kEditTagsIcon, size: 20),
+                    ),
+                  if (!compact)
+                    IconButton(
+                      tooltip: '修订历史',
+                      visualDensity: VisualDensity.compact,
+                      // 有未保存改动时提示先保存：否则用户会在历史里找不到
+                      // 自己刚写的内容，以为丢了。
+                      onPressed: () {
+                        if (_dirty) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('请先保存，再查看修订历史。')),
+                          );
+                          return;
+                        }
+                        showRevisionHistory(
+                          context,
+                          noteId: widget.noteId,
+                          noteTitle: _noteTitle(ref),
+                        );
+                      },
+                      icon: const Icon(kHistoryIcon, size: 20),
+                    ),
+                  IconButton(
+                    tooltip: '附加文件',
+                    visualDensity: VisualDensity.compact,
+                    // 附加的流程是"先保存 → 内核把块写进文档 → 重新加载"。
+                    // 有未保存改动时**不弹提示而是直接保存**——附加本身就要
+                    // 保存一次，让用户多点一步没有意义。
+                    onPressed: () => unawaited(_attachFile()),
+                    icon: const Icon(Icons.attach_file, size: 20),
                   ),
-                ),
-              ),
-              IconButton(
-                tooltip: '标签',
-                visualDensity: VisualDensity.compact,
-                // 与"修订历史"同样的理由：先保存再改标签，
-                // 避免用户以为标签没生效。
-                onPressed: () {
-                  if (_dirty) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('请先保存，再编辑标签。')),
-                    );
-                    return;
-                  }
-                  showTagEditor(
-                    context,
-                    noteId: widget.noteId,
-                    noteTitle: _noteTitle(ref),
-                  );
-                },
-                icon: const Icon(kEditTagsIcon, size: 20),
-              ),
-              IconButton(
-                tooltip: '修订历史',
-                visualDensity: VisualDensity.compact,
-                // 有未保存改动时提示先保存：否则用户会在历史里找不到
-                // 自己刚写的内容，以为丢了。
-                onPressed: () {
-                  if (_dirty) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('请先保存，再查看修订历史。')),
-                    );
-                    return;
-                  }
-                  showRevisionHistory(
-                    context,
-                    noteId: widget.noteId,
-                    noteTitle: _noteTitle(ref),
-                  );
-                },
-                icon: const Icon(kHistoryIcon, size: 20),
-              ),
-              IconButton(
-                tooltip: '附加文件',
-                visualDensity: VisualDensity.compact,
-                // 附加的流程是"先保存 → 内核把块写进文档 → 重新加载"。
-                // 有未保存改动时**不弹提示而是直接保存**——附加本身就要
-                // 保存一次，让用户多点一步没有意义。
-                onPressed: () => unawaited(_attachFile()),
-                icon: const Icon(Icons.attach_file, size: 20),
-              ),
-              IconButton(
-                tooltip: '附件列表',
-                visualDensity: VisualDensity.compact,
-                onPressed: () =>
-                    showAttachmentsDialog(context, ref, noteId: widget.noteId),
-                icon: const Icon(Icons.folder_zip_outlined, size: 20),
-              ),
-              IconButton(
-                tooltip: '立即保存',
-                visualDensity: VisualDensity.compact,
-                onPressed: _dirty ? _save : null,
-                icon: const Icon(kSaveIcon, size: 20),
-              ),
-            ],
+                  if (!compact)
+                    IconButton(
+                      tooltip: '附件列表',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => showAttachmentsDialog(
+                        context,
+                        ref,
+                        noteId: widget.noteId,
+                      ),
+                      icon: const Icon(Icons.folder_zip_outlined, size: 20),
+                    ),
+                  IconButton(
+                    tooltip: _previewing ? '返回编辑' : '预览（按块渲染）',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => unawaited(_togglePreview()),
+                    icon: Icon(
+                      _previewing
+                          ? Icons.edit_outlined
+                          : Icons.visibility_outlined,
+                      size: 20,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '立即保存',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _dirty ? _save : null,
+                    icon: const Icon(kSaveIcon, size: 20),
+                  ),
+                ],
+              );
+            },
           ),
         ),
         const Divider(height: 1),
@@ -570,30 +631,64 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
           ),
         ),
         Expanded(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
-            child: TextField(
-              controller: _controller,
-              focusNode: _bodyFocus,
-              maxLines: null,
-              expands: true,
-              textAlignVertical: TextAlignVertical.top,
-              keyboardType: TextInputType.multiline,
-              // 字号按用户设置的倍率缩放（Ctrl+= / Ctrl+- / Ctrl+0）。
-              // 只缩放正文：界面文字是设计好的，放大它们只会让布局变乱。
-              style: theme.textTheme.bodyLarge?.copyWith(
-                fontSize:
-                    (theme.textTheme.bodyLarge?.fontSize ?? 16) * fontScale,
-              ),
-              decoration: const InputDecoration(
-                border: InputBorder.none,
-                hintText:
-                    '开始写点什么…\n\n'
-                    '（P1 编辑器为纯文本：每行会保存为一个段落块。停止输入后会自动保存。）',
-              ),
-              onChanged: _onChanged,
-            ),
-          ),
+          child: _previewing
+              ? Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+                  child: FutureBuilder<List<UiBlock>>(
+                    future: _previewFuture,
+                    builder:
+                        (
+                          BuildContext context,
+                          AsyncSnapshot<List<UiBlock>> snapshot,
+                        ) {
+                          if (snapshot.connectionState !=
+                              ConnectionState.done) {
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          }
+                          if (snapshot.hasError) {
+                            return Center(
+                              child: Text(
+                                '预览读取失败：${snapshot.error}',
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.error,
+                                ),
+                              ),
+                            );
+                          }
+                          return DocumentView(
+                            blocks: snapshot.data ?? const <UiBlock>[],
+                            noteId: widget.noteId,
+                          );
+                        },
+                  ),
+                )
+              : Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+                  child: TextField(
+                    controller: _controller,
+                    focusNode: _bodyFocus,
+                    maxLines: null,
+                    expands: true,
+                    textAlignVertical: TextAlignVertical.top,
+                    keyboardType: TextInputType.multiline,
+                    // 字号按用户设置的倍率缩放（Ctrl+= / Ctrl+- / Ctrl+0）。
+                    // 只缩放正文：界面文字是设计好的，放大它们只会让布局变乱。
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      fontSize:
+                          (theme.textTheme.bodyLarge?.fontSize ?? 16) *
+                          fontScale,
+                    ),
+                    decoration: const InputDecoration(
+                      border: InputBorder.none,
+                      hintText:
+                          '开始写点什么…\n\n'
+                          '（P1 编辑器为纯文本：每行会保存为一个段落块。停止输入后会自动保存。）',
+                    ),
+                    onChanged: _onChanged,
+                  ),
+                ),
         ),
       ],
     );

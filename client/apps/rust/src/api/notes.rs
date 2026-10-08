@@ -108,6 +108,10 @@ pub struct NotePayload {
     pub notes: Vec<NoteSummary>,
     /// 纯文本内容（读取时返回，行内标记已展平）。
     pub text: Option<String>,
+    /// 块文档的 JSON（`notes_read_document` 返回）。
+    ///
+    /// 与落库字节同源（同一套 serde 定义），Dart 渲染它 = 渲染真正存储的东西。
+    pub document_json: Option<String>,
     /// 笔记本（创建笔记本时返回）。
     pub notebook: Option<NotebookNode>,
     /// 笔记本树（树查询返回，已按展开顺序排列）。
@@ -567,6 +571,40 @@ pub fn notes_create(notebook_id: Option<String>, title: &str, at_ms: i64) -> Not
     }) {
         Ok(note) => NoteResult::ok(NotePayload {
             note: Some(summary_of(&note)),
+            ..NotePayload::default()
+        }),
+        Err(failure) => failure,
+    }
+}
+
+/// 读取一篇笔记的**块文档**（JSON 形态，供富显示渲染）。
+///
+/// ## 为什么是 JSON 而不是镜像枚举
+///
+/// `Block` 的 serde JSON（`tag = "type"`、snake_case）与**落库字节同源**
+/// ——同一套 serde 定义。Dart 渲染这段 JSON = 渲染真正存储的东西，
+/// 不存在"投影是 A、存储是 B"的第二事实。
+///
+/// 也排查过 FRB 镜像枚举方案：跨 crate 的枚举要么把定义搬进契约面
+/// （重复），要么被当 opaque（`MaintenanceResult`/`ActivityEntry`
+/// 都踩过）。JSON 是这条路上最不容易撒谎的形态。
+///
+/// 序列化失败映射到 [`CoreError::Config`]：它意味着内核自己的
+/// 不变量被破坏（落库内容反序列化得回来、却序列化不出去），
+/// 比"数据库错误"更准确地指向要排查的方向。
+#[must_use]
+pub fn notes_read_document(id: &str) -> NoteResult {
+    let parsed = match parse_id(id) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    match with_core(|core| {
+        let document = core.get_note_document(&parsed)?;
+        serde_json::to_string(&document)
+            .map_err(|error| CoreError::Config(format!("文档序列化失败：{error}")))
+    }) {
+        Ok(json) => NoteResult::ok(NotePayload {
+            document_json: Some(json),
             ..NotePayload::default()
         }),
         Err(failure) => failure,
@@ -1724,6 +1762,24 @@ mod tests {
         let failure = notes_revision_snapshot(&Id::new().to_string());
         assert!(!failure.ok);
         assert_eq!(failure.code.as_deref(), Some("NOT_FOUND"));
+    }
+
+    #[test]
+    fn document_json_reflects_stored_blocks() {
+        // 富显示的地基：read_document 的 JSON 必须与落库块同源。
+        // 若有人改了序列化（比如把 tag 改名），这里的断言会先炸——
+        // 而不是让界面的预览静默变成一片空白。
+        let (_dir, _guard) = fresh_engine();
+        let created = notes_create(None, "富显示", NOW);
+        let note = created.value.expect("payload").note.expect("note");
+        assert!(notes_save(&note.id, None, "# 标题\n- 项\n\n正文", NOW + 1).ok);
+
+        let read = notes_read_document(&note.id);
+        assert!(read.ok, "读取失败：{:?}", read.hint);
+        let json = read.value.expect("payload").document_json.expect("json");
+        assert!(json.contains(r#""type":"heading""#), "JSON: {json}");
+        assert!(json.contains(r#""type":"list""#), "JSON: {json}");
+        assert!(json.contains(r#""type":"paragraph""#), "JSON: {json}");
     }
 
     #[test]
