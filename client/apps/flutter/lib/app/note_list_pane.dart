@@ -24,6 +24,7 @@ import '../core/note_providers.dart';
 import '../core/trash_providers.dart';
 import 'dialogs.dart';
 import 'icons.dart';
+import 'merge_notes.dart';
 import 'note_actions.dart';
 import 'typography.dart';
 
@@ -94,7 +95,7 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        if (widget.showDeleted && _selecting)
+        if (_selecting)
           _selectionBar(notes.value ?? const <NoteItem>[], theme)
         else
           _header(context, notes, notebookName, notebookId, theme),
@@ -156,10 +157,10 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
             selected: note.id == widget.openNote?.id,
             retentionDays: widget.showDeleted ? retention : null,
             // 多选模式下显示勾选框，点击即勾选（而不是打开笔记）
-            selectable: widget.showDeleted && _selecting,
+            selectable: _selecting,
             checked: _selected.contains(note.id),
             onTap: () {
-              if (widget.showDeleted && _selecting) {
+              if (_selecting) {
                 _toggle(note.id);
               } else {
                 widget.onOpenNote(note);
@@ -225,21 +226,78 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
             child: Text(allSelected ? '取消全选' : '全选'),
           ),
           const SizedBox(width: 4),
-          FilledButton.tonal(
-            // 一条都没勾时禁用，而不是弹一个"请先选择"——
-            // 按钮变灰本身就说明了原因，少一次打断。
-            onPressed: count == 0
-                ? null
-                : () => _purgeSelected(_selected.intersection(visibleIds)),
-            style: FilledButton.styleFrom(
-              backgroundColor: theme.colorScheme.errorContainer,
-              foregroundColor: theme.colorScheme.onErrorContainer,
+          if (widget.showDeleted)
+            FilledButton.tonal(
+              // 一条都没勾时禁用，而不是弹一个"请先选择"——
+              // 按钮变灰本身就说明了原因，少一次打断。
+              onPressed: count == 0
+                  ? null
+                  : () => _purgeSelected(_selected.intersection(visibleIds)),
+              style: FilledButton.styleFrom(
+                backgroundColor: theme.colorScheme.errorContainer,
+                foregroundColor: theme.colorScheme.onErrorContainer,
+              ),
+              child: const Text('彻底删除'),
+            )
+          else
+            FilledButton(
+              // 合并至少要两篇：一篇没有"合并"可言
+              onPressed: count < 2
+                  ? null
+                  : () => _mergeSelected(visible, _selected),
+              child: const Text('合并所选'),
             ),
-            child: const Text('彻底删除'),
-          ),
         ],
       ),
     );
+  }
+
+  /// 合并所选笔记。
+  ///
+  /// 顺序按**列表从上到下**（用户看到的第 1、2 篇），不是勾选先后——
+  /// 勾选顺序是操作细节，列表顺序才是用户心里的次序。
+  Future<void> _mergeSelected(
+    List<NoteItem> visible,
+    Set<String> selectedIds,
+  ) async {
+    // 按列表顺序取所选（_selected 里的 id 可能含已被过滤掉的）
+    final List<NoteItem> ordered = <NoteItem>[
+      for (final NoteItem note in visible)
+        if (selectedIds.contains(note.id)) note,
+    ];
+    if (ordered.length < 2) {
+      return;
+    }
+    final MergePlan? plan = await showMergeDialog(context, ref, notes: ordered);
+    if (plan == null || !mounted) {
+      return;
+    }
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    try {
+      final CreatedNote created = await ref
+          .read(noteActionsProvider)
+          .create(notebookId: ref.read(selectedNotebookIdProvider));
+      await ref
+          .read(noteActionsProvider)
+          .save(created.id, title: plan.title, text: plan.text);
+      // 打开合并产物（从覆盖层取摘要；创建路径已 patch 过）
+      final NoteItem? fresh = ref
+          .read(noteListMergedProvider(const NoteListQuery()))
+          .value
+          ?.where((NoteItem n) => n.id == created.id)
+          .firstOrNull;
+      if (fresh != null) {
+        widget.onOpenNote(fresh);
+      }
+      _exitSelection();
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('已合并 ${ordered.length} 篇为新笔记「${plan.title}」。原笔记保留不动。'),
+        ),
+      );
+    } on NoteFailure catch (failure) {
+      messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
+    }
   }
 
   /// 批量彻底删除，**一次确认**，然后如实回报逐条结果。
@@ -316,6 +374,13 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
               ],
             ),
           ),
+          if (!widget.showDeleted)
+            IconButton(
+              tooltip: '多选（合并笔记）',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => setState(() => _selecting = true),
+              icon: const Icon(Icons.checklist, size: 20),
+            ),
           IconButton(
             tooltip: widget.showDeleted ? '回收站中不能新建' : '在此新建笔记',
             visualDensity: VisualDensity.compact,
