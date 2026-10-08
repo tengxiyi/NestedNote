@@ -14,7 +14,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/typography.dart';
+import 'package:nestednote/app/typography.dart';
 
 void main() {
   group('字体栈', () {

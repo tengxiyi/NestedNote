@@ -16,18 +16,18 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/block_format.dart';
-import 'package:nested/app/menu_bar.dart';
-import 'package:nested/app/note_list_pane.dart';
-import 'package:nested/app/note_editor_page.dart';
-import 'package:nested/app/notes_page.dart';
-import 'package:nested/app/notebook_sidebar.dart';
-import 'package:nested/app/shortcuts.dart';
-import 'package:nested/app/shortcuts_host.dart';
-import 'package:nested/core/engine_providers.dart';
-import 'package:nested/core/layout_providers.dart';
-import 'package:nested/core/notebook_providers.dart';
-import 'package:nested/core/note_providers.dart';
+import 'package:nestednote/app/block_format.dart';
+import 'package:nestednote/app/menu_bar.dart';
+import 'package:nestednote/app/note_list_pane.dart';
+import 'package:nestednote/app/note_editor_page.dart';
+import 'package:nestednote/app/notes_page.dart';
+import 'package:nestednote/app/notebook_sidebar.dart';
+import 'package:nestednote/app/shortcuts.dart';
+import 'package:nestednote/app/shortcuts_host.dart';
+import 'package:nestednote/core/engine_providers.dart';
+import 'package:nestednote/core/layout_providers.dart';
+import 'package:nestednote/core/notebook_providers.dart';
+import 'package:nestednote/core/note_providers.dart';
 
 import 'widget_test.dart' show fakeEngineStatus;
 

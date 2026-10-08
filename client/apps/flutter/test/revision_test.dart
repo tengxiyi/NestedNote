@@ -11,8 +11,8 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/revision_history.dart';
-import 'package:nested/core/revision_providers.dart';
+import 'package:nestednote/app/revision_history.dart';
+import 'package:nestednote/core/revision_providers.dart';
 
 void main() {
   group('缺快照的说明', () {

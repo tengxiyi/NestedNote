@@ -22,15 +22,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/app.dart';
-import 'package:nested/app/note_list_pane.dart';
-import 'package:nested/app/notebook_sidebar.dart';
-import 'package:nested/app/notes_page.dart';
-import 'package:nested/core/engine.dart';
-import 'package:nested/core/engine_providers.dart';
-import 'package:nested/core/notebook_providers.dart';
-import 'package:nested/app/icons.dart';
-import 'package:nested/core/note_providers.dart';
+import 'package:nestednote/app/app.dart';
+import 'package:nestednote/app/note_list_pane.dart';
+import 'package:nestednote/app/notebook_sidebar.dart';
+import 'package:nestednote/app/notes_page.dart';
+import 'package:nestednote/core/engine.dart';
+import 'package:nestednote/core/engine_providers.dart';
+import 'package:nestednote/core/notebook_providers.dart';
+import 'package:nestednote/app/icons.dart';
+import 'package:nestednote/core/note_providers.dart';
 
 /// 一个"引擎已就绪"的假状态。
 EngineStatus fakeEngineStatus() => const EngineStatus(

@@ -19,10 +19,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/notes_page.dart';
-import 'package:nested/core/engine_providers.dart';
-import 'package:nested/core/notebook_providers.dart';
-import 'package:nested/core/note_providers.dart';
+import 'package:nestednote/app/notes_page.dart';
+import 'package:nestednote/core/engine_providers.dart';
+import 'package:nestednote/core/notebook_providers.dart';
+import 'package:nestednote/core/note_providers.dart';
 
 import 'widget_test.dart' show fakeEngineStatus;
 

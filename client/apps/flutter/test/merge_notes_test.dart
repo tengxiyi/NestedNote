@@ -9,7 +9,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/merge_notes.dart';
+import 'package:nestednote/app/merge_notes.dart';
 
 void main() {
   group('composeMergedText', () {

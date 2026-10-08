@@ -10,7 +10,7 @@
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/block_format.dart';
+import 'package:nestednote/app/block_format.dart';
 
 /// 便捷：对**整段文本**套用格式（全选）。
 ///

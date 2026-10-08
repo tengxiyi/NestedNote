@@ -26,9 +26,9 @@
 
 import 'dart:io';
 
-import 'package:nested/src/rust/api/branding.dart';
-import 'package:nested/src/rust/api/notes.dart' as rust;
-import 'package:nested/src/rust/frb_generated.dart';
+import 'package:nestednote/src/rust/api/branding.dart';
+import 'package:nestednote/src/rust/api/notes.dart' as rust;
+import 'package:nestednote/src/rust/frb_generated.dart';
 
 import 'app_paths.dart';
 

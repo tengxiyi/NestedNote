@@ -8,7 +8,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/word_count.dart';
+import 'package:nestednote/app/word_count.dart';
 
 void main() {
   group('CJK 按字计', () {

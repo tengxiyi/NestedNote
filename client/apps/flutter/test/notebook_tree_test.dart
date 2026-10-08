@@ -17,9 +17,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/icons.dart';
-import 'package:nested/app/notebook_sidebar.dart';
-import 'package:nested/core/notebook_providers.dart';
+import 'package:nestednote/app/icons.dart';
+import 'package:nestednote/app/notebook_sidebar.dart';
+import 'package:nestednote/core/notebook_providers.dart';
 
 /// 造一个笔记本节点。
 NotebookNode nb({

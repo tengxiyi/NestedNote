@@ -24,8 +24,8 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:nested/core/engine_providers.dart';
-import 'package:nested/src/rust/api/notes.dart';
+import 'package:nestednote/core/engine_providers.dart';
+import 'package:nestednote/src/rust/api/notes.dart';
 
 /// 定位 Rust 动态库目录：`client/target/release`。
 ///

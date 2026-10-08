@@ -8,8 +8,8 @@
 
 import 'dart:io';
 
-import 'package:nested/src/rust/api/notes.dart';
-import 'package:nested/src/rust/frb_generated.dart';
+import 'package:nestednote/src/rust/api/notes.dart';
+import 'package:nestednote/src/rust/frb_generated.dart';
 
 Future<void> main() async {
   final dir = Directory.systemTemp.createTempSync('nested-depth-');

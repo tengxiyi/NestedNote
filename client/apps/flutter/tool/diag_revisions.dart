@@ -2,8 +2,8 @@
 // 诊断脚本：观察"保存 → 修订记录"的真实行为，定位多出来的那一条。
 import 'dart:io';
 
-import 'package:nested/src/rust/api/notes.dart';
-import 'package:nested/src/rust/frb_generated.dart';
+import 'package:nestednote/src/rust/api/notes.dart';
+import 'package:nestednote/src/rust/frb_generated.dart';
 
 void dump(String label, List<RevisionEntry> list) {
   stdout.writeln('--- $label: ${list.length} 条 ---');

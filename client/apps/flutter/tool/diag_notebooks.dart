@@ -2,8 +2,8 @@
 // 诊断脚本：直接调用笔记本树与按笔记本过滤的笔记列表，确认内核返回什么。
 import 'dart:io';
 
-import 'package:nested/src/rust/api/notes.dart';
-import 'package:nested/src/rust/frb_generated.dart';
+import 'package:nestednote/src/rust/api/notes.dart';
+import 'package:nestednote/src/rust/frb_generated.dart';
 
 import 'app_paths.dart';
 

@@ -12,8 +12,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nested/app/document_view.dart';
-import 'package:nested/core/blocks.dart';
+import 'package:nestednote/app/document_view.dart';
+import 'package:nestednote/core/blocks.dart';
 
 void main() {
   group('JSON → UiBlock 解析', () {
@@ -108,6 +108,8 @@ void main() {
   group('DocumentView 渲染冒烟', () {
     testWidgets('标题/待办/代码/附件卡都出现', (WidgetTester tester) async {
       await tester.pumpWidget(
+        // ProviderScope 无 const 构造（有状态），这里关掉该 lint 的误报
+        // ignore: prefer_const_constructors
         ProviderScope(
           child: const MaterialApp(
             home: Scaffold(
