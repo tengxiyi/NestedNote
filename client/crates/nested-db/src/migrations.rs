@@ -50,6 +50,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0003_revision_documents",
         sql: include_str!("../../../migrations/0003_revision_documents.sql"),
     },
+    // 0004：活动日志（铁律 T1"可追溯"的兑现）。
+    // 只记维护/破坏性事件（回收站清理、附件 GC、完整性核对）；
+    // 笔记级变更修订历史已经覆盖，重复记一遍是噪音。
+    Migration {
+        version: 4,
+        name: "0004_activity_log",
+        sql: include_str!("../../../migrations/0004_activity_log.sql"),
+    },
 ];
 
 /// 当前程序支持的最高数据库版本。

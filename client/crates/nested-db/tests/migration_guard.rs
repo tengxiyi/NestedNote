@@ -40,6 +40,10 @@ const MIGRATION_HASHES: &[(&str, &str)] = &[
         "0003_revision_documents.sql",
         "8aafa535f57688385dc7c1456ed4888f2e208f3d66de327eb893095059dc6037",
     ),
+    (
+        "0004_activity_log.sql",
+        "4b4976e0a3672ad51ac0811e204e9a82ccb4b5cb6e73017d3117a016833fcfd7",
+    ),
 ];
 
 /// 定位迁移目录：`client/migrations`。

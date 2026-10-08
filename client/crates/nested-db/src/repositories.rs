@@ -5,6 +5,7 @@
 //! - 涉及多表的业务操作**必须**由调用方放进同一个事务（铁律 D1）；
 //! - 删除一律软删除（铁律 T7 / D2），物理删除只允许出现在 GC 模块（尚未实现）。
 
+pub mod activity;
 pub mod attachments;
 pub mod notebooks;
 pub mod notes;
