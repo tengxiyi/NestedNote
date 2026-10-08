@@ -86,13 +86,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 迁移文件必须是 LF
+      - name: 源码与迁移文件必须是 LF
         run: |
-          if grep -rIl $'\r' client/migrations server/migrations shared 2>/dev/null; then
-            echo "以下文件含 CR，必须为 LF（会破坏迁移哈希保护）"
+          # 用 `git ls-files` 而不是 `grep -r`：它只列**已跟踪**的文件，
+          # 天然排除 target/、build/、.dart_tool/ 这些生成物，
+          # 也不必去猜哪些子目录该跳过。
+          #
+          # 覆盖范围要与 `scripts/normalize-line-endings.ps1` 一致——
+          # 两边不一致时会出现"本地过、CI 挂"（或反过来），排查起来很费劲。
+          #
+          # 背景：这个门禁曾经只覆盖 migrations 与 shared，结果
+          # `client/**/*.rs` 与 `client/**/*.dart` **从未被检查过**。
+          # 详见 docs/03-踩坑备忘.md §8.5。
+          files=$(git ls-files \
+            '*.rs' '*.dart' '*.sql' '*.md' '*.ps1' '*.yaml' '*.yml' \
+            'justfile' '.gitattributes')
+          if [ -z "$files" ]; then
+            echo "FAIL: 没有匹配到任何文件——覆盖范围失效了。"
+            echo "      一个永远通过的门禁比没有门禁更危险。"
             exit 1
           fi
-          echo "OK: 迁移与共享源码均为 LF"
+          count=$(echo "$files" | wc -l)
+          # 自检：源码必须在覆盖范围内，否则这个门禁是空转的
+          for ext in '\.rs$' '\.dart$' '\.sql$'; do
+            if ! echo "$files" | grep -qE "$ext"; then
+              echo "FAIL: 覆盖范围里没有 $ext 的文件——门禁失效了。"
+              exit 1
+            fi
+          done
+          offenders=$(echo "$files" | xargs grep -lI $'\r' 2>/dev/null || true)
+          if [ -n "$offenders" ]; then
+            echo "以下文件含 CR，必须为 LF（会破坏迁移哈希保护）："
+            echo "$offenders"
+            exit 1
+          fi
+          echo "OK: $count 个文件均为 LF（rust/dart/sql 都在覆盖范围内）"
 
   # ---------------------------------------------------------------- 客户端
   client:
