@@ -38,10 +38,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/layout_providers.dart';
 import '../core/note_providers.dart';
+import 'attachments_dialog.dart';
 import 'block_format.dart';
 import 'icons.dart';
 import 'typography.dart';
+import 'word_count.dart';
 import 'revision_history.dart';
 import 'tag_editor.dart';
 
@@ -221,6 +224,30 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     await _save();
   }
 
+  /// 附加一个文件到当前笔记。
+  ///
+  /// 流程（顺序是正确性的一部分，见 [attachFileToNote] 的说明）：
+  /// 先保存当前编辑（若有），再让内核附加并写块，最后重新加载正文。
+  Future<void> _attachFile() async {
+    if (_dirty) {
+      await _save();
+    }
+    if (!mounted) {
+      return;
+    }
+    // `attachFileToNote` 不收 BuildContext（见它的说明），
+    // 因此这里唯一的异步间隙守卫就是 State 自己的 `mounted`。
+    final String? failure = await pickAndAttachFile(
+      noteId: widget.noteId,
+      reloadNote: _load,
+    );
+    if (failure != null && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(failure)));
+    }
+  }
+
   /// 登记给菜单用的保存方法。
   ///
   /// 存成字段是为了 `unregister` 时能做**同一性校验**：
@@ -378,6 +405,8 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
+    // 字号倍率只影响正文（见正文 style 处的说明）
+    final double fontScale = ref.watch(editorFontScaleProvider);
 
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
@@ -409,6 +438,23 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
               else
                 Icon(kSavedIcon, size: 16, color: theme.colorScheme.outline),
               const SizedBox(width: 8),
+              // 字数与阅读时长。放在保存状态**旁边**而不是角落：
+              // 写作时它就在视线里，但又不抢保存状态的戏。
+              //
+              // 用 `Flexible` 而不是裸 `Text`：三栏布局下编辑器可能只有
+              // 二百多逻辑像素宽，这行会**溢出**——那是渲染异常，
+              // 测试抓出来的。可收缩 + 省略号是唯一两全的办法。
+              Flexible(
+                child: Text(
+                  countWords(_controller.text).summary,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.outline,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
               Expanded(
                 child: Text(
                   _saving
@@ -462,6 +508,22 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                 icon: const Icon(kHistoryIcon, size: 20),
               ),
               IconButton(
+                tooltip: '附加文件',
+                visualDensity: VisualDensity.compact,
+                // 附加的流程是"先保存 → 内核把块写进文档 → 重新加载"。
+                // 有未保存改动时**不弹提示而是直接保存**——附加本身就要
+                // 保存一次，让用户多点一步没有意义。
+                onPressed: () => unawaited(_attachFile()),
+                icon: const Icon(Icons.attach_file, size: 20),
+              ),
+              IconButton(
+                tooltip: '附件列表',
+                visualDensity: VisualDensity.compact,
+                onPressed: () =>
+                    showAttachmentsDialog(context, ref, noteId: widget.noteId),
+                icon: const Icon(Icons.folder_zip_outlined, size: 20),
+              ),
+              IconButton(
                 tooltip: '立即保存',
                 visualDensity: VisualDensity.compact,
                 onPressed: _dirty ? _save : null,
@@ -506,7 +568,12 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
               expands: true,
               textAlignVertical: TextAlignVertical.top,
               keyboardType: TextInputType.multiline,
-              style: theme.textTheme.bodyLarge,
+              // 字号按用户设置的倍率缩放（Ctrl+= / Ctrl+- / Ctrl+0）。
+              // 只缩放正文：界面文字是设计好的，放大它们只会让布局变乱。
+              style: theme.textTheme.bodyLarge?.copyWith(
+                fontSize:
+                    (theme.textTheme.bodyLarge?.fontSize ?? 16) * fontScale,
+              ),
               decoration: const InputDecoration(
                 border: InputBorder.none,
                 hintText:

@@ -29,11 +29,13 @@ import '../core/layout_providers.dart';
 import '../core/notebook_providers.dart';
 import '../core/note_providers.dart';
 import 'about_dialog.dart';
+import 'attachments_dialog.dart';
 import 'block_format.dart';
 import 'dialogs.dart';
 import 'note_actions.dart';
 import 'shortcuts_dialog.dart';
 import 'icons.dart';
+import 'settings_dialog.dart';
 import 'shortcuts.dart';
 
 /// 顶部菜单栏。
@@ -52,6 +54,7 @@ class AppMenuBar extends ConsumerWidget {
         _viewMenu(context, ref),
         _noteMenu(context, ref),
         _formatMenu(context, ref),
+        _toolsMenu(context, ref),
         _helpMenu(context, ref),
       ],
     );
@@ -199,6 +202,13 @@ class AppMenuBar extends ConsumerWidget {
         ),
         const Divider(),
         MenuItemButton(
+          leadingIcon: const Icon(Icons.folder_zip_outlined, size: 18),
+          onPressed: has
+              ? () => showAttachmentsDialog(context, ref, noteId: note.id)
+              : null,
+          child: const Text('附件…'),
+        ),
+        MenuItemButton(
           leadingIcon: const Icon(kHistoryIcon, size: 18),
           onPressed: has ? () => showNoteHistory(context, ref, note) : null,
           child: const Text('修订历史…'),
@@ -287,6 +297,8 @@ class AppMenuBar extends ConsumerWidget {
   Widget _viewMenu(BuildContext context, WidgetRef ref) {
     final PaneLayout layout = ref.watch(paneLayoutProvider);
     final bool sidebarCollapsed = ref.watch(sidebarCollapsedProvider);
+    // 菜单要显示当前倍率，因此 watch 它——缩放时菜单文字跟着变
+    final double scale = ref.watch(editorFontScaleProvider);
 
     return SubmenuButton(
       menuChildren: <Widget>[
@@ -329,8 +341,48 @@ class AppMenuBar extends ConsumerWidget {
           onPressed: () => ref.read(paneLayoutProvider.notifier).threePanes(),
           child: const Text('恢复三栏'),
         ),
+        const Divider(),
+        // 字号只作用于**编辑器正文**。菜单项上带出当前倍率：
+        // 缩放是连续动作，用户需要知道"现在在哪"，否则不知道还要按几下。
+        MenuItemButton(
+          shortcut: AppShortcuts.zoomIn.activator,
+          onPressed: () => ref.read(editorFontScaleProvider.notifier).zoomIn(),
+          child: Text('编辑器字号放大（${(scale * 100).round()}%）'),
+        ),
+        MenuItemButton(
+          shortcut: AppShortcuts.zoomOut.activator,
+          onPressed: () => ref.read(editorFontScaleProvider.notifier).zoomOut(),
+          child: Text('编辑器字号缩小（${(scale * 100).round()}%）'),
+        ),
+        MenuItemButton(
+          shortcut: AppShortcuts.zoomReset.activator,
+          onPressed: () => ref.read(editorFontScaleProvider.notifier).reset(),
+          child: const Text('编辑器字号恢复默认'),
+        ),
       ],
       child: const Text('查看'),
+    );
+  }
+
+  // ------------------------------------------------------------------ 工具
+
+  /// 「工具」菜单。
+  ///
+  /// ## 为什么现在才出现
+  ///
+  /// M1 时这个菜单**整个不存在**——里面没有任何能用的项，
+  /// 而铁律 F5 不允许放空菜单或占位项。现在有了设置对话框，
+  /// 它才有资格出现。
+  Widget _toolsMenu(BuildContext context, WidgetRef ref) {
+    return SubmenuButton(
+      menuChildren: <Widget>[
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.settings_outlined, size: 18),
+          onPressed: () => showSettingsDialog(context),
+          child: const Text('设置…'),
+        ),
+      ],
+      child: const Text('工具'),
     );
   }
 

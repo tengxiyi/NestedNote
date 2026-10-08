@@ -334,7 +334,9 @@ pub fn engine_start(data_dir: &str) -> EngineStatus {
 }
 
 /// 在一个已启动的内核上执行操作（读锁）。
-fn with_core<T>(f: impl FnOnce(&NestedCore) -> Result<T, CoreError>) -> Result<T, NoteResult> {
+pub(crate) fn with_core<T>(
+    f: impl FnOnce(&NestedCore) -> Result<T, CoreError>,
+) -> Result<T, NoteResult> {
     let guard = engine().read().map_err(|_| NoteResult {
         ok: false,
         code: Some("ENGINE_LOCK_FAILED".to_owned()),

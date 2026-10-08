@@ -79,3 +79,54 @@ final sidebarCollapsedProvider =
     NotifierProvider<SidebarCollapsedNotifier, bool>(
       SidebarCollapsedNotifier.new,
     );
+
+// ------------------------------------------------------------------ 字号缩放
+
+/// 编辑器正文字号的缩放倍率。
+///
+/// ## 为什么只缩放编辑器，而不缩放整个应用
+///
+/// 印象笔记的"缩放"缩的是整个窗口内容。对我们来说那是错的方向：
+/// 界面文字（菜单、按钮、列表）的大小是设计好的，放大它们只会让
+/// 布局变乱；用户想放大的是**正在读的正文**——那是他盯得最久的东西。
+///
+/// ## 边界为什么是 0.7–2.0
+///
+/// - 低于 0.7 时中文笔画开始粘连（小字号下微软雅黑的渲染质量下降）；
+/// - 高于 2.0 时每行容纳的字太少，反而读不下去。
+///
+/// 越界请求直接**夹取**而不是报错——缩放是连续的手感动作，
+/// 按住快捷键连按的人不希望被弹错误提示打断。
+class EditorFontScaleNotifier extends Notifier<double> {
+  /// 允许的最小倍率。
+  static const double kMin = 0.7;
+
+  /// 允许的最大倍率。
+  static const double kMax = 2.0;
+
+  /// 每次放大/缩小的步长。
+  static const double kStep = 0.1;
+
+  @override
+  double build() => 1.0;
+
+  /// 放大一档。
+  void zoomIn() => set(state + kStep);
+
+  /// 缩小一档。
+  void zoomOut() => set(state - kStep);
+
+  /// 恢复默认。
+  void reset() => state = 1.0;
+
+  /// 设置（夹取到合法区间）。
+  void set(double value) {
+    state = value.clamp(kMin, kMax);
+  }
+}
+
+/// 编辑器正文字号倍率（1.0 = 默认）。
+final editorFontScaleProvider =
+    NotifierProvider<EditorFontScaleNotifier, double>(
+      EditorFontScaleNotifier.new,
+    );

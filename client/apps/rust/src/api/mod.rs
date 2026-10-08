@@ -14,5 +14,7 @@
 //! - 跨边界只传可序列化的简单结构，不传裸指针、不传数据库句柄；
 //! - 所有函数**禁止** panic：错误一律转成结构化结果返回。
 
+pub mod attachments;
 pub mod branding;
+pub mod maintenance;
 pub mod notes;

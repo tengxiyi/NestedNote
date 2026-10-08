@@ -57,6 +57,11 @@ class AppShortcutHost extends ConsumerWidget {
         AppShortcuts.viewThreePanes.activator: const SetLayoutIntent(
           PaneLayout.threePanes,
         ),
+        AppShortcuts.zoomIn.activator: const ZoomIntent(ZoomDirection.increase),
+        AppShortcuts.zoomOut.activator: const ZoomIntent(
+          ZoomDirection.decrease,
+        ),
+        AppShortcuts.zoomReset.activator: const ZoomIntent(ZoomDirection.reset),
         AppShortcuts.shortcutsHelp.activator: const ShowShortcutsIntent(),
       },
       child: Actions(
@@ -70,6 +75,22 @@ class AppShortcutHost extends ConsumerWidget {
           SetLayoutIntent: CallbackAction<SetLayoutIntent>(
             onInvoke: (SetLayoutIntent intent) {
               ref.read(paneLayoutProvider.notifier).set(intent.layout);
+              return null;
+            },
+          ),
+          ZoomIntent: CallbackAction<ZoomIntent>(
+            onInvoke: (ZoomIntent intent) {
+              final EditorFontScaleNotifier scale = ref.read(
+                editorFontScaleProvider.notifier,
+              );
+              switch (intent.direction) {
+                case ZoomDirection.increase:
+                  scale.zoomIn();
+                case ZoomDirection.decrease:
+                  scale.zoomOut();
+                case ZoomDirection.reset:
+                  scale.reset();
+              }
               return null;
             },
           ),
@@ -105,4 +126,25 @@ class SetLayoutIntent extends Intent {
 class ShowShortcutsIntent extends Intent {
   /// 构造。
   const ShowShortcutsIntent();
+}
+
+/// 调整编辑器字号。
+class ZoomIntent extends Intent {
+  /// 构造。
+  const ZoomIntent(this.direction);
+
+  /// 调整方向。
+  final ZoomDirection direction;
+}
+
+/// 字号调整的方向。
+enum ZoomDirection {
+  /// 放大。
+  increase,
+
+  /// 缩小。
+  decrease,
+
+  /// 恢复默认。
+  reset,
 }

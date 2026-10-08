@@ -123,6 +123,28 @@ abstract final class AppShortcuts {
     'Ctrl+4',
   );
 
+  /// 编辑器字号放大。
+  ///
+  /// 用 `=` 而不是 `+`：`+` 在多数键盘上要与 Shift 同按
+  ///（Shift+= 才是 +），绑 `+` 会要求用户按三根手指。
+  /// Windows 的惯例就是 Ctrl+= 放大。
+  static const AppShortcut zoomIn = AppShortcut(
+    SingleActivator(LogicalKeyboardKey.equal, control: true),
+    'Ctrl+=',
+  );
+
+  /// 编辑器字号缩小。
+  static const AppShortcut zoomOut = AppShortcut(
+    SingleActivator(LogicalKeyboardKey.minus, control: true),
+    'Ctrl+-',
+  );
+
+  /// 编辑器字号恢复默认。
+  static const AppShortcut zoomReset = AppShortcut(
+    SingleActivator(LogicalKeyboardKey.digit0, control: true),
+    'Ctrl+0',
+  );
+
   // ---------------------------------------------------------------- 帮助
 
   /// 快捷键一览。
@@ -161,6 +183,10 @@ abstract final class AppShortcuts {
           (viewEditorOnly.label, '只显示编辑器'),
           (viewThreePanes.label, '恢复三栏'),
           (toggleSidebar.label, '折叠 / 展开笔记本栏'),
+          (
+            '${zoomIn.label} / ${zoomOut.label} / ${zoomReset.label}',
+            '编辑器字号：放大 / 缩小 / 恢复默认',
+          ),
         ],
       ),
       ('帮助', <(String, String)>[(shortcutsHelp.label, '打开这个列表')]),
