@@ -52,7 +52,7 @@ pub fn append(
             params![crate::rowmap::id_to_blob(event_id), at_ms, kind, detail],
         )
         .map(|_| ())
-        .map_err(|e| DbError::from(e))
+        .map_err(DbError::from)
 }
 
 /// 按时间倒序列出最近的记录。
