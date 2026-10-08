@@ -1255,10 +1255,11 @@ impl NestedCore {
                 if images.contains_key(attachment_id) {
                     continue;
                 }
-                if let Ok(attachment) = self.get_attachment(attachment_id) {
-                    if let Ok(bytes) = self.read_attachment(&attachment.sha256) {
-                        images.insert(*attachment_id, bytes);
-                    }
+                if let Ok(bytes) = self
+                    .get_attachment(attachment_id)
+                    .and_then(|attachment| self.read_attachment(&attachment.sha256))
+                {
+                    images.insert(*attachment_id, bytes);
                 }
             }
         }
