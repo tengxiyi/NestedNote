@@ -580,3 +580,100 @@ class NoteActions {
 final Provider<NoteActions> noteActionsProvider = Provider<NoteActions>(
   NoteActions.new,
 );
+
+// ------------------------------------------------------------------ 当前笔记
+
+/// 当前在右栏打开的笔记。
+///
+/// ## 为什么放进 provider 而不是留在 `NotesPage` 的 State 里
+///
+/// 菜单栏（「笔记」菜单）要能对"当前这篇"做复制、移动、标签、删除、
+/// 查修订历史。若这个 id 留在 State 里，菜单就得持有一个 State 引用——
+/// 那是把界面状态与"谁持有它"绑在一起，很快会变成互相引用。
+///
+/// 放进 provider 后，选笔记（列表点击）与用笔记（菜单动作）都只依赖它。
+///
+/// 存整个 [NoteItem] 而不是只存 id：菜单要根据标题显示
+/// "删除「项目约定」"这类确认文案，只有 id 时还得再查一次；
+/// 而且列表刷新后标题会变，这里存的对象也要跟着变（见 [refresh]）。
+class OpenNote extends Notifier<NoteItem?> {
+  @override
+  NoteItem? build() => null;
+
+  /// 打开某篇笔记。
+  void open(NoteItem note) => state = note;
+
+  /// 关闭（回到"未选择"状态）。
+  void close() => state = null;
+
+  /// 用最新的摘要刷新当前这篇（保存后标题可能变了）。
+  ///
+  /// **只在 id 相同时更新**：保存一篇笔记的过程中用户可能已经切走，
+  /// 那时不该把当前打开的那一篇换掉——否则右栏会显示"另一篇的标题
+  /// 配着这一篇的正文"。
+  void refresh(NoteItem updated) {
+    if (state?.id == updated.id) {
+      state = updated;
+    }
+  }
+}
+
+/// 当前打开的笔记；`null` 表示没有打开任何笔记。
+final openNoteProvider = NotifierProvider<OpenNote, NoteItem?>(OpenNote.new);
+
+// ------------------------------------------------------------ 立即保存的通道
+
+/// 「立即保存」的登记处。
+///
+/// ## 为什么需要一个回调登记处，而不是让菜单直接调 provider
+///
+/// "保存"不是内核动作，而是**编辑器当前的编辑状态**（标题 + 正文两个
+/// 输入框的内容、是否正在保存、有没有未保存改动）。这些只有编辑器知道。
+///
+/// 菜单要触发它，只有两条路：
+///
+/// 1. 把编辑状态也搬进 provider —— 那等于把整个编辑器的内部状态公开，
+///    任何地方都能改，很快会出现"谁把 _dirty 清了"这类难查的问题；
+/// 2. **编辑器把「保存」这个方法登记出来**，菜单只负责调用。
+///
+/// 这里是第二条。登记是显式的、生命周期明确（编辑器 dispose 时注销），
+/// 且菜单不需要知道编辑器内部长什么样。
+///
+/// `saveNow()` 返回 `false` 表示"当前没有编辑器，或没有可保存的内容"。
+/// 菜单据此给不同的反馈，而不是假装成功。
+class EditorSaveChannel extends Notifier<Future<void> Function()?> {
+  @override
+  Future<void> Function()? build() => null;
+
+  /// 编辑器挂载时登记自己的保存方法。
+  void register(Future<void> Function() save) => state = save;
+
+  /// 编辑器卸载时注销。
+  ///
+  /// **必须传 `save` 做校验**：编辑器可能被快速替换（`ValueKey` 变化时
+  /// 旧实例的 dispose 晚于新实例的 initState），无条件清空会把
+  /// **新**编辑器的登记一起抹掉，表现为"菜单里的保存从此没反应"。
+  void unregister(Future<void> Function() save) {
+    if (state == save) {
+      state = null;
+    }
+  }
+
+  /// 触发一次保存。
+  ///
+  /// 返回 `false` 表示当前没有可保存的编辑器。
+  Future<bool> saveNow() async {
+    final Future<void> Function()? save = state;
+    if (save == null) {
+      return false;
+    }
+    await save();
+    return true;
+  }
+}
+
+/// 「立即保存」的登记处。
+final editorSaveChannelProvider =
+    NotifierProvider<EditorSaveChannel, Future<void> Function()?>(
+      EditorSaveChannel.new,
+    );

@@ -54,6 +54,8 @@ Widget harness() {
             summary: '',
             updatedAtMs: 0,
             version: 1,
+            // **必须不是已删除的**：`NotesPage._openNote` 会拒绝打开
+            // 一篇在回收站里的笔记（那会让右栏显示一篇列表里看不到的内容）。
             deleted: false,
           ),
         ],

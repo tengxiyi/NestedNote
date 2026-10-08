@@ -30,6 +30,7 @@ import '../core/notebook_providers.dart';
 import '../core/note_providers.dart';
 import 'about_dialog.dart';
 import 'dialogs.dart';
+import 'note_actions.dart';
 import 'shortcuts_dialog.dart';
 import 'icons.dart';
 import 'shortcuts.dart';
@@ -48,6 +49,7 @@ class AppMenuBar extends ConsumerWidget {
         _fileMenu(context, ref),
         _editMenu(context, ref),
         _viewMenu(context, ref),
+        _noteMenu(context, ref),
         _helpMenu(context, ref),
       ],
     );
@@ -57,6 +59,13 @@ class AppMenuBar extends ConsumerWidget {
 
   Widget _fileMenu(BuildContext context, WidgetRef ref) {
     final String? notebookId = ref.watch(selectedNotebookIdProvider);
+    // 「保存」在**没有编辑器时禁用**，而不是点了没反应。
+    //
+    // 这与"未实现的功能不放菜单"不冲突：那是**功能不存在**，
+    // 这是**功能存在但当前上下文不适用**（没打开笔记）。后者用禁用
+    // 是标准做法，用户一看就懂。
+    final bool editorOpen = ref.watch(openNoteProvider) != null;
+
     return SubmenuButton(
       menuChildren: <Widget>[
         MenuItemButton(
@@ -75,12 +84,84 @@ class AppMenuBar extends ConsumerWidget {
         ),
         const Divider(),
         MenuItemButton(
+          shortcut: AppShortcuts.save.activator,
+          leadingIcon: const Icon(kSaveIcon, size: 18),
+          onPressed: editorOpen ? () => _saveNow(context, ref) : null,
+          child: const Text('保存当前笔记'),
+        ),
+        const Divider(),
+        MenuItemButton(
           leadingIcon: const Icon(Icons.logout, size: 18),
           onPressed: () => _quit(),
           child: const Text('退出'),
         ),
       ],
       child: const Text('文件'),
+    );
+  }
+
+  // ------------------------------------------------------------------ 笔记
+
+  /// 「笔记」菜单：对**当前打开的那一篇**做操作。
+  ///
+  /// ## 为什么全部依赖"当前笔记"而不是"列表里选中的"
+  ///
+  /// 我们把"选中的列表行"与"打开的笔记"合并成了同一件事
+  ///（`openNoteProvider`）：中栏只有一行会高亮，右栏显示的就是它。
+  /// 两个独立概念会让菜单项的含义变得可疑——"删除选中的"到底删哪个？
+  ///
+  /// 没有打开笔记时，这一组**全部禁用**（不是隐藏）：菜单结构保持稳定，
+  /// 用户能看出"这些功能存在，只是要先打开一篇"。
+  Widget _noteMenu(BuildContext context, WidgetRef ref) {
+    final NoteItem? note = ref.watch(openNoteProvider);
+    final bool has = note != null;
+
+    return SubmenuButton(
+      menuChildren: <Widget>[
+        MenuItemButton(
+          leadingIcon: const Icon(kDuplicateIcon, size: 18),
+          onPressed: has ? () => duplicateNote(context, ref, note) : null,
+          child: const Text('复制一份'),
+        ),
+        MenuItemButton(
+          leadingIcon: const Icon(kMoveIcon, size: 18),
+          onPressed: has ? () => moveNote(context, ref, note) : null,
+          child: const Text('移动到…'),
+        ),
+        MenuItemButton(
+          leadingIcon: const Icon(kEditTagsIcon, size: 18),
+          onPressed: has ? () => editNoteTags(context, ref, note) : null,
+          child: const Text('标签…'),
+        ),
+        const Divider(),
+        MenuItemButton(
+          leadingIcon: const Icon(kHistoryIcon, size: 18),
+          onPressed: has ? () => showNoteHistory(context, ref, note) : null,
+          child: const Text('修订历史…'),
+        ),
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.info_outline, size: 18),
+          onPressed: has ? () => showNoteProperties(context, ref, note) : null,
+          child: const Text('属性…'),
+        ),
+        const Divider(),
+        // 「删除」只进回收站。**刻意不提供"彻底删除"**——那件事只应在
+        // 回收站里发生（用户已确认）：在"正在编辑一篇笔记"的地方放一个
+        // 不可逆的入口，误触代价太大。
+        MenuItemButton(
+          leadingIcon: const Icon(kRecycleBinIcon, size: 18),
+          onPressed: has ? () => _deleteCurrent(context, ref, note) : null,
+          child: const Text('删除（移入回收站）'),
+        ),
+        const Divider(),
+        MenuItemButton(
+          onPressed: has
+              ? () => ref.read(openNoteProvider.notifier).close()
+              : null,
+          child: const Text('关闭当前笔记'),
+        ),
+      ],
+      child: const Text('笔记'),
     );
   }
 
@@ -211,6 +292,47 @@ class AppMenuBar extends ConsumerWidget {
   }
 
   // ------------------------------------------------------------------ 动作
+
+  /// 触发一次"立即保存"。
+  ///
+  /// 保存的实现**不在菜单里**：它依赖编辑器当前的编辑状态
+  ///（两个输入框的内容、是否正在保存、有没有改动），只有编辑器知道。
+  /// 编辑器在挂载时把自己的保存方法登记到 `editorSaveChannelProvider`，
+  /// 这里只是调用它。见 `EditorSaveChannel` 的说明。
+  Future<void> _saveNow(BuildContext context, WidgetRef ref) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    final bool saved = await ref
+        .read(editorSaveChannelProvider.notifier)
+        .saveNow();
+    messenger.showSnackBar(
+      SnackBar(content: Text(saved ? '已保存。' : '当前没有可保存的笔记。')),
+    );
+  }
+
+  /// 删除当前笔记，并在删除后关闭它。
+  ///
+  /// 删除后必须调 `close()`：否则右栏会继续显示一篇**已经进回收站**的
+  /// 笔记，用户还能继续输入，而保存会写到一个已删除的实体上。
+  Future<void> _deleteCurrent(
+    BuildContext context,
+    WidgetRef ref,
+    NoteItem note,
+  ) async {
+    await deleteNote(context, ref, note);
+    // 无论删除成功与否都读一次当前状态：成功时 provider 里还是它，
+    // 失败时也不该关闭（用户还要接着编辑）。
+    if (ref.read(openNoteProvider)?.id == note.id) {
+      final bool stillThere =
+          ref
+              .read(noteListMergedProvider(const NoteListQuery()))
+              .value
+              ?.any((NoteItem n) => n.id == note.id && !n.deleted) ??
+          false;
+      if (!stillThere) {
+        ref.read(openNoteProvider.notifier).close();
+      }
+    }
+  }
 
   void _dispatch(BuildContext context, Intent intent) {
     Actions.invoke(context, intent);

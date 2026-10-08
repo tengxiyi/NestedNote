@@ -41,6 +41,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/engine.dart';
 import '../core/engine_providers.dart';
 import '../core/layout_providers.dart';
+import '../core/note_providers.dart';
 import 'icons.dart';
 import 'menu_bar.dart';
 import 'note_editor_page.dart';
@@ -90,9 +91,6 @@ class _NotesPageState extends ConsumerState<NotesPage> {
   /// 是否显示回收站内容（影响中栏列表）。
   bool _showDeleted = false;
 
-  /// 当前在右栏打开的笔记。
-  String? _openNoteId;
-
   @override
   Widget build(BuildContext context) {
     final AsyncValue<EngineStatus> engine = ref.watch(engineProvider);
@@ -101,6 +99,9 @@ class _NotesPageState extends ConsumerState<NotesPage> {
     // 那是把"界面状态"与"谁持有它"绑在一起，很快会变成互相引用。
     final bool sidebarCollapsed = ref.watch(sidebarCollapsedProvider);
     final PaneLayout layout = ref.watch(paneLayoutProvider);
+    // 当前打开的笔记也放进 provider：菜单栏的「笔记」菜单要按它决定
+    // 哪些项可用，以及确认文案里的标题。
+    final NoteItem? openNote = ref.watch(openNoteProvider);
 
     return Scaffold(
       appBar: AppBar(
@@ -146,8 +147,8 @@ class _NotesPageState extends ConsumerState<NotesPage> {
                 showDeleted: _showDeleted,
                 sidebarCollapsed: sidebarCollapsed,
                 layout: layout,
-                openNoteId: _openNoteId,
-                onOpenNote: (String? id) => setState(() => _openNoteId = id),
+                openNote: openNote,
+                onOpenNote: _openNote,
               ),
             ),
           ],
@@ -155,6 +156,30 @@ class _NotesPageState extends ConsumerState<NotesPage> {
         _ => const Center(child: CircularProgressIndicator()),
       },
     );
+  }
+
+  /// 打开/关闭笔记。
+  ///
+  /// `null` 表示关闭——菜单里的「关闭当前笔记」与列表取消选中都走这里。
+  ///
+  /// ## 为什么接收整个 [NoteItem] 而不是 id
+  ///
+  /// 第一版接收 id，然后在这里 `ref.read(noteListMergedProvider(...))`
+  /// 回查摘要。两个问题：
+  ///
+  /// 1. **回查的 provider 可能还没被建立**。`read` 一个从未被 `watch`
+  ///    过的 family provider，首次拿到的是 loading 态（`value == null`），
+  ///    于是查不到笔记、点击毫无反应——这个缺陷就是测试抓出来的；
+  /// 2. 列表本来就已经持有那个对象，"传 id 再查回来"是无谓的往返。
+  ///
+  /// 改成直接传对象：调用方给什么就打开什么，没有中间态。
+  void _openNote(NoteItem? note) {
+    final OpenNote notifier = ref.read(openNoteProvider.notifier);
+    if (note == null) {
+      notifier.close();
+    } else {
+      notifier.open(note);
+    }
   }
 
   void _showDiagnostics(BuildContext context) {
@@ -212,15 +237,15 @@ class _ThreePane extends StatefulWidget {
     required this.showDeleted,
     required this.sidebarCollapsed,
     required this.layout,
-    required this.openNoteId,
+    required this.openNote,
     required this.onOpenNote,
   });
 
   final bool showDeleted;
   final bool sidebarCollapsed;
   final PaneLayout layout;
-  final String? openNoteId;
-  final ValueChanged<String?> onOpenNote;
+  final NoteItem? openNote;
+  final ValueChanged<NoteItem?> onOpenNote;
 
   @override
   State<_ThreePane> createState() => _ThreePaneState();
@@ -310,7 +335,7 @@ class _ThreePaneState extends State<_ThreePane> {
                 width: list,
                 child: NoteListPane(
                   showDeleted: widget.showDeleted,
-                  openNoteId: widget.openNoteId,
+                  openNote: widget.openNote,
                   onOpenNote: widget.onOpenNote,
                 ),
               ),
@@ -320,13 +345,13 @@ class _ThreePaneState extends State<_ThreePane> {
             ],
             if (editorVisible)
               Expanded(
-                child: widget.openNoteId == null
+                child: widget.openNote == null
                     ? const _EmptyReadingPane()
                     : NoteEditorPane(
                         // key 让"切换到另一篇笔记"时重建编辑状态，
                         // 否则会沿用上一篇的文本与"已保存"基准
-                        key: ValueKey<String>(widget.openNoteId!),
-                        noteId: widget.openNoteId!,
+                        key: ValueKey<String>(widget.openNote!.id),
+                        noteId: widget.openNote!.id,
                       ),
               ),
           ],

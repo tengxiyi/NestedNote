@@ -129,17 +129,73 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   /// 已被销毁，写库仍会完成（不依赖 `mounted`）。
   NoteActions? _actionsForFlush;
 
+  /// 「立即保存」的登记处（提前取好，dispose 时不能再用 `ref`）。
+  ///
+  /// Riverpod 明确禁止在 `dispose()` 里用 `ref`：
+  /// "Using ref when a widget is about to or has been unmounted is unsafe"。
+  /// 因此在 `initState` 里把 notifier 存下来——与 `_actionsForFlush`
+  /// 是同一个理由、同一个手法。
+  EditorSaveChannel? _saveChannel;
+
   @override
   void initState() {
     super.initState();
     // 提前取好，供 dispose 补保存用（dispose 时不能再碰 ref）
     _actionsForFlush = ref.read(noteActionsProvider);
+    _saveChannel = ref.read(editorSaveChannelProvider.notifier);
+    // 把"立即保存"登记出去，菜单的「文件 → 保存当前笔记」才能触发它。
+    //
+    // 保存依赖的是**编辑器当前的编辑状态**（两个输入框的内容、是否正在
+    // 保存、有没有改动），这些只有本组件知道。见
+    // `EditorSaveChannel` 的说明——不把编辑状态搬进 provider 是刻意的。
+    //
+    // ## 为什么放到下一帧
+    //
+    // `initState` 发生在**构建过程中**，此时修改 provider 会被 Riverpod
+    // 拦下（"Tried to modify a provider while the widget tree was building"），
+    // 编辑器整个构建失败、界面一片空白。这个缺陷是诊断脚本抓出来的。
+    //
+    // 延后一帧的代价：极短时间内（一帧）菜单里的「保存」可能还是禁用态，
+    // 用户不可能察觉。而"编辑器构建失败"是灾难性的。
+    _savingCallback = _saveNow;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _saveChannel?.register(_savingCallback);
+    });
     unawaited(_load());
+  }
+
+  /// 登记给菜单用的保存方法。
+  ///
+  /// 存成字段是为了 `unregister` 时能做**同一性校验**：
+  /// 编辑器被快速替换时旧实例的 dispose 可能晚于新实例的 initState，
+  /// 无条件清空会把新编辑器的登记一起抹掉（见 `unregister` 的说明）。
+  late final Future<void> Function() _savingCallback;
+
+  /// 「立即保存」的入口：不弹 SnackBar，由菜单负责反馈。
+  ///
+  /// 与自动保存走同一条 `_save`，因此"无改动时不写库、不产生修订"
+  /// 这条不变量对两条路径都成立。
+  Future<void> _saveNow() async {
+    if (_loading || _loadError != null) {
+      // 内容还没读出来（或读失败）时不能保存：那会把空内容盖到已有笔记上。
+      // 这是最危险的一类错误——用户点一次"保存"，笔记就空了。
+      return;
+    }
+    await _save();
   }
 
   @override
   void dispose() {
     _autoSaveTimer?.cancel();
+    // 注销要**同步**做，不能也延后：延后会让"旧编辑器的注销"跑在
+    // "新编辑器的登记"之后，把新的登记抹掉。
+    //
+    // 好在 `unregister` 内部有同一性校验（`state == save` 才清空），
+    // 因此即便顺序颠倒也不会误伤——这里只是把顺序理正。
+    _saveChannel?.unregister(_savingCallback);
     // **补一次保存**：用户可能在去抖窗口内就切走了。
     //
     // 这是"输入后切走就丢"的直接修法。注意：

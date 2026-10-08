@@ -24,16 +24,15 @@ import '../core/note_providers.dart';
 import '../core/trash_providers.dart';
 import 'dialogs.dart';
 import 'icons.dart';
+import 'note_actions.dart';
 import 'typography.dart';
-import 'notebook_sidebar.dart';
-import 'tag_editor.dart';
 
 /// 中栏：当前笔记本下的笔记列表。
 class NoteListPane extends ConsumerStatefulWidget {
   /// 构造。
   const NoteListPane({
     required this.showDeleted,
-    required this.openNoteId,
+    required this.openNote,
     required this.onOpenNote,
     super.key,
   });
@@ -42,10 +41,10 @@ class NoteListPane extends ConsumerStatefulWidget {
   final bool showDeleted;
 
   /// 当前打开的笔记（高亮）。
-  final String? openNoteId;
+  final NoteItem? openNote;
 
   /// 打开某篇笔记（或关闭：传 null）。
-  final ValueChanged<String?> onOpenNote;
+  final ValueChanged<NoteItem?> onOpenNote;
 
   @override
   ConsumerState<NoteListPane> createState() => _NoteListPaneState();
@@ -119,7 +118,7 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
           child: widget.showDeleted && !_selecting
               ? _TimelineView(
                   notes: notes,
-                  openNoteId: widget.openNoteId,
+                  openNote: widget.openNote,
                   retentionDays: retention,
                   onOpenNote: widget.onOpenNote,
                   onEnterSelection: (String id) => setState(() {
@@ -154,7 +153,7 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
           final NoteItem note = value[index];
           return _NoteRow(
             note: note,
-            selected: note.id == widget.openNoteId,
+            selected: note.id == widget.openNote?.id,
             retentionDays: widget.showDeleted ? retention : null,
             // 多选模式下显示勾选框，点击即勾选（而不是打开笔记）
             selectable: widget.showDeleted && _selecting,
@@ -163,7 +162,7 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
               if (widget.showDeleted && _selecting) {
                 _toggle(note.id);
               } else {
-                widget.onOpenNote(note.id);
+                widget.onOpenNote(note);
               }
             },
             onLongPress: () {
@@ -352,7 +351,16 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
       if (landed != null && landed != notebookId) {
         ref.read(selectedNotebookIdProvider.notifier).select(landed);
       }
-      widget.onOpenNote(created.id);
+      // 新建后立刻打开它。摘要从"刚保存过的覆盖层"里取——内核只回了 id，
+      // 而打开需要的是摘要对象（见 NotesPage._openNote 的说明）。
+      final NoteItem? fresh = ref
+          .read(noteListMergedProvider(const NoteListQuery()))
+          .value
+          ?.where((NoteItem n) => n.id == created.id)
+          .firstOrNull;
+      if (fresh != null) {
+        widget.onOpenNote(fresh);
+      }
     } on NoteFailure catch (failure) {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }
@@ -444,71 +452,50 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
       return;
     }
 
+    // 这些动作**与菜单栏的「笔记」菜单共用同一批函数**
+    //（`note_actions.dart`）。在这里重写一遍会让"删除要提示去回收站"
+    // 这类规则出现两份，改一处漏一处。
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     try {
       switch (action) {
         case 'open':
-          widget.onOpenNote(note.id);
+          widget.onOpenNote(note);
         case 'restore':
           await ref.read(noteActionsProvider).restore(note.id);
         case 'purge':
           await _purgeNote(context, ref, note);
         case 'delete':
-          await ref.read(noteActionsProvider).delete(note.id);
-          if (widget.openNoteId == note.id) {
+          await deleteNote(context, ref, note);
+          // 删掉正在看的那篇就要关掉右栏，否则会继续显示一篇已删除的笔记
+          if (widget.openNote?.id == note.id) {
             widget.onOpenNote(null);
           }
-          _notifyMovedToTrash(messenger, retention);
         case 'move':
-          await _moveNote(context, ref, note);
+          await moveNote(context, ref, note);
         case 'tags':
-          await _editTags(context, ref, note);
+          await editNoteTags(context, ref, note);
         case 'duplicate':
-          await _duplicateNote(context, ref, note);
+          await duplicateNote(
+            context,
+            ref,
+            note,
+            onOpen: (String id) {
+              final NoteItem? copy = ref
+                  .read(noteListMergedProvider(const NoteListQuery()))
+                  .value
+                  ?.where((NoteItem n) => n.id == id)
+                  .firstOrNull;
+              if (copy != null) {
+                widget.onOpenNote(copy);
+              }
+            },
+          );
         case 'properties':
-          await _showProperties(context, note);
+          await showNoteProperties(context, ref, note);
       }
     } on NoteFailure catch (failure) {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }
-  }
-
-  /// 编辑标签。
-  ///
-  /// 保存后把笔记**重新打开一次**：右栏的编辑器是按 noteId 取正文的，
-  /// 标签变化不影响它；但中栏的行如果有标签展示，需要它重绘。
-  /// 刷新由 `TagActions` 的 `invalidate` 负责，这里不必额外做什么。
-  Future<void> _editTags(
-    BuildContext context,
-    WidgetRef ref,
-    NoteItem note,
-  ) async {
-    await showTagEditor(context, noteId: note.id, noteTitle: note.title);
-  }
-
-  /// 复制一份。
-  ///
-  /// 复制完**不自动打开**副本：用户点"复制一份"通常是为了做点别的，
-  /// 立刻把右栏切走会打断他手上的事。改为提示一句"已复制"，
-  /// 副本就出现在列表里（标题带「（副本）」），需要时再点。
-  Future<void> _duplicateNote(
-    BuildContext context,
-    WidgetRef ref,
-    NoteItem note,
-  ) async {
-    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
-    final String newId = await ref.read(noteActionsProvider).duplicate(note.id);
-    messenger.showSnackBar(
-      SnackBar(
-        content: const Text('已复制一份（标题带「（副本）」）。'),
-        action: SnackBarAction(
-          label: '打开副本',
-          // 用返回值里的 id，而不是自己拼——与标签复活同理，
-          // 调用方不该假设自己知道新实体的 id
-          onPressed: () => widget.onOpenNote(newId),
-        ),
-      ),
-    );
   }
 
   /// 彻底删除（不可逆）。**必须二次确认**，且确认按钮写明后果。
@@ -531,7 +518,7 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     try {
       await ref.read(noteActionsProvider).purge(note.id);
-      if (widget.openNoteId == note.id) {
+      if (widget.openNote?.id == note.id) {
         widget.onOpenNote(null);
       }
       messenger.showSnackBar(const SnackBar(content: Text('已彻底删除。')));
@@ -539,184 +526,7 @@ class _NoteListPaneState extends ConsumerState<NoteListPane> {
       messenger.showSnackBar(SnackBar(content: Text(failure.hint)));
     }
   }
-
-  Future<void> _moveNote(
-    BuildContext context,
-    WidgetRef ref,
-    NoteItem note,
-  ) async {
-    final List<NotebookNode> tree =
-        ref.read(notebooksTreeProvider).value ?? const <NotebookNode>[];
-    final String? target = await showDialog<String>(
-      context: context,
-      builder: (BuildContext dialogContext) => SimpleDialog(
-        title: const Text('移动到笔记本'),
-        children: <Widget>[
-          SimpleDialogOption(
-            // 用空串表示"移出笔记本"；null 表示"用户取消"——
-            // 两者必须区分，否则无法表达"移出"这个合法操作
-            onPressed: () => Navigator.of(dialogContext).pop(''),
-            child: const Text('（移出笔记本）'),
-          ),
-          for (final NotebookNode node in tree)
-            SimpleDialogOption(
-              onPressed: () => Navigator.of(dialogContext).pop(node.id),
-              child: Padding(
-                // 与左栏用同一套缩进规则，避免两处的层级观感不一致
-                padding: EdgeInsets.only(left: notebookIndent(node.depth)),
-                child: Text(node.name, overflow: TextOverflow.ellipsis),
-              ),
-            ),
-        ],
-      ),
-    );
-    if (target == null || !context.mounted) {
-      return;
-    }
-    await ref
-        .read(notebookActionsProvider)
-        .moveNote(note.id, target.isEmpty ? null : target);
-  }
-
-  Future<void> _showProperties(BuildContext context, NoteItem note) async {
-    await showDialog<void>(
-      context: context,
-      builder: (BuildContext dialogContext) => AlertDialog(
-        title: Text(note.title),
-        content: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            _propertyRow('修订', '第 ${note.version} 版'),
-            _propertyRow('修改时间', formatListTime(note.updatedAtMs)),
-            _propertyRow('状态', note.deleted ? '在回收站中' : '正常'),
-            _propertyRow('标识', note.id),
-          ],
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('关闭'),
-          ),
-        ],
-      ),
-    );
-  }
 }
-
-/// 回收站的**时间线视图**：笔记与目录按**删除时间**混排。
-///
-/// ## 为什么不再按类型分组
-///
-/// 最初目录被单独钉在列表顶部，用户指出这不合理：
-///
-/// > 回收站里面，目录级别的为什么要给它置顶？这个设定不合理
-///
-/// 他是对的。用户找东西的依据是**时间**（"我刚删的那个在哪"），
-/// 不是**类型**。按类型分组把一条时间线切成两段，于是"刚删的笔记"
-/// 可能排在一小时前删的目录下面。
-///
-/// 现在混排，删除时间新的在上——正好对应"最近删的在最上面"。
-///
-/// ## 排序键用 `deletedAtMs` 而不是 `updatedAtMs`
-///
-/// 这两个值在删除之后就不同步了（一篇三天前写、今天删的笔记，
-/// `updatedAtMs` 是三天前）。用错会让"最近删的"沉到列表中间。
-class _TimelineView extends ConsumerWidget {
-  const _TimelineView({
-    required this.notes,
-    required this.openNoteId,
-    required this.retentionDays,
-    required this.onOpenNote,
-    required this.onEnterSelection,
-  });
-
-  final AsyncValue<List<NoteItem>> notes;
-  final String? openNoteId;
-  final int retentionDays;
-  final ValueChanged<String?> onOpenNote;
-  final ValueChanged<String> onEnterSelection;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final AsyncValue<List<TrashedNotebookItem>> trashed = ref.watch(
-      trashedNotebooksProvider,
-    );
-    final ThemeData theme = Theme.of(context);
-
-    if (notes case AsyncError(:final Object error)) {
-      return Padding(
-        padding: const EdgeInsets.all(14),
-        child: Text('$error', style: theme.textTheme.bodySmall),
-      );
-    }
-    if (notes is AsyncLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    final List<NoteItem> noteList = notes.value ?? const <NoteItem>[];
-    final List<TrashedNotebookItem> bookList =
-        trashed.value ?? const <TrashedNotebookItem>[];
-
-    // 合并成一条时间线。用记录类型而不是新建一个类：这里只需要
-    // "按时间排好序、渲染时能分辨两种"这两件事，加一个类反而要维护
-    // 一份与两个真实类型重复的字段清单。
-    final List<({int at, NoteItem? note, TrashedNotebookItem? book})> items =
-        <({int at, NoteItem? note, TrashedNotebookItem? book})>[
-          for (final NoteItem n in noteList)
-            // 未删除的笔记不该出现在这里；真出现了用它自己的时间兜底，
-            // 而不是丢掉它（丢掉就是"列表里少了一条"）。
-            (at: n.deletedAtMs ?? n.updatedAtMs, note: n, book: null),
-          for (final TrashedNotebookItem b in bookList)
-            (at: b.deletedAtMs, note: null, book: b),
-        ]..sort(
-          (
-            ({int at, NoteItem? note, TrashedNotebookItem? book}) a,
-            ({int at, NoteItem? note, TrashedNotebookItem? book}) b,
-          ) => b.at.compareTo(a.at),
-        );
-
-    if (items.isEmpty) {
-      return const _EmptyNoteList(showDeleted: true);
-    }
-
-    return ListView.builder(
-      itemCount: items.length,
-      itemBuilder: (BuildContext context, int index) {
-        final ({int at, NoteItem? note, TrashedNotebookItem? book}) item =
-            items[index];
-        final TrashedNotebookItem? book = item.book;
-        if (book != null) {
-          return _TrashedNotebookRow(item: book, retentionDays: retentionDays);
-        }
-        final NoteItem note = item.note!;
-        return _NoteRow(
-          note: note,
-          selected: note.id == openNoteId,
-          retentionDays: retentionDays,
-          onTap: () => onOpenNote(note.id),
-          // 长按进入多选（与网格列表一致的手势）
-          onLongPress: () => onEnterSelection(note.id),
-        );
-      },
-    );
-  }
-}
-
-/// 属性对话框里的一行。
-Widget _propertyRow(String label, String value) => Padding(
-  padding: const EdgeInsets.symmetric(vertical: 3),
-  child: Row(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: <Widget>[
-      SizedBox(
-        width: 72,
-        child: Text(label, style: const TextStyle(color: Colors.grey)),
-      ),
-      Expanded(child: SelectableText(value)),
-    ],
-  ),
-);
 
 /// 中栏的一行笔记。
 class _NoteRow extends StatelessWidget {
@@ -888,6 +698,105 @@ class _NoteRow extends StatelessWidget {
   }
 }
 
+/// 回收站的**时间线视图**：笔记与目录按**删除时间**混排。
+///
+/// ## 为什么不再按类型分组
+///
+/// 最初目录被单独钉在列表顶部，用户指出这不合理：
+///
+/// > 回收站里面，目录级别的为什么要给它置顶？这个设定不合理
+///
+/// 他是对的。用户找东西的依据是**时间**（"我刚删的那个在哪"），
+/// 不是**类型**。按类型分组把一条时间线切成两段，于是"刚删的笔记"
+/// 可能排在一小时前删的目录下面。
+///
+/// 现在混排，删除时间新的在上——正好对应"最近删的在最上面"。
+///
+/// ## 排序键用 `deletedAtMs` 而不是 `updatedAtMs`
+///
+/// 这两个值在删除之后就不同步了（一篇三天前写、今天删的笔记，
+/// `updatedAtMs` 是三天前）。用错会让"最近删的"沉到列表中间。
+class _TimelineView extends ConsumerWidget {
+  const _TimelineView({
+    required this.notes,
+    required this.openNote,
+    required this.retentionDays,
+    required this.onOpenNote,
+    required this.onEnterSelection,
+  });
+
+  final AsyncValue<List<NoteItem>> notes;
+  final NoteItem? openNote;
+  final int retentionDays;
+  final ValueChanged<NoteItem?> onOpenNote;
+  final ValueChanged<String> onEnterSelection;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final AsyncValue<List<TrashedNotebookItem>> trashed = ref.watch(
+      trashedNotebooksProvider,
+    );
+    final ThemeData theme = Theme.of(context);
+
+    if (notes case AsyncError(:final Object error)) {
+      return Padding(
+        padding: const EdgeInsets.all(14),
+        child: Text('$error', style: theme.textTheme.bodySmall),
+      );
+    }
+    if (notes is AsyncLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final List<NoteItem> noteList = notes.value ?? const <NoteItem>[];
+    final List<TrashedNotebookItem> bookList =
+        trashed.value ?? const <TrashedNotebookItem>[];
+
+    // 合并成一条时间线。用记录类型而不是新建一个类：这里只需要
+    // "按时间排好序、渲染时能分辨两种"这两件事，加一个类反而要维护
+    // 一份与两个真实类型重复的字段清单。
+    final List<({int at, NoteItem? note, TrashedNotebookItem? book})> items =
+        <({int at, NoteItem? note, TrashedNotebookItem? book})>[
+          for (final NoteItem n in noteList)
+            // 未删除的笔记不该出现在这里；真出现了用它自己的时间兜底，
+            // 而不是丢掉它（丢掉就是"列表里少了一条"）。
+            (at: n.deletedAtMs ?? n.updatedAtMs, note: n, book: null),
+          for (final TrashedNotebookItem b in bookList)
+            (at: b.deletedAtMs, note: null, book: b),
+        ]..sort(
+          (
+            ({int at, NoteItem? note, TrashedNotebookItem? book}) a,
+            ({int at, NoteItem? note, TrashedNotebookItem? book}) b,
+          ) => b.at.compareTo(a.at),
+        );
+
+    if (items.isEmpty) {
+      return const _EmptyNoteList(showDeleted: true);
+    }
+
+    return ListView.builder(
+      itemCount: items.length,
+      itemBuilder: (BuildContext context, int index) {
+        final ({int at, NoteItem? note, TrashedNotebookItem? book}) item =
+            items[index];
+        final TrashedNotebookItem? book = item.book;
+        if (book != null) {
+          return _TrashedNotebookRow(item: book, retentionDays: retentionDays);
+        }
+        final NoteItem note = item.note!;
+        return _NoteRow(
+          note: note,
+          selected: note.id == openNote?.id,
+          retentionDays: retentionDays,
+          onTap: () => onOpenNote(note),
+          // 长按进入多选（与网格列表一致的手势）
+          onLongPress: () => onEnterSelection(note.id),
+        );
+      },
+    );
+  }
+}
+
 /// 回收站里的一个目录（一行）。
 class _TrashedNotebookRow extends ConsumerWidget {
   const _TrashedNotebookRow({required this.item, required this.retentionDays});
@@ -1037,30 +946,6 @@ class _EmptyNoteList extends StatelessWidget {
   }
 }
 
-/// 提示"已删除，可在回收站恢复 N 天"。
-///
-/// ## 为什么这句话必须存在
-///
-/// 菜单写的是「删除」（用户熟悉的说法），但实际只做了软删。
-/// 如果删完什么都不说，用户会以为数据立刻没了；
-/// 而保留期到了被自动清理时，用户又没有任何预警。
-/// **不可逆的流程必须在发生前与发生后都能被看见。**
-void _notifyMovedToTrash(ScaffoldMessengerState messenger, int retentionDays) {
-  messenger.showSnackBar(
-    SnackBar(
-      content: Text(
-        retentionDays > 0
-            ? '笔记已删除。可在回收站中恢复（保留 $retentionDays 天）'
-            : '笔记已删除。可在回收站中恢复。',
-      ),
-      action: SnackBarAction(
-        label: '知道了',
-        onPressed: () => messenger.hideCurrentSnackBar(),
-      ),
-    ),
-  );
-}
-
 /// 把 UTC 毫秒格式化成列表里显示的时间。
 ///
 /// 规则（与常见笔记应用一致）：
@@ -1086,4 +971,22 @@ String formatListTime(int utcMs, {DateTime? now}) {
     return '${two(time.month)}-${two(time.day)}';
   }
   return '${time.year}-${two(time.month)}-${two(time.day)}';
+}
+
+/// 把 UTC 毫秒格式化成**精确到分钟**的完整时间。
+///
+/// 与 [formatListTime] 的分工：
+///
+/// - [formatListTime] 为**列表**服务——列表要的是"多久以前"的粗略感，
+///   所以"今天"只显示时间、往年只显示日期，省横向空间；
+/// - 本函数为**属性对话框**服务——那里要的是**确切时刻**。
+///   用户打开属性多半是在核对"这篇到底什么时候改的"，
+///   给他"今天 11:28"是不够的（跨天就失去意义）。
+///
+/// 公开（非下划线开头）是为了能在测试里直接断言格式。
+String formatAbsoluteTime(int utcMs) {
+  final DateTime time = DateTime.fromMillisecondsSinceEpoch(utcMs);
+  String two(int value) => value.toString().padLeft(2, '0');
+  return '${time.year}-${two(time.month)}-${two(time.day)} '
+      '${two(time.hour)}:${two(time.minute)}';
 }
