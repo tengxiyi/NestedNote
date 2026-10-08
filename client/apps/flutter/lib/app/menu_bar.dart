@@ -29,6 +29,7 @@ import '../core/layout_providers.dart';
 import '../core/notebook_providers.dart';
 import '../core/note_providers.dart';
 import 'about_dialog.dart';
+import 'activity_log_dialog.dart';
 import 'attachments_dialog.dart';
 import 'block_format.dart';
 import 'dialogs.dart';
@@ -380,6 +381,11 @@ class AppMenuBar extends ConsumerWidget {
           leadingIcon: const Icon(Icons.settings_outlined, size: 18),
           onPressed: () => showSettingsDialog(context),
           child: const Text('设置…'),
+        ),
+        MenuItemButton(
+          leadingIcon: const Icon(Icons.receipt_long_outlined, size: 18),
+          onPressed: () => showActivityLogDialog(context),
+          child: const Text('活动日志…'),
         ),
       ],
       child: const Text('工具'),

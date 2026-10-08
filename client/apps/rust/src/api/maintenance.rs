@@ -132,3 +132,44 @@ pub fn maintenance_check_integrity() -> MaintenanceResult {
         },
     }
 }
+
+/// 一条活动记录（对界面暴露的形态）。
+///
+/// ## 为什么定义在本模块而不是 core
+///
+/// 第一版放 core，FFI 的生成代码里它被当成了 **opaque 类型**
+///（界面拿到的是不透明句柄，读不到字段）——FRB 只把 **api 模块里
+/// 定义的、带完整字段的结构**当镜像类型。与 `MaintenanceResult`
+/// 同一个教训：**跨语言契约面只放本 crate 的结构**。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    /// 发生时间（UTC 毫秒）。
+    pub at_ms: i64,
+    /// 事件类型，如 `trash.purge` / `attachments.gc` / `integrity.check`。
+    pub kind: String,
+    /// 给人看的说明（含关键数字），界面直接展示。
+    pub detail: String,
+}
+
+/// 最近的活动记录（时间倒序），供"工具 → 活动日志"展示。
+///
+/// ## 失败时返回空列表的已知妥协
+///
+/// 与 `attachments_list` 同一个缺口：这一层没有通道区分"没有记录"
+/// 与"读取失败"。对日志而言这个妥协可以接受（日志不是业务数据，
+/// 丢了不丢用户内容），但空列表的文案必须**两种情况都读得通**——
+/// 界面写的是"还没有记录"，而不是"一切正常"。
+#[must_use]
+pub fn activity_recent(limit: u32) -> Vec<ActivityEntry> {
+    match with_core(|core: &NestedCore| core.recent_activity(limit)) {
+        Ok(events) => events
+            .into_iter()
+            .map(|event| ActivityEntry {
+                at_ms: event.at_ms,
+                kind: event.kind,
+                detail: event.detail,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}

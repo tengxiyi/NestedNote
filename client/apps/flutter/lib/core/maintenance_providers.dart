@@ -11,7 +11,7 @@
 
 import '../src/rust/api/maintenance.dart' as rust;
 
-export '../src/rust/api/maintenance.dart' show MaintenanceResult;
+export '../src/rust/api/maintenance.dart' show ActivityEntry, MaintenanceResult;
 
 /// 运行附件清理。
 ///
@@ -23,3 +23,9 @@ Future<rust.MaintenanceResult> gcAttachments(int atMs) =>
 /// 核对数据库完整性（只读，失败不会让情况变得更糟）。
 Future<rust.MaintenanceResult> checkIntegrity() =>
     rust.maintenanceCheckIntegrity();
+
+/// 最近的活动记录（时间倒序）。
+///
+/// `limit = 0` 由内核解释为"给一个合理的默认值"。
+Future<List<rust.ActivityEntry>> listActivity(int limit) =>
+    rust.activityRecent(limit: limit);

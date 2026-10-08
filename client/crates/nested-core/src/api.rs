@@ -35,6 +35,33 @@ pub struct TrashPurgeReport {
     pub notebooks_removed: u64,
 }
 
+/// 一条活动记录（对界面暴露的形态）。
+///
+/// 放在 core 而不是 FFI 层：FFI crate 不依赖 nested-db，
+/// 拿不到仓储类型；由 core 把仓储行映射成这个无标识符的展示形态
+///（event_id 对界面没有意义，剥掉）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityEntry {
+    /// 发生时间（UTC 毫秒）。
+    pub at_ms: i64,
+    /// 事件类型，如 `trash.purge` / `attachments.gc` / `integrity.check`。
+    pub kind: String,
+    /// 给人看的说明（含关键数字），界面直接展示。
+    pub detail: String,
+}
+
+/// 把字节数格式化成给 activity 日志用的可读文本（不超过一位小数）。
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} 字节");
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{kb:.1} KB");
+    }
+    format!("{:.1} MB", kb / 1024.0)
+}
+
 impl TrashPurgeReport {
     /// 本次是否真的删掉了东西。
     ///
@@ -1184,7 +1211,58 @@ impl NestedCore {
             }
         }
 
+        // 只在**真的删了东西**时留痕：启动扫描每次都会跑，空跑也记一条
+        // 的话，日志会被"清理了 0 条"刷满——噪音会把真事件淹没。
+        if report.notes_removed + report.notebooks_removed > 0 {
+            self.record_activity(
+                now_ms,
+                "trash.purge",
+                format!(
+                    "清理了 {} 条笔记、{} 个目录（超过保留期）",
+                    report.notes_removed, report.notebooks_removed
+                ),
+            );
+        }
+
         Ok(report)
+    }
+
+    /// 追加一条活动记录（**尽力而为**）。
+    ///
+    /// ## 为什么失败不向上传播
+    ///
+    /// 调用时机是主操作**成功之后**：回收站已经清空、附件已经删除，
+    /// 此刻若报错，用户会以为操作失败了——那比日志缺一条更糟。
+    /// 但"可追溯"的承诺不能静默破掉：写入失败会留痕到日志框架
+    /// （tracing），由开发者排查——活动日志写不进去通常意味着
+    /// 数据库出了更大的问题，而那种问题会在别处先爆出来。
+    fn record_activity(&self, at_ms: i64, kind: &str, detail: String) {
+        let event_id = nested_model::Id::new();
+        let result = self.database.connection().and_then(|connection| {
+            nested_db::repositories::activity::append(&connection, &event_id, at_ms, kind, &detail)
+        });
+        if let Err(error) = result {
+            tracing::warn!(kind, %error, "活动记录写入失败");
+        }
+    }
+
+    /// 最近的活动记录（时间倒序），供"工具 → 活动日志"展示。
+    ///
+    /// # Errors
+    ///
+    /// 查询失败 → [`CoreError::Database`]。
+    pub fn recent_activity(&self, limit: u32) -> CoreResult<Vec<ActivityEntry>> {
+        let connection = self.database.connection()?;
+        let events = nested_db::repositories::activity::list_recent(&connection, limit)
+            .map_err(CoreError::from)?;
+        Ok(events
+            .into_iter()
+            .map(|event| ActivityEntry {
+                at_ms: event.at_ms,
+                kind: event.kind,
+                detail: event.detail,
+            })
+            .collect())
     }
 
     /// 回收站中还有多少条笔记"已到期、下次清理就会被删"。
@@ -1533,7 +1611,29 @@ impl NestedCore {
     ///
     /// 内存库模式 → [`CoreError::Config`]；遍历或查询失败 → 相应错误。
     pub fn gc_attachments(&self, now_ms: i64) -> CoreResult<crate::attachments::GcReport> {
-        self.attachment_service()?.gc(self, now_ms)
+        let report = self.attachment_service()?.gc(self, now_ms)?;
+        // 有真删除才记。kept_recent（保护期内保留）不为 0 而删除为 0 时
+        // 不记：那是一次"没有发生清理"的查询，记了反而让人以为动过数据。
+        if report.removed_files > 0 {
+            let mut detail = format!(
+                "删除 {} 个文件，释放 {}。另有 {} 个仍在保护期内。",
+                report.removed_files,
+                format_bytes(report.freed_bytes),
+                report.kept_recent
+            );
+            if report.broken_links > 0 {
+                // 断链违反附件模块的不变量，必须显眼——不能只躺在报告字段里。
+                // 用 `write!` 而不是 `push_str(&format!)`（clippy::format_push_string）
+                use std::fmt::Write as _;
+                let _ = write!(
+                    detail,
+                    "发现 {} 处断链（记录存在但文件缺失），建议核对数据目录。",
+                    report.broken_links
+                );
+            }
+            self.record_activity(now_ms, "attachments.gc", detail);
+        }
+        Ok(report)
     }
 }
 
