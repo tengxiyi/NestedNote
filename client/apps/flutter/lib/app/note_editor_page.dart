@@ -41,7 +41,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/layout_providers.dart';
 import '../core/blocks.dart';
 import '../core/note_providers.dart';
-import 'appflowy_spike.dart';
 import 'attachments_dialog.dart';
 import 'document_view.dart';
 import 'block_format.dart';
@@ -152,10 +151,6 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
 
   /// 是否处于**预览态**（R1 富显示，见 09 方案）。
   bool _previewing = false;
-
-  /// 是否处于**实验编辑器**（AppFlowy Spike，ADR 0002 §6.1；
-  /// R2 第 2 步替换编辑面后本态与预览按钮一并移除）。
-  bool _spikeMode = false;
 
   /// 预览的加载_future（进入预览时创建一次，重建不重取）。
   Future<List<UiBlock>>? _previewFuture;
@@ -588,22 +583,9 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
                       icon: const Icon(Icons.folder_zip_outlined, size: 20),
                     ),
                   IconButton(
-                    tooltip: _spikeMode
-                        ? '退出实验编辑器'
-                        : _previewing
-                        ? '返回编辑'
-                        : '预览（按块渲染）· 长按试实验编辑器',
+                    tooltip: _previewing ? '返回编辑' : '预览（按块渲染）',
                     visualDensity: VisualDensity.compact,
-                    onPressed: () {
-                      if (_spikeMode) {
-                        setState(() {
-                          _spikeMode = false;
-                          _previewing = false;
-                        });
-                        return;
-                      }
-                      unawaited(_togglePreview());
-                    },
+                    onPressed: () => unawaited(_togglePreview()),
                     icon: Icon(
                       _previewing
                           ? Icons.edit_outlined
@@ -649,9 +631,7 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
           ),
         ),
         Expanded(
-          child: _spikeMode
-              ? AppFlowySpikeView(noteId: widget.noteId)
-              : _previewing
+          child: _previewing
               ? Padding(
                   padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
                   child: FutureBuilder<List<UiBlock>>(
