@@ -18,9 +18,10 @@ mod document;
 mod entity;
 mod error;
 mod id;
+mod text_projection;
 mod time;
 
-pub use block::{Block, BlockKind, InlineMark, ListItem, TableCell, TableRow};
+pub use block::{Block, BlockKind, InlineMark, InlineMarkKind, ListItem, TableCell, TableRow};
 pub use diff::{
     DiffKind, DiffLine, DiffOutcome, DiffSide, DocumentDiff, diff_documents, diff_lines,
     flatten_lines,
@@ -32,4 +33,5 @@ pub use entity::{
 };
 pub use error::{ModelError, Result};
 pub use id::Id;
+pub use text_projection::{blocks_to_text, is_blank, kind_display_name, text_to_blocks};
 pub use time::{Timestamp, now_ms};

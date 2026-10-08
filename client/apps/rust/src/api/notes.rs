@@ -400,28 +400,27 @@ fn summary_of(note: &Note) -> NoteSummary {
     }
 }
 
-/// 把文档展平为纯文本（用于简洁的编辑器：一个文本块 = 一个段落）。
+/// 把文档展平为纯文本（供纯文本编辑器显示）。
 ///
-/// 注意：这只是**展示**用的降级表示。真实编辑器（P3）会直接操作块模型，
-/// 不会经过纯文本这一步——这里的目的是让 P1 有一条能看见结果的通路。
+/// ## 这里曾经是一个数据损失点
+///
+/// 旧实现是 `block.searchable_text()` + `filter(!is_empty)` + `join("\n")`。
+/// 它把**块类型拍平**：标题、列表、代码块、分割线全都变成一个普通段落。
+/// 于是在编辑器里保存一次，格式就"悄悄没了"——用户看不到任何提示。
+///
+/// 现在改用 [`nested_model::blocks_to_text`]：块类型以 Markdown 风格
+/// 保留在文本里，**往返无损**（见该模块文档与它的往返测试）。
 fn document_to_text(document: &Document) -> String {
-    document
-        .blocks
-        .iter()
-        .map(|block| block.searchable_text())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    nested_model::blocks_to_text(&document.blocks)
 }
 
-/// 把纯文本转成文档（按换行切分为段落，空行忽略）。
+/// 把纯文本转成文档。
+///
+/// 与 [`document_to_text`] 互为逆运算：块类型从 Markdown 风格的前缀
+/// 反解回来，**空行保留为段落分隔**（旧实现把空行丢掉了，
+/// 于是"按两次回车分段"在保存后失效）。
 fn text_to_document(text: &str, at_ms: i64) -> Document {
-    let blocks: Vec<Block> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| Block::paragraph(line))
-        .collect();
+    let blocks: Vec<Block> = nested_model::text_to_blocks(text);
     if blocks.is_empty() {
         Document::empty(at_ms)
     } else {
@@ -570,6 +569,32 @@ pub fn notes_create(notebook_id: Option<String>, title: &str, at_ms: i64) -> Not
         }),
         Err(failure) => failure,
     }
+}
+
+/// 把一段文本走一遍"解析成块 → 再投影回文本"，返回结果。
+///
+/// ## 这个函数为什么存在
+///
+/// 编辑器的保存路径是"文本 → 块 → 存储"，读回是"块 → 文本"。
+/// 如果这两个方向不是互逆的，**用户在编辑器里保存一次就会改动文档**：
+/// 格式被拍平、空行消失，而且每保存一次修订历史就多一条无意义的差异。
+///
+/// 这正是本项目修掉的一个真实缺陷（旧实现把每一行都变成段落、
+/// 并丢掉空行）。修完之后仍然需要一条**在真实数据上验证**的通路：
+/// 单元测试用的是构造出来的块，而真实库里的笔记是历次编辑攒下来的。
+///
+/// `round_trip_text(t) == t` 对任意文本成立，就意味着"再保存也不会变"。
+/// 它是纯函数，**不碰数据库**，因此可以在用户的真实数据上安全地批量检查。
+///
+/// 结果放在 [`NotePayload::text`] 里：`text` 的语义是"这段文本经过一次
+/// 往返之后的样子"。调用方拿它和输入比对即可。
+#[must_use]
+pub fn round_trip_text(text: &str) -> NoteResult {
+    let blocks = nested_model::text_to_blocks(text);
+    NoteResult::ok(NotePayload {
+        text: Some(nested_model::blocks_to_text(&blocks)),
+        ..NotePayload::default()
+    })
 }
 
 /// 读取一篇笔记的元数据与纯文本内容。

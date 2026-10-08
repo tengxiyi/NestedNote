@@ -39,6 +39,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/note_providers.dart';
+import 'block_format.dart';
 import 'icons.dart';
 import 'typography.dart';
 import 'revision_history.dart';
@@ -137,17 +138,21 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
   /// 是同一个理由、同一个手法。
   EditorSaveChannel? _saveChannel;
 
+  /// 格式套用的登记处（同样要提前取好）。
+  EditorTextChannel? _textChannel;
+
   @override
   void initState() {
     super.initState();
     // 提前取好，供 dispose 补保存用（dispose 时不能再碰 ref）
     _actionsForFlush = ref.read(noteActionsProvider);
     _saveChannel = ref.read(editorSaveChannelProvider.notifier);
-    // 把"立即保存"登记出去，菜单的「文件 → 保存当前笔记」才能触发它。
+    _textChannel = ref.read(editorTextChannelProvider.notifier);
+    // 把"立即保存"与"套用格式"登记出去，菜单才能触发它们。
     //
-    // 保存依赖的是**编辑器当前的编辑状态**（两个输入框的内容、是否正在
-    // 保存、有没有改动），这些只有本组件知道。见
-    // `EditorSaveChannel` 的说明——不把编辑状态搬进 provider 是刻意的。
+    // 这两个动作依赖的是**编辑器当前的编辑状态**（两个输入框的内容、
+    // 光标在哪、有没有改动），只有本组件知道。见 `EditorSaveChannel`
+    // 的说明——不把编辑状态搬进 provider 是刻意的。
     //
     // ## 为什么放到下一帧
     //
@@ -155,16 +160,65 @@ class _NoteEditorPaneState extends ConsumerState<NoteEditorPane> {
     // 拦下（"Tried to modify a provider while the widget tree was building"），
     // 编辑器整个构建失败、界面一片空白。这个缺陷是诊断脚本抓出来的。
     //
-    // 延后一帧的代价：极短时间内（一帧）菜单里的「保存」可能还是禁用态，
+    // 延后一帧的代价：极短时间内（一帧）菜单里的这两项可能还是禁用态，
     // 用户不可能察觉。而"编辑器构建失败"是灾难性的。
     _savingCallback = _saveNow;
+    _formatCallback = _applyBlockFormat;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) {
         return;
       }
       _saveChannel?.register(_savingCallback);
+      _textChannel?.register(_formatCallback);
     });
     unawaited(_load());
+  }
+
+  /// 登记给菜单用的"套用块格式"方法。
+  late final Future<void> Function(String) _formatCallback;
+
+  /// 把块格式套用到**正文**（不作用于标题输入框）。
+  ///
+  /// ## 为什么套用后立刻保存
+  ///
+  /// 格式只有在保存之后才会真正变成块。若不立刻保存，用户点完菜单
+  /// 看到标记出现了，但过一会儿切走时依赖 dispose 的补保存——
+  /// 那条路径只为"最后几个字"设计，不该承担格式落库的责任。
+  ///
+  /// 立刻保存也让"再点一次取消格式"的行为可预期：第二次点击读到的是
+  /// 已保存后的文本。
+  Future<void> _applyBlockFormat(String formatId) async {
+    if (_loading || _loadError != null) {
+      return;
+    }
+    final BlockFormat? format = BlockFormats.byId(formatId);
+    final TextEditingController controller = _controller;
+    final TextSelection selection = controller.selection;
+
+    // 光标还没进过正文时 `selection` 是无效的（-1）。此时把格式
+    // 套用到**整篇**会让用户莫名其妙，因此退化成"移到开头"。
+    final TextSelection effective = selection.isValid
+        ? selection
+        : const TextSelection.collapsed(offset: 0);
+
+    final FormatResult result = formatId == 'plain'
+        ? toPlainText(text: controller.text, selection: effective)
+        : applyFormat(
+            text: controller.text,
+            selection: effective,
+            format: format!,
+          );
+
+    if (!result.changed) {
+      return;
+    }
+    controller.value = TextEditingValue(
+      text: result.text,
+      selection: result.selection,
+    );
+    // 让"已修改"状态与自动保存都跟上（用户点菜单也是一次编辑）
+    _onChanged('');
+    await _save();
   }
 
   /// 登记给菜单用的保存方法。

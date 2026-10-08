@@ -16,6 +16,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:nested/app/block_format.dart';
 import 'package:nested/app/menu_bar.dart';
 import 'package:nested/app/note_list_pane.dart';
 import 'package:nested/app/note_editor_page.dart';
@@ -100,23 +101,38 @@ void main() {
   });
 
   group('菜单栏渲染', () {
-    testWidgets('出现四个菜单，且**不含**未实现的菜单', (WidgetTester tester) async {
+    testWidgets('出现六个菜单，且**不含**未实现的菜单', (WidgetTester tester) async {
       await tester.pumpWidget(harness());
       await tester.pumpAndSettle();
 
-      for (final String label in <String>['文件', '编辑', '查看', '帮助']) {
+      for (final String label in <String>['文件', '编辑', '查看', '笔记', '格式', '帮助']) {
         expect(find.text(label), findsOneWidget, reason: '缺少「$label」菜单');
       }
 
       // 铁律 F5：没有实现的菜单**整个不出现**，而不是显示一个空菜单。
       // 空菜单与置灰的假按钮是同一回事——用户点下去什么都得不到。
-      for (final String absent in <String>['格式', '工具']) {
+      //
+      // 「工具」尚未实现（设置对话框还没做），因此它必须**不在**。
+      // 这一条同时是提醒：等它实现了要把断言改成"出现"，
+      // 而不是被悄悄删掉。
+      expect(find.text('工具'), findsNothing, reason: '「工具」还没实现，不该出现在菜单栏里');
+    });
+
+    testWidgets('「格式」菜单列出全部块格式', (WidgetTester tester) async {
+      await tester.pumpWidget(harness());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('格式'));
+      await tester.pumpAndSettle();
+
+      for (final BlockFormat f in BlockFormats.all) {
         expect(
-          find.text(absent),
-          findsNothing,
-          reason: '「$absent」在 M1 没有实现，不该出现在菜单栏里',
+          find.text(f.label),
+          findsWidgets,
+          reason: '「格式」菜单缺少「${f.label}」',
         );
       }
+      expect(find.text('设为纯文本（清除格式）'), findsWidgets);
     });
 
     testWidgets('三栏默认都渲染', (WidgetTester tester) async {

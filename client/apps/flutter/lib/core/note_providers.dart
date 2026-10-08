@@ -677,3 +677,57 @@ final editorSaveChannelProvider =
     NotifierProvider<EditorSaveChannel, Future<void> Function()?>(
       EditorSaveChannel.new,
     );
+
+// ------------------------------------------------------------ 文本编辑通道
+
+/// 编辑器暴露给菜单的**文本级**操作：套用块格式、读取当前正文。
+///
+/// ## 为什么是"改文本"而不是"改块"
+///
+/// 编辑器里用户看到的、光标所在的是**文本**。若菜单直接去改块模型，
+/// 就必须自己回答一串问题：光标在哪个块里？选区跨了几个块？
+/// 改完文本怎么回到界面？——而这些恰恰是 `TextEditingController`
+/// 已经解决的事。
+///
+/// 因此格式菜单做的是**在选中行前面加/去标记**（`# `、`- [ ] `……），
+/// 交给已有的保存路径把标记反解成块。这样：
+///
+/// - 所见即所得：用户立刻看到标记出现在文字里，可撤销（Ctrl+Z）；
+/// - 不新开一条保存路径，也就不会出现"菜单改的格式没存上"；
+/// - 与手工敲 `# ` 完全等价——**没有第二种语义**。
+///
+/// ## 为什么不用 provider 直接持有 controller
+///
+/// controller 是 `State` 的私有物，暴露出去会让别处能改它。
+/// 这里只登记**一个方法**（套用格式），菜单拿不到 controller 本身。
+class EditorTextChannel extends Notifier<Future<void> Function(String)?> {
+  @override
+  Future<void> Function(String)? build() => null;
+
+  /// 编辑器挂载时登记"套用格式"的方法。
+  void register(Future<void> Function(String) applyFormat) =>
+      state = applyFormat;
+
+  /// 编辑器卸载时注销（做同一性校验，理由见 `EditorSaveChannel`）。
+  void unregister(Future<void> Function(String) applyFormat) {
+    if (state == applyFormat) {
+      state = null;
+    }
+  }
+
+  /// 套用一种块格式。返回 `false` 表示当前没有编辑器。
+  Future<bool> applyFormat(String marker) async {
+    final Future<void> Function(String)? apply = state;
+    if (apply == null) {
+      return false;
+    }
+    await apply(marker);
+    return true;
+  }
+}
+
+/// 编辑器的文本级操作通道。
+final editorTextChannelProvider =
+    NotifierProvider<EditorTextChannel, Future<void> Function(String)?>(
+      EditorTextChannel.new,
+    );

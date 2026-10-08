@@ -29,6 +29,7 @@ import '../core/layout_providers.dart';
 import '../core/notebook_providers.dart';
 import '../core/note_providers.dart';
 import 'about_dialog.dart';
+import 'block_format.dart';
 import 'dialogs.dart';
 import 'note_actions.dart';
 import 'shortcuts_dialog.dart';
@@ -50,9 +51,72 @@ class AppMenuBar extends ConsumerWidget {
         _editMenu(context, ref),
         _viewMenu(context, ref),
         _noteMenu(context, ref),
+        _formatMenu(context, ref),
         _helpMenu(context, ref),
       ],
     );
+  }
+
+  // ------------------------------------------------------------------ 格式
+
+  /// 「格式」菜单。
+  ///
+  /// ## 为什么这里做的是"加标记"而不是"改块"
+  ///
+  /// 菜单没有"当前编辑的是哪个块"这个概念——用户的光标在文本里。
+  /// 因此格式动作是**在选中行前面加/去 Markdown 风格的标记**，
+  /// 交给既有的保存路径把标记反解成块。
+  ///
+  /// 好处有三条：
+  ///
+  /// 1. **只有一个语义**——与用户手工敲 `# ` 完全等价，不必理解"块"；
+  /// 2. **可撤销**——标记出现在文本里，Ctrl+Z 就能退回去；
+  /// 3. **不新开保存路径**——因此不会出现"菜单改的格式没存上"。
+  ///
+  /// 只在**打开笔记时**可用（没有编辑器就没有可套用的正文）。
+  Widget _formatMenu(BuildContext context, WidgetRef ref) {
+    final bool editorOpen = ref.watch(openNoteProvider) != null;
+
+    return SubmenuButton(
+      menuChildren: <Widget>[
+        for (final BlockFormat f in BlockFormats.all)
+          MenuItemButton(
+            onPressed: editorOpen
+                ? () => _applyFormat(context, ref, f.id, f.label)
+                : null,
+            child: Text(f.label),
+          ),
+        const Divider(),
+        MenuItemButton(
+          onPressed: editorOpen
+              ? () => _applyFormat(context, ref, 'plain', '纯文本')
+              : null,
+          child: const Text('设为纯文本（清除格式）'),
+        ),
+      ],
+      child: const Text('格式'),
+    );
+  }
+
+  /// 套用一种块格式。
+  ///
+  /// 反馈很克制：成功时**不弹提示**。效果用户直接在正文里看得见
+  /// （标记出现了），再弹一句"已设为标题"是噪音。
+  /// 只有"没有编辑器"这种用户看不出原因的情况才提示。
+  Future<void> _applyFormat(
+    BuildContext context,
+    WidgetRef ref,
+    String formatId,
+    String label,
+  ) async {
+    final bool applied = await ref
+        .read(editorTextChannelProvider.notifier)
+        .applyFormat(formatId);
+    if (!applied && context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('请先打开一篇笔记，再使用「$label」。')));
+    }
   }
 
   // ------------------------------------------------------------------ 文件
