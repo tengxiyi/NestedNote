@@ -123,10 +123,11 @@ fn render_block(block: &Block, resolve: Resolve<'_>, out: &mut String) {
                     let _ = write!(
                         out,
                         "<p><img src=\"data:application/octet-stream;base64,{}\" \
-                         alt=\"{}\"></p>\n",
+                         alt=\"{}\"></p>",
                         base64_encode(&bytes),
                         escape_html(alt.as_deref().unwrap_or(""))
                     );
+                    out.push('\n');
                 }
                 None => {
                     let _ = writeln!(
