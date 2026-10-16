@@ -259,20 +259,20 @@ void main() {
         tester.element(find.byType(NotesPage)),
       );
       await tester.tap(find.text('一篇笔记'));
-      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pumpAndSettle();
       expect(find.byType(NoteEditorPane), findsOneWidget);
 
       // 让焦点进到正文输入框
       final Finder fields = find.byType(TextField);
       expect(fields, findsWidgets, reason: '编辑器应当有输入框');
       await tester.tap(fields.last);
-      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pumpAndSettle();
 
       // 在输入框有焦点的情况下按 Ctrl+2
       await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
       await tester.sendKeyEvent(LogicalKeyboardKey.digit2);
       await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
-      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pumpAndSettle();
 
       expect(
         container.read(paneLayoutProvider),
